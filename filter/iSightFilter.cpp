@@ -37,18 +37,10 @@ static const GUID CLSID_ISightFireWireCam =
 { 0x73912ce1, 0x84dd, 0x4bf4, { 0x86, 0x93, 0xff, 0x46, 0x03, 0xd7, 0x36, 0x9f } };
 
 // normally defined in the base-classes dllentry.cpp, which we do not link;
-// still referenced by dllsetup.obj (AMovieDllRegisterServer)
+// still referenced by dllsetup.obj (AMovieDllRegisterServer).
+// Assigned in DllMain (1394main.c) — must be non-NULL at registration time,
+// otherwise dllsetup stores the host executable path instead of this DLL's.
 HINSTANCE g_hInst = NULL;
-
-// dllentry.cpp replacement: dllsetup uses g_hInst to compute this DLL's path
-// during DllRegisterServer. Without this, GetModuleFileName(NULL) returns the
-// host executable (e.g. regsvr32.exe) and the COM registration is corrupted.
-extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD dwReason, LPVOID)
-{
-    if (dwReason == DLL_PROCESS_ATTACH)
-        g_hInst = hInst;
-    return TRUE;
-}
 
 static const WCHAR g_wszFilterName[] = L"Apple iSight (FireWire)";
 
