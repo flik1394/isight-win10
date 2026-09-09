@@ -1,0 +1,58 @@
+name: Build iSightCam
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch DirectShow BaseClasses
+        shell: pwsh
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/microsoft/Windows-classic-samples.git wcs
+          Push-Location wcs
+          git sparse-checkout set Samples/Win7Samples/multimedia/directshow/baseclasses
+          Pop-Location
+          Copy-Item -Recurse "wcs/Samples/Win7Samples/multimedia/directshow/baseclasses" "./baseclasses"
+          Get-ChildItem ./baseclasses | Select-Object -First 5
+
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build x64
+        shell: cmd
+        run: build.cmd x64
+
+      - name: Setup MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build x86
+        shell: cmd
+        run: build.cmd x86
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item iSightCam64.ax, iSightCam32.ax package/
+          Copy-Item installer\install-all.bat,  installer\uninstall-all.bat  package/
+          Copy-Item installer\README-install.txt package/
+          $src = "https://github.com/Andrew-Dyachenko/apple-firewire-isight-on-windows/raw/main/CMU%201394%20Digital%20Camera%20Driver%206.4.6%20(signed)%20(September%2026%2C%202011).exe"
+          Invoke-WebRequest -Uri $src -OutFile "package/1394camera646.exe"
+          Get-ChildItem package
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iSightCam-package
+          path: package/
