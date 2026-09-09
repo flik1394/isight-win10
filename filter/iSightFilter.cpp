@@ -489,7 +489,7 @@ public:
         if (punk == NULL)
             return FAILED(hr) ? hr : E_OUTOFMEMORY;
         hr = punk->NonDelegatingQueryInterface(riid, ppv);
-        punk->Release();
+        punk->NonDelegatingRelease();
         return hr;
     }
 
