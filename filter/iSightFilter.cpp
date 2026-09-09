@@ -36,6 +36,10 @@
 static const GUID CLSID_ISightFireWireCam =
 { 0x73912ce1, 0x84dd, 0x4bf4, { 0x86, 0x93, 0xff, 0x46, 0x03, 0xd7, 0x36, 0x9f } };
 
+// normally defined in the base-classes dllentry.cpp, which we do not link;
+// still referenced by dllsetup.obj (AMovieDllRegisterServer)
+HINSTANCE g_hInst = NULL;
+
 static const WCHAR g_wszFilterName[] = L"Apple iSight (FireWire)";
 
 // DirectShow reference clock = 10,000,000 units/sec
