@@ -60,6 +60,7 @@ static const REFERENCE_TIME kFrameDurations[] =
 class CiSightStream : public CSourceStream, public IAMStreamConfig
 {
 public:
+    DECLARE_IUNKNOWN
     CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName);
     ~CiSightStream();
 
@@ -102,6 +103,7 @@ private:
 class CiSightSource : public CSource
 {
 public:
+    DECLARE_IUNKNOWN
     static CUnknown *WINAPI CreateInstance(LPUNKNOWN lpunk, HRESULT *phr);
 
 private:
@@ -256,7 +258,7 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
     if (!TryStart())
     {
         DeliverBlackFrame(pSample);
-        Sleep(kFrameDurations[m_rateIndex] / 10000);   // ms
+        Sleep(static_cast<DWORD>(kFrameDurations[m_rateIndex] / 10000));   // ms
     }
     else
     {
@@ -438,12 +440,8 @@ int g_cTemplates = _countof(g_Templates);
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void **ppv)
 {
-    for (int i = 0; i < g_cTemplates; i++)
-    {
-        if (*g_Templates[i].m_ClsID == rclsid)
-            return g_Templates[i].GetClassObject(rclsid, riid, ppv);
-    }
-    return CLASS_E_CLASSNOTAVAILABLE;
+    // iterate g_Templates via the standard base-classes helper
+    return AMovieDllGetClassObject(rclsid, riid, ppv);
 }
 
 STDAPI DllCanUnloadNow()
