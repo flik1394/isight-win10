@@ -19,6 +19,7 @@ if not exist obj\bc-%ARCH% mkdir obj\bc-%ARCH%
 cd obj\bc-%ARCH%
 cl /nologo /c /O2 /MD /EHsc /GR /W3 /FS /Zc:twoPhase- ^
    /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS ^
+   /DUNICODE /D_UNICODE ^
    /I..\..\baseclasses ..\..\baseclasses\*.cpp
 if errorlevel 1 ( cd ..\.. & exit /b 1 )
 lib /nologo /OUT:strmbase-%ARCH%.lib *.obj
@@ -47,6 +48,7 @@ cl /nologo /c /O2 /MD /EHsc /GR /W3 /FS /Zc:twoPhase- ^
    ..\..\cmu\1394camera\1394CameraControlSize.cpp ^
    ..\..\cmu\1394camera\1394CameraControlStrobe.cpp ^
    ..\..\cmu\1394camera\1394CameraControlTrigger.cpp ^
+   ..\..\cmu\1394camera\ControlWrappers.cpp ^
    ..\..\cmu\1394camera\1394main.c ^
    ..\..\cmu\1394camera\isochapi.c ^
    ..\..\cmu\1394camera\tables.c ^
