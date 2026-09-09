@@ -74,7 +74,7 @@ link /nologo /DLL /OUT:%OUT% /DEF:filter\iSightCam.def /MACHINE:%MACHINE% ^
   obj\cmu-%ARCH%\*.obj ^
   obj\bc-%ARCH%\strmbase-%ARCH%.lib ^
   ole32.lib oleaut32.lib uuid.lib strmiids.lib winmm.lib advapi32.lib ^
-  setupapi.lib shlwapi.lib user32.lib gdi32.lib version.lib
+  setupapi.lib shlwapi.lib user32.lib gdi32.lib version.lib comctl32.lib
 if errorlevel 1 exit /b 1
 
 echo === OK: %OUT% built ===
