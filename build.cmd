@@ -69,7 +69,7 @@ cd ..\..
 echo === [4/4] linking %OUT% (%ARCH%) ===
 if /i "%ARCH%"=="x64" (set MACHINE=X64) else (set MACHINE=X86)
 link /nologo /DLL /OUT:%OUT% /DEF:filter\iSightCam.def /MACHINE:%MACHINE% ^
-  /OPT:REF /OPT:ICF ^
+  /MAP:obj\flt-%ARCH%\%OUT%.map ^
   obj\flt-%ARCH%\iSightFilter.obj ^
   obj\cmu-%ARCH%\*.obj ^
   obj\bc-%ARCH%\strmbase-%ARCH%.lib ^
