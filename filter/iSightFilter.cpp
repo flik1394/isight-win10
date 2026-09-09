@@ -494,8 +494,18 @@ public:
         CUnknown *punk = m_pTemplate->CreateInstance(pUnkOuter, &hr);
         if (punk == NULL)
             return FAILED(hr) ? hr : E_OUTOFMEMORY;
+
+        // IMPORTANT: modern baseclasses construct CUnknown with refcount 0;
+        // NonDelegatingQueryInterface's AddRef is the reference the caller
+        // holds. (dllentry.cpp's CClassFactory behaves the same: delete on
+        // failure, no extra Release.) The old "construct = 1 ref + factory
+        // Release" pattern turns every object into an immediate use-after-free:
+        // the extra NonDelegatingRelease deletes the filter while the caller
+        // still holds it, so any later call (EnumPins etc.) crashes with
+        // "access violation writing 0x24" inside EnterCriticalSection.
         hr = punk->NonDelegatingQueryInterface(riid, ppv);
-        punk->NonDelegatingRelease();
+        if (FAILED(hr))
+            delete punk;
         return hr;
     }
 
