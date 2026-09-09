@@ -438,10 +438,87 @@ CFactoryTemplate g_Templates[] =
 };
 int g_cTemplates = _countof(g_Templates);
 
+//---------------------------------------------------------------------
+// minimal IClassFactory over the template array (the modern base
+// classes keep their CClassFactory inside dllentry.cpp, which we do
+// not link, so we provide our own equivalent here)
+//---------------------------------------------------------------------
+class CMiniClassFactory : public IClassFactory
+{
+    const CFactoryTemplate *const m_pTemplate;
+    ULONG m_cRef;
+
+public:
+    CMiniClassFactory(const CFactoryTemplate *pTemplate)
+        : m_pTemplate(pTemplate), m_cRef(1) {}
+
+    STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
+    {
+        CheckPointer(ppv, E_POINTER);
+        *ppv = NULL;
+        if (riid == IID_IUnknown || riid == IID_IClassFactory) {
+            *ppv = (LPVOID)this;
+            ((LPUNKNOWN)*ppv)->AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override
+    {
+        return ++m_cRef;
+    }
+
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        ULONG cRef = --m_cRef;
+        if (cRef == 0)
+            delete this;
+        return cRef;
+    }
+
+    STDMETHODIMP CreateInstance(LPUNKNOWN pUnkOuter, REFIID riid, void **ppv) override
+    {
+        CheckPointer(ppv, E_POINTER);
+        *ppv = NULL;
+        if (pUnkOuter != NULL && !IsEqualIID(riid, IID_IUnknown))
+            return CLASS_E_NOAGGREGATION;
+
+        HRESULT hr = S_OK;
+        CUnknown *punk = m_pTemplate->CreateInstance(pUnkOuter, &hr);
+        if (punk == NULL)
+            return FAILED(hr) ? hr : E_OUTOFMEMORY;
+        hr = punk->NonDelegatingQueryInterface(riid, ppv);
+        punk->Release();
+        return hr;
+    }
+
+    STDMETHODIMP LockServer(BOOL fLock) override
+    {
+        UNREFERENCED_PARAMETER(fLock);
+        return S_OK;
+    }
+};
+
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void **ppv)
 {
-    // iterate g_Templates via the standard base-classes helper
-    return AMovieDllGetClassObject(rclsid, riid, ppv);
+    CheckPointer(ppv, E_POINTER);
+    *ppv = NULL;
+    if (!(riid == IID_IUnknown) && !(riid == IID_IClassFactory))
+        return E_NOINTERFACE;
+    for (int i = 0; i < g_cTemplates; i++)
+    {
+        if (g_Templates[i].IsClassID(rclsid))
+        {
+            CMiniClassFactory *pFactory = new CMiniClassFactory(&g_Templates[i]);
+            if (pFactory == NULL)
+                return E_OUTOFMEMORY;
+            HRESULT hr = pFactory->QueryInterface(riid, ppv);
+            pFactory->Release();
+            return hr;
+        }
+    }
+    return CLASS_E_CLASSNOTAVAILABLE;
 }
 
 STDAPI DllCanUnloadNow()
