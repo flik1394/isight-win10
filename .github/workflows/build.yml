@@ -45,6 +45,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item iSightCam64.ax, iSightCam32.ax package/
+          Copy-Item obj\flt-x64\iSightCam64.ax.map, obj\flt-x86\iSightCam32.ax.map package/ -ErrorAction SilentlyContinue
           Copy-Item installer\install-all.bat,  installer\uninstall-all.bat  package/
           Copy-Item installer\README-install.txt package/
           $src = "https://github.com/Andrew-Dyachenko/apple-firewire-isight-on-windows/raw/main/CMU%201394%20Digital%20Camera%20Driver%206.4.6%20(signed)%20(September%2026%2C%202011).exe"
