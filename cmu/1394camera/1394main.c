@@ -78,12 +78,6 @@ DllMain(
 
 	g_hInstDLL = hInstance;
 	g_hInstance = hInstance;
-	{
-		// DirectShow baseclasses dllsetup uses this to compute the DLL path
-		// during DllRegisterServer (normally set by dllentry.cpp's DllMain)
-		extern HINSTANCE g_hInst;
-		g_hInst = hInstance;
-	}
 
 	// now that we don't start the extra process nor muck around with shared
 	// memory and device change signals and bus resets, DllMain is really simple
