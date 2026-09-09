@@ -40,6 +40,16 @@ static const GUID CLSID_ISightFireWireCam =
 // still referenced by dllsetup.obj (AMovieDllRegisterServer)
 HINSTANCE g_hInst = NULL;
 
+// dllentry.cpp replacement: dllsetup uses g_hInst to compute this DLL's path
+// during DllRegisterServer. Without this, GetModuleFileName(NULL) returns the
+// host executable (e.g. regsvr32.exe) and the COM registration is corrupted.
+extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD dwReason, LPVOID)
+{
+    if (dwReason == DLL_PROCESS_ATTACH)
+        g_hInst = hInst;
+    return TRUE;
+}
+
 static const WCHAR g_wszFilterName[] = L"Apple iSight (FireWire)";
 
 // DirectShow reference clock = 10,000,000 units/sec
