@@ -273,6 +273,9 @@ int main(int argc, char **argv)
         uid.HighPart, uid.LowPart);
     LOG("device path: %s", cam.GetDevicePath());
 
+    // start the generation monitor EARLY so we also see resets during InitCamera
+    StartGenMonitor(cam.GetDevicePath());
+
     // CheckLink re-enumerates and clears init state, so call it BEFORE InitCamera
     LOG("CheckLink -> %d", cam.CheckLink());
     cam.SelectCamera(0);
@@ -281,6 +284,18 @@ int main(int argc, char **argv)
     LOG("InitCamera(FALSE) -> %d (%s)", r, CamErr(r));
     if (r != CAM_SUCCESS)
     {
+        // post-mortem experiment: does a software bus reset revive the camera?
+        LOG("post-mortem: issuing software BUS_RESET to test if camera revives...");
+        DWORD ret = 0;
+        BOOL br = DeviceIoControl(g_genHandle, CMDR_IOCTL_BUS_RESET, NULL, 0,
+                                  NULL, 0, &ret, NULL);
+        LOG("post-mortem: BUS_RESET -> %d (GetLastError=%lu)", br, GetLastError());
+        Sleep(3000);
+        LOG("post-mortem: CheckLink=%d", cam.CheckLink());
+        cam.SelectCamera(0);
+        r = cam.InitCamera(FALSE);
+        LOG("post-mortem: InitCamera after bus reset -> %d (%s)", r, CamErr(r));
+        StopGenMonitor();
         if (g_log) fclose(g_log);
         printf("\nPress Enter to exit...");
         getchar();
@@ -291,8 +306,7 @@ int main(int argc, char **argv)
     LOG("Has1394b=%d Status1394b=%d HasPowerControl=%d",
         (int)cam.Has1394b(), (int)cam.Status1394b(), (int)cam.HasPowerControl());
     LOG("GetMaxSpeed -> %d Mbps", cam.GetMaxSpeed());
-
-    StartGenMonitor(cam.GetDevicePath());
+    LOG("gen-monitor still active from before InitCamera");
 
     // rate selection from command line: 15 | 375 | 30 | all (default 15)
     unsigned long rateArg = 3;
