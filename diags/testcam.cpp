@@ -184,6 +184,10 @@ int main(int argc, char **argv)
         uid.HighPart, uid.LowPart);
     LOG("device path: %s", cam.GetDevicePath());
 
+    // CheckLink re-enumerates and clears init state, so call it BEFORE InitCamera
+    LOG("CheckLink -> %d", cam.CheckLink());
+    cam.SelectCamera(0);
+
     int r = cam.InitCamera(FALSE);
     LOG("InitCamera(FALSE) -> %d (%s)", r, CamErr(r));
     if (r != CAM_SUCCESS)
@@ -195,11 +199,9 @@ int main(int argc, char **argv)
     }
 
     ULONG speed = 0;
-    // GetMaxIsochSpeed uses the raw device name
     LOG("Has1394b=%d Status1394b=%d HasPowerControl=%d",
         (int)cam.Has1394b(), (int)cam.Status1394b(), (int)cam.HasPowerControl());
-    LOG("CheckLink -> %d", cam.CheckLink());
-    LOG("GetMaxSpeed -> %d (0=S100 1=S200 2=S400)", cam.GetMaxSpeed());
+    LOG("GetMaxSpeed -> %d Mbps", cam.GetMaxSpeed());
 
     // rate selection from command line: 15 | 375 | 30 | all (default 15)
     unsigned long rateArg = 3;
