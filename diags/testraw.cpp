@@ -38,16 +38,18 @@ int main(void)
     char path[512] = "";
     if (h != INVALID_HANDLE_VALUE)
     {
-        char buf[512]; ULONG len = 0;
+        char buf[512]; ULONG sz = 0;
         for (DWORD i = 0; i < 8; i++)
         {
             ZeroMemory(buf, sizeof(buf));
-            if (t1394CmdrGetDevicePath(h, i, buf, &len) == 0 && buf[0])
+            sz = sizeof(buf);
+            if (t1394CmdrGetDevicePath(h, i, buf, &sz) > 0 && buf[0])
             {
                 LOG("t1394cmdr device[%lu]: %s", (unsigned long)i, buf);
                 if (!path[0]) strcpy_s(path, sizeof(path), buf);
             }
         }
+        SetupDiDestroyDeviceInfoList(h);
     }
     else
     {
