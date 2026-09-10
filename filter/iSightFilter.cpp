@@ -144,7 +144,7 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_bAcquiring(false)
     , m_width(ISIGHT_WIDTH)
     , m_height(ISIGHT_HEIGHT)
-    , m_rateIndex(4)
+    , m_rateIndex(3)
     , m_rtNext(0)
 {
 }
@@ -192,11 +192,16 @@ void CiSightStream::StopIfNeeded()
     }
 }
 
-// prefer Format 0 / Mode 2 (640x480 YUV422) @ 30fps; fall back to the
-// highest available mode/rate pair. The iSight always exposes mode 2.
+// prefer Format 0 / Mode 2 (640x480 YUV422). The iSight is an S100
+// (100 Mbit/s) device: 640x480 YUV422 @ 30fps needs ~150 Mbit/s of
+// isochronous bandwidth and does NOT fit. Cap the rate at 15 fps
+// (~74 Mbit/s), which is the classic working setting for this camera.
+// The iSight always exposes mode 2.
 void CiSightStream::ConfigureVideo()
 {
     bool found = false;
+
+    const int kMaxRateIndex = (m_cam.GetMaxSpeed() <= 1) ? 3 : 5;   // 3 = 15fps
 
     for (unsigned long f = 0; f < 3 && !found; f++)
     {
@@ -206,7 +211,7 @@ void CiSightStream::ConfigureVideo()
         {
             if (!m_cam.HasVideoMode(f, m))
                 continue;
-            for (int r = 5; r >= 0 && !found; r--)
+            for (int r = kMaxRateIndex; r >= 0 && !found; r--)
             {
                 if (!m_cam.HasVideoFrameRate(f, m, (unsigned long)r))
                     continue;
@@ -414,10 +419,10 @@ STDMETHODIMP CiSightStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE **ppmt, BYTE
     caps->MaxCroppingSize       = caps->InputSize;
     caps->MinOutputSize         = caps->InputSize;
     caps->MaxOutputSize         = caps->InputSize;
-    caps->MinBitsPerSecond      = FRAME_BYTES * 8 * 15;
-    caps->MaxBitsPerSecond      = FRAME_BYTES * 8 * 30;
-    caps->MinFrameInterval      = kFrameDurations[4];
-    caps->MaxFrameInterval      = kFrameDurations[3];
+    caps->MinBitsPerSecond      = FRAME_BYTES * 8 * 2;
+    caps->MaxBitsPerSecond      = FRAME_BYTES * 8 * 15;
+    caps->MinFrameInterval      = kFrameDurations[3];   // fastest = 15 fps
+    caps->MaxFrameInterval      = kFrameDurations[1];   // slowest = 3.75 fps
     return S_OK;
 }
 
