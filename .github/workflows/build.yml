@@ -94,6 +94,7 @@ jobs:
              cmu\1394camera\isochapi.c ^
              cmu\1394camera\tables.c ^
              cmu\1394camera\debug.c ^
+             setupapi.lib advapi32.lib user32.lib comctl32.lib ^
              /Fe:isight-diag.exe
 
       - name: Upload diagnostic tool
