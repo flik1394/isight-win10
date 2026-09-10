@@ -15,6 +15,7 @@
 //=====================================================================
 
 #include <windows.h>
+#include <winioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -26,7 +27,21 @@
 #include "1394camapi.h"
 #include "1394Camera.h"
 
+// t1394cmdr custom IOCTLs (1394common.h, CMDR1394_IOCTL_INDEX = 0x0800)
+#define CMDR_IOCTL_INDEX          0x0800
+#define CMDR_IOCTL_BUS_RESET      CTL_CODE(FILE_DEVICE_UNKNOWN, CMDR_IOCTL_INDEX + 25, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define CMDR_IOCTL_GET_GENERATION CTL_CODE(FILE_DEVICE_UNKNOWN, CMDR_IOCTL_INDEX + 26, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 static FILE *g_log = NULL;
+
+// ---- bus generation monitor -------------------------------------------
+// Polls IOCTL_GET_GENERATION_COUNT on a private handle to the camera PDO.
+// Every 1394 bus reset bumps the generation, so a change = a bus reset
+// happened at that moment (host or camera initiated).
+static HANDLE g_genHandle = INVALID_HANDLE_VALUE;
+static HANDLE g_genStop = NULL;
+static HANDLE g_genThread = NULL;
+static volatile LONG g_genChanges = 0;
 
 static void LOG(const char *fmt, ...)
 {
@@ -67,7 +82,67 @@ static double NowMs()
     if (!f.QuadPart) QueryPerformanceFrequency(&f);
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (double)(t.QuadPart - 0) * 1000.0 / (double)f.QuadPart;
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+static DWORD WINAPI GenMonitorThread(LPVOID)
+{
+    ULONG lastGen = 0xFFFFFFFF;
+    while (WaitForSingleObject(g_genStop, 150) == WAIT_TIMEOUT)
+    {
+        ULONG gen = 0;
+        DWORD ret = 0;
+        if (!DeviceIoControl(g_genHandle, CMDR_IOCTL_GET_GENERATION, NULL, 0,
+                             &gen, sizeof(gen), &ret, NULL))
+            continue;
+        if (lastGen != 0xFFFFFFFF && gen != lastGen)
+        {
+            InterlockedIncrement(&g_genChanges);
+            LOG("[gen-monitor] t=%.1fs  GENERATION %lu -> %lu   <<< BUS RESET #%d",
+                NowMs() / 1000.0, lastGen, gen, g_genChanges);
+        }
+        lastGen = gen;
+    }
+    return 0;
+}
+
+static void StartGenMonitor(const char *devicePath)
+{
+    g_genHandle = CreateFileA(devicePath, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                              OPEN_EXISTING, 0, NULL);
+    if (g_genHandle == INVALID_HANDLE_VALUE)
+    {
+        LOG("gen-monitor: cannot open device (%lu) - monitoring disabled", GetLastError());
+        return;
+    }
+    // sanity check the IOCTL works
+    ULONG gen = 0; DWORD ret = 0;
+    if (!DeviceIoControl(g_genHandle, CMDR_IOCTL_GET_GENERATION, NULL, 0,
+                         &gen, sizeof(gen), &ret, NULL))
+    {
+        LOG("gen-monitor: GET_GENERATION_COUNT failed (%lu) - monitoring disabled", GetLastError());
+        CloseHandle(g_genHandle); g_genHandle = INVALID_HANDLE_VALUE;
+        return;
+    }
+    LOG("gen-monitor: started, generation=%lu", gen);
+    g_genStop = CreateEventA(NULL, TRUE, FALSE, NULL);
+    g_genThread = CreateThread(NULL, 0, GenMonitorThread, NULL, 0, NULL);
+}
+
+static void StopGenMonitor()
+{
+    if (g_genThread)
+    {
+        SetEvent(g_genStop);
+        WaitForSingleObject(g_genThread, 3000);
+        CloseHandle(g_genThread); g_genThread = NULL;
+        CloseHandle(g_genStop); g_genStop = NULL;
+    }
+    if (g_genHandle != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_genHandle); g_genHandle = INVALID_HANDLE_VALUE;
+    }
+    LOG("gen-monitor: stopped, total bus resets observed=%d", g_genChanges);
 }
 
 static void RunRateTest(C1394Camera &cam, unsigned long rate)
@@ -146,6 +221,20 @@ static void RunRateTest(C1394Camera &cam, unsigned long rate)
     LOG("aliveness: CheckLink=%d", cam.CheckLink());
     int ri = cam.InitCamera(FALSE);
     LOG("aliveness: InitCamera -> %d (%s)", ri, CamErr(ri));
+
+    // post-mortem experiment: does a software bus reset revive the camera?
+    if (ri != CAM_SUCCESS && g_genHandle != INVALID_HANDLE_VALUE)
+    {
+        LOG("post-mortem: issuing software BUS_RESET to test if camera revives...");
+        DWORD ret = 0;
+        BOOL br = DeviceIoControl(g_genHandle, CMDR_IOCTL_BUS_RESET, NULL, 0,
+                                  NULL, 0, &ret, NULL);
+        LOG("post-mortem: BUS_RESET -> %d (GetLastError=%lu)", br, GetLastError());
+        Sleep(3000);
+        LOG("post-mortem: CheckLink=%d", cam.CheckLink());
+        ri = cam.InitCamera(FALSE);
+        LOG("post-mortem: InitCamera after bus reset -> %d (%s)", ri, CamErr(ri));
+    }
 }
 
 int main(int argc, char **argv)
@@ -203,6 +292,8 @@ int main(int argc, char **argv)
         (int)cam.Has1394b(), (int)cam.Status1394b(), (int)cam.HasPowerControl());
     LOG("GetMaxSpeed -> %d Mbps", cam.GetMaxSpeed());
 
+    StartGenMonitor(cam.GetDevicePath());
+
     // rate selection from command line: 15 | 375 | 30 | all (default 15)
     unsigned long rateArg = 3;
     bool doRun = true;
@@ -217,6 +308,8 @@ int main(int argc, char **argv)
 
     if (cam.IsAcquiring())
         cam.StopImageAcquisition();
+
+    StopGenMonitor();
 
     LOG("");
     LOG("=== done ===");
