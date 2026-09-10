@@ -141,6 +141,11 @@ static void RunRateTest(C1394Camera &cam, unsigned long rate)
     r = cam.StopImageAcquisition();
     LOG("StopImageAcquisition -> %d (%s)", r, CamErr(r));
     Sleep(1000);   // let the bus settle between tests
+
+    // aliveness check: did this rate kill the camera?
+    LOG("aliveness: CheckLink=%d", cam.CheckLink());
+    int ri = cam.InitCamera(FALSE);
+    LOG("aliveness: InitCamera -> %d (%s)", ri, CamErr(ri));
 }
 
 int main(int argc, char **argv)
@@ -196,10 +201,17 @@ int main(int argc, char **argv)
     LOG("CheckLink -> %d", cam.CheckLink());
     LOG("GetMaxSpeed -> %d (0=S100 1=S200 2=S400)", cam.GetMaxSpeed());
 
-    // rate tests, worst-bandwidth first so we end on a stable config
-    RunRateTest(cam, 3);   // 15 fps
-    RunRateTest(cam, 1);   // 3.75 fps
-    RunRateTest(cam, 4);   // 30 fps
+    // rate selection from command line: 15 | 375 | 30 | all (default 15)
+    unsigned long rateArg = 3;
+    bool doRun = true;
+    if (argc > 1)
+    {
+        if (!_stricmp(argv[1], "375")) rateArg = 1;
+        else if (!_stricmp(argv[1], "30")) rateArg = 4;
+        else if (!_stricmp(argv[1], "all")) { doRun = false; RunRateTest(cam, 3); RunRateTest(cam, 1); RunRateTest(cam, 4); }
+    }
+    if (doRun)
+        RunRateTest(cam, rateArg);
 
     if (cam.IsAcquiring())
         cam.StopImageAcquisition();
