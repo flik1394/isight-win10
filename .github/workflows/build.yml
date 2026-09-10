@@ -57,3 +57,47 @@ jobs:
         with:
           name: iSightCam-package
           path: package/
+
+  diag:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build diagnostic tool
+        shell: cmd
+        run: |
+          cl /nologo /O2 /W3 /EHsc /GR /FS /Zc:twoPhase- /MD ^
+             /D_CRT_SECURE_NO_WARNINGS /DMY1394CAMERA_EXPORTS ^
+             /Icmu\1394camera ^
+             diags\testcam.cpp ^
+             cmu\1394camera\1394Camera.cpp ^
+             cmu\1394camera\1394CamAcq.cpp ^
+             cmu\1394camera\1394CamCap.cpp ^
+             cmu\1394camera\1394CamRGB.cpp ^
+             cmu\1394camera\1394CamReg.cpp ^
+             cmu\1394camera\1394CamMem.cpp ^
+             cmu\1394camera\1394CamPIO.cpp ^
+             cmu\1394camera\1394CamSIO.cpp ^
+             cmu\1394camera\1394CamFMR.cpp ^
+             cmu\1394camera\1394CameraControl.cpp ^
+             cmu\1394camera\1394CameraControlSize.cpp ^
+             cmu\1394camera\1394CameraControlStrobe.cpp ^
+             cmu\1394camera\1394CameraControlTrigger.cpp ^
+             cmu\1394camera\ControlWrappers.cpp ^
+             cmu\1394camera\1394main.c ^
+             cmu\1394camera\isochapi.c ^
+             cmu\1394camera\tables.c ^
+             cmu\1394camera\debug.c ^
+             /Fe:isight-diag.exe
+
+      - name: Upload diagnostic tool
+        uses: actions/upload-artifact@v4
+        with:
+          name: isight-diag
+          path: isight-diag.exe
