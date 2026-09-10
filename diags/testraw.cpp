@@ -74,7 +74,7 @@ int main(void)
     };
 
     // 3. retry loop: catches recovery after unplug/replug
-    for (int attempt = 1; attempt <= 12; attempt++)
+    for (int attempt = 1; attempt <= 60; attempt++)
     {
         LOG("--- attempt %d ---", attempt);
         int anyOK = 0;
@@ -99,7 +99,7 @@ int main(void)
             LOG(">>> ALL READS OK - camera alive!");
             break;
         }
-        Sleep(3000);
+        Sleep(2000);
     }
 
     LOG("=== done ===");
