@@ -19,7 +19,7 @@ rem    * 拒绝在 32 位 cmd 里运行
 rem    * 目标文件被占用时先改名再复制，复制后按版本标记自检
 rem ============================================================
 
-set "TAG=ISIGHTFILTER-BUILD-V7-20260912-PINCAT"
+set "TAG=ISIGHTFILTER-BUILD-V8-20260912-ORIENT"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
