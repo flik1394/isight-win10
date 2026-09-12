@@ -280,8 +280,13 @@ int main(int argc, char **argv)
     LOG("CheckLink -> %d", cam.CheckLink());
     cam.SelectCamera(0);
 
+    // fast bring-up: skip the per-feature inquiry walk, exactly like the
+    // DirectShow filter does.  On this driver the walk alone costs ~14 s.
+    g_bISightFastBringUp = TRUE;
+
+    double tInit = NowMs();
     int r = cam.InitCamera(FALSE);
-    LOG("InitCamera(FALSE) -> %d (%s)", r, CamErr(r));
+    LOG("InitCamera(FALSE, fast) -> %d (%s) in %.0f ms", r, CamErr(r), NowMs() - tInit);
     if (r != CAM_SUCCESS)
     {
         // post-mortem experiment: does a software bus reset revive the camera?
