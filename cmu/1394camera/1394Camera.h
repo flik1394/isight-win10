@@ -138,6 +138,25 @@
 // the C1394Camera class
 // member function implementations are in  1394Camera.cpp unless otherwise noted
 
+/*
+ * Fast bring-up switch (flik, 2026-09).
+ *
+ * InitCamera() normally walks the complete feature/control register table
+ * (Inquire()+Status() for every camera control) and then runs a full
+ * video-settings sanity pass.  On this 6.4.6 driver each register access is
+ * a synchronous DeviceIoControl that costs ~100 ms, so the walk alone takes
+ * ~14 seconds -- while a DirectShow host (WeChat, QQ, OBS, the 1394Camera
+ * Demo in its default mode) only tolerates a couple of seconds before it
+ * gives up on the device.
+ *
+ * A capture filter never exposes IAMVideoProcAmp / IAMCameraControl, so none
+ * of that information is ever used: set this to TRUE before calling
+ * InitCamera() and the walk is skipped.  Fix/manual control values stay at
+ * zero, video format/mode/rate and the bandwidth table are still read, and
+ * StartImageAcquisitionEx() behaves exactly as before.
+ */
+extern BOOL g_bISightFastBringUp;
+
 /**
  * \brief This class may be	used to	control	one	camera on the 1394 bus.
  * \ingroup	camcore
