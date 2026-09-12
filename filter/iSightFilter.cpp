@@ -86,7 +86,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V7-20260912-PINCAT"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V8-20260912-ORIENT"
 
 //---------------------------------------------------------------------
 // AMPROPSETID_Pin -- the pin category property set.
