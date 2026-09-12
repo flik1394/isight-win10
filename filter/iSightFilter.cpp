@@ -43,6 +43,19 @@
 //     SetFormat(NULL) resets to default instead of failing.
 //   * the CMU device handle is fully released on Inactive() so the same
 //     camera can be opened again and again by the host application.
+//
+// v7 additions -- the two reasons "the device shows up but the video never
+// starts" in WeChat / QQ / OBS:
+//   * the output pin now implements IKsPropertySet
+//     (AMPROPSETID_Pin / AMPROPERTY_PIN_CATEGORY -> PIN_CATEGORY_CAPTURE).
+//     ICaptureGraphBuilder2::FindPin() asks for exactly that before it will
+//     render a source, and returns E_INVALIDARG when no pin answers -- which
+//     is what the mainstream hosts do first, long before any media type is
+//     negotiated.
+//   * the camera bring-up no longer walks the whole feature/control register
+//     table: on this driver that walk is ~14 s of synchronous IOCTLs, far
+//     longer than a host is willing to wait for a first frame
+//     (g_bISightFastBringUp in the CMU library).
 //=====================================================================
 
 #include <windows.h>
@@ -68,6 +81,45 @@
 // {73912CE1-84DD-4BF4-8693-FF4603D7369F}
 static const GUID CLSID_ISightFireWireCam =
 { 0x73912ce1, 0x84dd, 0x4bf4, { 0x86, 0x93, 0xff, 0x46, 0x03, 0xd7, 0x36, 0x9f } };
+
+// Identifies the build inside the binary.  install-all.bat greps for this
+// string to prove that the file it just registered is really this version --
+// a silently failed copy (the .ax is mapped by a running host and the copy
+// is refused) has burned this project more than once.
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V7-20260912-PINCAT"
+
+//---------------------------------------------------------------------
+// AMPROPSETID_Pin -- the pin category property set.
+//
+// ICaptureGraphBuilder2::FindPin() asks a pin for its category through
+// IKsPropertySet(AMPROPSETID_Pin, AMPROPERTY_PIN_CATEGORY) before it will
+// render it.  RenderStream(PIN_CATEGORY_CAPTURE, ...) returns E_INVALIDARG
+// when no pin answers that query -- which is exactly how "the device shows
+// up in the list but the video never starts" presents itself in WeChat, QQ
+// and OBS.  The base classes do not implement this property set (CSource /
+// CSourceStream are just CBaseFilter / CBaseOutputPin), so the pin has to
+// do it itself.
+//
+// The registry-side FilterData is not enough: hosts query the running pin.
+//---------------------------------------------------------------------
+static const GUID kAMPROPSETID_Pin =
+{ 0x9b00f101, 0x1567, 0x11d1, { 0xb3, 0xf1, 0x00, 0xaa, 0x00, 0x37, 0x61, 0xc5 } };
+
+#define AMPROPERTY_PIN_CATEGORY_LOCAL 0     // AM_PROPERTY_PIN_CATEGORY
+#define AMPROPERTY_PIN_MEDIUM_LOCAL   1     // AM_PROPERTY_PIN_MEDIUM
+
+// ks.h / strmif.h do not always bring these in with a plain <streams.h>
+// build, so make sure they exist.
+#ifndef KSPROPERTY_SUPPORT_GET
+#define KSPROPERTY_SUPPORT_GET     0x00000001
+#endif
+#ifndef E_PROP_ID_UNSUPPORTED
+#define E_PROP_ID_UNSUPPORTED      ((HRESULT)0x80070490L)
+#endif
+#ifndef E_PROP_SET_UNSUPPORTED
+#define E_PROP_SET_UNSUPPORTED     ((HRESULT)0x80070492L)
+#endif
+
 
 // normally defined in the base-classes dllentry.cpp, which we do not link;
 // still referenced by dllsetup.obj (AMovieDllRegisterServer).
@@ -272,7 +324,7 @@ static void ConvToYUY2(const BYTE *src, BYTE *dst, ULONG width, ULONG height)
 //---------------------------------------------------------------------
 // CiSightStream : one output pin, delivering RGB24 / YUY2 / RGB32
 //---------------------------------------------------------------------
-class CiSightStream : public CSourceStream, public IAMStreamConfig
+class CiSightStream : public CSourceStream, public IAMStreamConfig, public IKsPropertySet
 {
 public:
     DECLARE_IUNKNOWN
@@ -293,7 +345,17 @@ public:
     STDMETHODIMP GetNumberOfCapabilities(int *piCount, int *piSize);
     STDMETHODIMP GetStreamCaps(int iIndex, AM_MEDIA_TYPE **ppmt, BYTE *pSCC);
 
-    // expose IAMStreamConfig
+    // IKsPropertySet -- this is how ICaptureGraphBuilder2 finds the
+    // PIN_CATEGORY_CAPTURE pin of a source filter.
+    STDMETHODIMP Set(REFGUID guidPropSet, DWORD dwID,
+                     void *pInstanceData, DWORD cbInstanceData,
+                     void *pPropData, DWORD cbPropData);
+    STDMETHODIMP Get(REFGUID guidPropSet, DWORD dwID,
+                     void *pInstanceData, DWORD cbInstanceData,
+                     void *pPropData, DWORD cbPropData, DWORD *pcbReturned);
+    STDMETHODIMP QuerySupported(REFGUID guidPropSet, DWORD dwPropID, DWORD *pTypeSupport);
+
+    // expose IAMStreamConfig / IKsPropertySet
     STDMETHODIMP NonDelegatingQueryInterface(REFIID riid, void **ppv);
 
 private:
@@ -478,6 +540,12 @@ bool CiSightStream::TryStart()
         }
 
         DWORD t0 = TickMs();
+        // Skip the CMU library's per-feature inquiry walk: it costs ~14 s on
+        // this driver (one synchronous IOCTL per register) and a capture
+        // filter exposes none of those controls anyway.  This is what
+        // brings the camera up in well under a second.
+        g_bISightFastBringUp = TRUE;
+
         int cameras = m_pCam->RefreshCameraList();
         if (cameras <= 0)
         {
@@ -505,15 +573,18 @@ bool CiSightStream::TryStart()
         FLog("TryStart: InitCamera OK, MaxSpeed=%d (enum=%lums init=%lums)",
              m_pCam->GetMaxSpeed(), (unsigned long)(t1 - t0), (unsigned long)(t2 - t1));
         ConfigureVideo();
+        DWORD t3 = TickMs();
+        FLog("TryStart: ConfigureVideo done (%lums) -> %ux%u @ rate %d",
+             (unsigned long)(t3 - t2), m_width, m_height, m_rateIndex);
         m_bInit = true;
     }
 
-    // 8 buffers and a 3 s frame timeout. StartImageAcquisition() would use
-    // the 6 / 1000 ms defaults, and the iSight needs a good second or two
-    // after the stream starts before its first frame appears -- with the
-    // tight default the very first AcquireImageEx comes back as
-    // CAM_ERROR_FRAME_TIMEOUT (-16) and the host sees nothing but black.
-    int rc = m_pCam->StartImageAcquisitionEx(8, 3000, ACQ_START_VIDEO_STREAM);
+    // 8 buffers and a 2 s frame timeout -- the exact configuration the
+    // standalone CMU diagnostic (isight-diag.exe) uses to pull 90 frames off
+    // this camera without a single timeout.  StartImageAcquisition() would
+    // use the library defaults (6 / 1000 ms) and the iSight needs a good
+    // second after the stream starts before frame 0 appears.
+    int rc = m_pCam->StartImageAcquisitionEx(8, 2000, ACQ_START_VIDEO_STREAM);
     if (rc != CAM_SUCCESS)
     {
         FLog("TryStart: StartImageAcquisition -> %d, dropping init state", rc);
@@ -1057,10 +1128,81 @@ STDMETHODIMP CiSightStream::NonDelegatingQueryInterface(REFIID riid, void **ppv)
     HRESULT hr;
     if (riid == __uuidof(IAMStreamConfig))
         hr = GetInterface((IAMStreamConfig *)this, ppv);
+    else if (riid == __uuidof(IKsPropertySet))
+        hr = GetInterface((IKsPropertySet *)this, ppv);
     else
         hr = CSourceStream::NonDelegatingQueryInterface(riid, ppv);
     FLog("pin QI %s -> %s", GuidName(riid), SUCCEEDED(hr) ? "OK" : "E_NOINTERFACE");
     return hr;
+}
+
+//---------------------------------------------------------------------
+// IKsPropertySet : report the pin category (PIN_CATEGORY_CAPTURE).
+//
+// Without this, ICaptureGraphBuilder2::RenderStream() -- the call every
+// real capture application makes -- cannot locate our output pin and
+// fails with E_INVALIDARG before a single media type is negotiated.
+//---------------------------------------------------------------------
+STDMETHODIMP CiSightStream::Set(REFGUID guidPropSet, DWORD /*dwID*/,
+                                void * /*pInstanceData*/, DWORD /*cbInstanceData*/,
+                                void * /*pPropData*/, DWORD /*cbPropData*/)
+{
+    if (guidPropSet == kAMPROPSETID_Pin)
+        return E_PROP_SET_UNSUPPORTED;      // all our pin properties are read-only
+    return E_PROP_SET_UNSUPPORTED;
+}
+
+STDMETHODIMP CiSightStream::Get(REFGUID guidPropSet, DWORD dwID,
+                                void * /*pInstanceData*/, DWORD /*cbInstanceData*/,
+                                void *pPropData, DWORD cbPropData, DWORD *pcbReturned)
+{
+    if (!(guidPropSet == kAMPROPSETID_Pin))
+        return E_PROP_SET_UNSUPPORTED;
+
+    if (dwID == AMPROPERTY_PIN_CATEGORY_LOCAL)
+    {
+        if (pcbReturned) *pcbReturned = sizeof(GUID);
+        if (pPropData == NULL)                       // size query
+            return S_OK;
+        if (cbPropData < sizeof(GUID))
+            return E_UNEXPECTED;
+        *(GUID *)pPropData = PIN_CATEGORY_CAPTURE;
+        FLog("pin IKsPropertySet Get(PIN_CATEGORY) -> CAPTURE");
+        return S_OK;
+    }
+
+    if (dwID == AMPROPERTY_PIN_MEDIUM_LOCAL)
+    {
+        // The iSight lives on a 1394 bus.  Answering this is optional; some
+        // graph builders use it to avoid mixing transport media.  We report
+        // "no medium" rather than inventing a GUID the camera does not have.
+        if (pcbReturned) *pcbReturned = 0;
+        return pPropData ? E_PROP_ID_UNSUPPORTED : S_OK;
+    }
+
+    return E_PROP_ID_UNSUPPORTED;
+}
+
+STDMETHODIMP CiSightStream::QuerySupported(REFGUID guidPropSet, DWORD dwPropID,
+                                           DWORD *pTypeSupport)
+{
+    if (!(guidPropSet == kAMPROPSETID_Pin))
+        return E_PROP_SET_UNSUPPORTED;
+
+    if (pTypeSupport == NULL)
+        return E_POINTER;
+
+    if (dwPropID == AMPROPERTY_PIN_CATEGORY_LOCAL)
+    {
+        *pTypeSupport = KSPROPERTY_SUPPORT_GET;
+        return S_OK;
+    }
+    if (dwPropID == AMPROPERTY_PIN_MEDIUM_LOCAL)
+    {
+        *pTypeSupport = KSPROPERTY_SUPPORT_GET;
+        return S_OK;
+    }
+    return E_PROP_ID_UNSUPPORTED;
 }
 
 //---------------------------------------------------------------------
@@ -1124,6 +1266,7 @@ public:
         if (pUnkOuter != NULL && !IsEqualIID(riid, IID_IUnknown))
             return CLASS_E_NOAGGREGATION;
 
+        FLog("=== %s ===", ISIGHT_BUILD_TAG);
         FLog("CreateInstance: riid=%s requested by %s", GuidName(riid), HostExeName());
 
         HRESULT hr = S_OK;
