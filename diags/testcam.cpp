@@ -32,6 +32,9 @@
 #define CMDR_IOCTL_BUS_RESET      CTL_CODE(FILE_DEVICE_UNKNOWN, CMDR_IOCTL_INDEX + 25, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define CMDR_IOCTL_GET_GENERATION CTL_CODE(FILE_DEVICE_UNKNOWN, CMDR_IOCTL_INDEX + 26, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+static BOOL DoBusReset(void);               // needs a 4-byte input buffer
+static void LogBusGeneration(const char *tag);
+
 static FILE *g_log = NULL;
 
 // ---- bus generation monitor -------------------------------------------
@@ -226,15 +229,44 @@ static void RunRateTest(C1394Camera &cam, unsigned long rate)
     if (ri != CAM_SUCCESS && g_genHandle != INVALID_HANDLE_VALUE)
     {
         LOG("post-mortem: issuing software BUS_RESET to test if camera revives...");
-        DWORD ret = 0;
-        BOOL br = DeviceIoControl(g_genHandle, CMDR_IOCTL_BUS_RESET, NULL, 0,
-                                  NULL, 0, &ret, NULL);
-        LOG("post-mortem: BUS_RESET -> %d (GetLastError=%lu)", br, GetLastError());
+        BOOL br = DoBusReset();
+        LOG("post-mortem: BUS_RESET -> %d (GetLastError=%lu)", br, br ? 0 : GetLastError());
         Sleep(3000);
         LOG("post-mortem: CheckLink=%d", cam.CheckLink());
         ri = cam.InitCamera(FALSE);
         LOG("post-mortem: InitCamera after bus reset -> %d (%s)", ri, CamErr(ri));
     }
+}
+
+// ---- manual recovery ---------------------------------------------------
+// Software bus reset: the "unwedge" button.  After the camera is switched
+// off in the middle of a stream it can be left in a state where it no longer
+// answers; forcing a bus reset from the host usually brings it straight
+// back, without rebooting the machine.  (The 4-byte input buffer is
+// required -- without it the driver rejects the request with
+// ERROR_INVALID_PARAMETER.)
+static BOOL DoBusReset(void)
+{
+    if (g_genHandle == INVALID_HANDLE_VALUE)
+        return FALSE;
+    DWORD in = 0, ret = 0;
+    return DeviceIoControl(g_genHandle, CMDR_IOCTL_BUS_RESET, &in, sizeof(in),
+                           NULL, 0, &ret, NULL);
+}
+
+static void LogBusGeneration(const char *tag)
+{
+    if (g_genHandle == INVALID_HANDLE_VALUE)
+    {
+        LOG("%s: bus generation unknown (no device handle)", tag);
+        return;
+    }
+    DWORD gen = 0, ret = 0;
+    if (DeviceIoControl(g_genHandle, CMDR_IOCTL_GET_GENERATION, NULL, 0,
+                        &gen, sizeof(gen), &ret, NULL))
+        LOG("%s: bus generation = %lu", tag, gen);
+    else
+        LOG("%s: GET_GENERATION_COUNT failed (%lu)", tag, GetLastError());
 }
 
 int main(int argc, char **argv)
@@ -249,6 +281,10 @@ int main(int argc, char **argv)
     if (!g_log && logpath[0]) g_log = fopen(logpath, "w");
 
     LOG("=== iSight CMU diagnostic %s ===", __TIMESTAMP__);
+
+    bool wantReset = false;                 // isight-diag.exe reset
+    for (int i = 1; i < argc; ++i)
+        if (!_stricmp(argv[i], "reset")) wantReset = true;
 
     C1394Camera cam;
 
@@ -276,6 +312,20 @@ int main(int argc, char **argv)
     // start the generation monitor EARLY so we also see resets during InitCamera
     StartGenMonitor(cam.GetDevicePath());
 
+    // "reset" mode: force a bus reset before anything else.  Run this when
+    // the camera stopped answering after being switched off / on mid-stream
+    // -- it is the recovery step the DirectShow filter now does on its own.
+    if (wantReset)
+    {
+        LogBusGeneration("recovery: before reset");
+        BOOL br = DoBusReset();
+        LOG("recovery: software BUS_RESET -> %d (GetLastError=%lu)", br, br ? 0 : GetLastError());
+        Sleep(2500);                        // let the bus re-enumerate
+        LogBusGeneration("recovery: after reset");
+        LOG("recovery: re-enumerating -> %d camera(s)", cam.RefreshCameraList());
+        cam.SelectCamera(0);
+    }
+
     // CheckLink re-enumerates and clears init state, so call it BEFORE InitCamera
     LOG("CheckLink -> %d", cam.CheckLink());
     cam.SelectCamera(0);
@@ -291,10 +341,8 @@ int main(int argc, char **argv)
     {
         // post-mortem experiment: does a software bus reset revive the camera?
         LOG("post-mortem: issuing software BUS_RESET to test if camera revives...");
-        DWORD ret = 0;
-        BOOL br = DeviceIoControl(g_genHandle, CMDR_IOCTL_BUS_RESET, NULL, 0,
-                                  NULL, 0, &ret, NULL);
-        LOG("post-mortem: BUS_RESET -> %d (GetLastError=%lu)", br, GetLastError());
+        BOOL br = DoBusReset();
+        LOG("post-mortem: BUS_RESET -> %d (GetLastError=%lu)", br, br ? 0 : GetLastError());
         Sleep(3000);
         LOG("post-mortem: CheckLink=%d", cam.CheckLink());
         cam.SelectCamera(0);
