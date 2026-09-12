@@ -122,6 +122,26 @@ jobs:
              setupapi.lib advapi32.lib user32.lib comctl32.lib ^
              /Fe:isight-raw.exe
 
+          cl /nologo /O2 /W3 /EHsc /GR /FS /Zc:twoPhase- /MD ^
+             /D_CRT_SECURE_NO_WARNINGS ^
+             diags\graphtest.cpp ^
+             strmiids.lib ole32.lib oleaut32.lib uuid.lib ^
+             /Fe:isight-graphtest.exe
+
+      - name: Setup MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build 32-bit graph test (WeChat/QQ are often 32-bit)
+        shell: cmd
+        run: |
+          cl /nologo /O2 /W3 /EHsc /GR /FS /Zc:twoPhase- /MD ^
+             /D_CRT_SECURE_NO_WARNINGS ^
+             diags\graphtest.cpp ^
+             strmiids.lib ole32.lib oleaut32.lib uuid.lib ^
+             /Fe:isight-graphtest32.exe
+
       - name: Upload diagnostic tool
         uses: actions/upload-artifact@v4
         with:
@@ -129,3 +149,5 @@ jobs:
           path: |
             isight-diag.exe
             isight-raw.exe
+            isight-graphtest.exe
+            isight-graphtest32.exe
