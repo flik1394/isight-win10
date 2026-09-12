@@ -115,6 +115,24 @@
 //     GetNumberOfCapabilities) and the negotiated sample size are logged, so
 //     the log shows which capability a host picked and how big its buffers
 //     really are.
+//
+// v11 additions -- making the [layout] box usable without guessing:
+//   * [layout] hosts=...  The box is applied *only* inside the named
+//     processes (default "Weixin.exe,WeChat.exe"), so QQ and every other
+//     host keep the untouched full frame.  An empty list applies it
+//     everywhere.
+//   * [layout] guide=1 draws a marker into the frame itself: a yellow
+//     border around the full 640x480 frame, a red border exactly on the
+//     layout box, and a white cross at its centre.  Whats visible in the
+//     host's window then tells us exactly how much the host crops, and the
+//     box can be matched to it (or the screenshot read back offline).
+//     The markers are symmetric, so a vertical flip does not move them.
+//   * orientation / layout / guide (and dump) are re-read from the ini
+//     while the stream is running, at most twice a second.  Editing the
+//     file reshapes the picture inside a second, so the box can be tuned
+//     live with the call window open instead of restarting WeChat per
+//     attempt.  [format] types= and [recovery] still need a fresh graph,
+//     because they are answered during connection setup.
 //=====================================================================
 
 #include <windows.h>
@@ -146,7 +164,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V10-20260912-LAYOUT"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V11-20260912-LAYOUT-LIVE"
 
 //---------------------------------------------------------------------
 // AMPROPSETID_Pin -- the pin category property set.
@@ -450,10 +468,17 @@ struct ISightOptions
     int  layoutW, layoutH;          // [layout] target=WxH, 0 = untouched
     int  typeOrder[3];              // [format] types=...  (indices into kAllSubs)
     int  typeCount;
+    // v11 -- who the layout box applies to, and a visible marker for
+    // calibrating it (see the v11 notes at the top of this file)
+    char hosts[160];                // [layout] hosts=..., empty = every host
+    bool guide;                     // [layout] guide=1 -> draw the marker
 };
 
 // the three subtypes we can produce, in the order they used to be advertised
 static const ISightOptions &Opts();          // defined below, used by SubTypeEnabled
+// v11 helper the option reader itself uses (defined right after Opts).
+// HostExeName() already exists above (the log prefix uses it).
+static bool HostInList(const char *list);
 
 static const GUID *const kAllSubs[3] =
 {
@@ -524,10 +549,19 @@ static void WriteDefaultIni(const char *path)
         "; target to the rectangle the host actually shows and the camera\n"
         "; picture is scaled down into it, centred, with black around it -- the\n"
         "; host's crop then lands on that rectangle and the whole scene is\n"
-        "; visible again.  Try 480x480, then 360x480 or 270x480 if it is still\n"
-        "; too close.  0 = off (send the frame untouched).\n"
+        "; visible again.  0 = off (send the frame untouched).  WeChat's call\n"
+        "; window is portrait, so 320x480 (2:3) is the usual answer; go wider\n"
+        "; (360x480, 480x480) if the picture still looks cut, narrower\n"
+        "; (270x480) if black bars show on the sides.\n"
+        "; hosts limits the box to those processes, so other hosts (QQ) keep\n"
+        "; the full frame; empty = every host.  guide=1 paints a yellow border\n"
+        "; on the full frame, a red border on the box and a white cross in its\n"
+        "; middle, which is how the box is matched to what the host shows.\n"
+        "; orientation/layout/guide are re-read while a call is running.\n"
         ";[layout]\n"
-        ";target=0\n");
+        ";target=0\n"
+        ";hosts=Weixin.exe,WeChat.exe\n"
+        ";guide=0\n");
     fclose(f);
 }
 
@@ -593,6 +627,10 @@ static const ISightOptions &Opts()
             s_o.layoutH = lh;
         }
 
+        // [layout] hosts=...  and  [layout] guide=1  (v11)
+        GetPrivateProfileStringA("layout", "hosts", "", s_o.hosts, sizeof(s_o.hosts), ini);
+        s_o.guide = GetPrivateProfileIntA("layout", "guide", 0, ini) != 0;
+
         FLog("options: yuy2=%s rgb=%s dump=%d busmon=%d bootdelay=%dms (ini=%s)",
              OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
              s_o.dump ? 1 : 0, s_o.busMon ? 1 : 0, s_o.bootDelayMs, ini);
@@ -610,9 +648,137 @@ static const ISightOptions &Opts()
                      order, s_o.layoutW, s_o.layoutH);
             else
                 FLog("options: types=%s layout target=off (full 640x480 frame)", order);
+            FLog("options: host='%s' layout hosts='%s' guide=%d -> layout %s",
+                 HostExeName(), s_o.hosts, s_o.guide ? 1 : 0,
+                 (s_o.layoutW > 0 && HostInList(s_o.hosts)) ? "ACTIVE" : "inactive");
         }
     }
     return s_o;
+}
+
+//---------------------------------------------------------------------
+// v11: the layout box exists for hosts that cut the frame down to their
+// own window shape; QQ and the rest must keep the untouched picture, so
+// the box is limited to a list of process names.
+//---------------------------------------------------------------------
+// [layout] hosts=weixin.exe,wechat.exe -- case-insensitive, comma/semicolon
+// separated.  An empty list means "every host".
+static bool ContainsNoCase(const char *hay, const char *needle)
+{
+    if (hay == NULL || needle == NULL || needle[0] == '\0')
+        return false;
+    const size_t nl = strlen(needle);
+    for (const char *p = hay; *p != '\0'; ++p)
+        if (_strnicmp(p, needle, nl) == 0)
+            return true;
+    return false;
+}
+
+static bool HostInList(const char *list)
+{
+    if (list == NULL || list[0] == '\0')
+        return true;
+
+    char tmp[160] = "";
+    _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s", list);
+    const char *me = HostExeName();
+    for (char *p = strtok(tmp, ",; \t"); p != NULL; p = strtok(NULL, ",; \t"))
+        if (ContainsNoCase(me, p))
+            return true;
+    return false;
+}
+
+// the rectangle the layout applies to right now, or 0/0 when it is off
+static void LayoutTarget(int *pw, int *ph)
+{
+    const ISightOptions &o = Opts();
+    if (o.layoutW > 0 && o.layoutH > 0 && HostInList(o.hosts))
+    {
+        *pw = o.layoutW;
+        *ph = o.layoutH;
+    }
+    else
+    {
+        *pw = *ph = 0;
+    }
+}
+
+//---------------------------------------------------------------------
+// v11: re-read the settings that act *inside* the frame while the stream
+// is running, so the layout box can be tuned with the call window open
+// instead of restarting the host for every attempt.  Checked on the
+// streaming thread, at most every 500 ms, and only through the file
+// stamp, so the cost is a stat() twice a second.  [format] types= and
+// [recovery] are deliberately left out: they are answered while the graph
+// is being built and cannot change on a live connection.
+//---------------------------------------------------------------------
+static void MaybeReloadTunables()
+{
+    static FILETIME s_stamp;
+    static bool     s_haveStamp = false;
+    static DWORD    s_nextCheck = 0;
+
+    const DWORD now = GetTickCount();
+    if (s_nextCheck != 0 && (LONG)(now - s_nextCheck) < 0)
+        return;
+    s_nextCheck = now + 500;
+
+    const char *ini = IniPath();
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(ini, GetFileExInfoStandard, &fad) == 0)
+        return;
+    if (s_haveStamp &&
+        fad.ftLastWriteTime.dwLowDateTime  == s_stamp.dwLowDateTime &&
+        fad.ftLastWriteTime.dwHighDateTime == s_stamp.dwHighDateTime)
+        return;
+    s_stamp = fad.ftLastWriteTime;
+    s_haveStamp = true;
+
+    ISightOptions &o = const_cast<ISightOptions &>(Opts());
+
+    const int  yuy2  = ClampOrient(GetPrivateProfileIntA("orientation", "yuy2", o.orientYUY2, ini));
+    const int  rgb   = ClampOrient(GetPrivateProfileIntA("orientation", "rgb",  o.orientRGB,  ini));
+    const bool dump  = GetPrivateProfileIntA("debug", "dump", o.dump ? 1 : 0, ini) != 0;
+    const bool guide = GetPrivateProfileIntA("layout", "guide", o.guide ? 1 : 0, ini) != 0;
+
+    int lw = o.layoutW, lh = o.layoutH;
+    char lay[64] = "";
+    GetPrivateProfileStringA("layout", "target", "", lay, sizeof(lay), ini);
+    if (lay[0] != '\0')
+    {
+        int a = 0, b = 0;
+        if (sscanf_s(lay, "%dx%d", &a, &b) == 2 && a > 0 && b > 0)
+        {
+            if (a < 64) a = 64;
+            if (a > ISIGHT_WIDTH)  a = ISIGHT_WIDTH;
+            if (b < 64) b = 64;
+            if (b > ISIGHT_HEIGHT) b = ISIGHT_HEIGHT;
+            lw = a;
+            lh = b;
+        }
+    }
+    if (_stricmp(lay, "0") == 0 || _stricmp(lay, "off") == 0)
+        lw = lh = 0;
+
+    char hosts[sizeof(o.hosts)] = "";
+    GetPrivateProfileStringA("layout", "hosts", o.hosts, hosts, sizeof(hosts), ini);
+
+    const bool changed =
+        (yuy2 != o.orientYUY2) || (rgb != o.orientRGB) || (dump != o.dump) ||
+        (guide != o.guide) || (lw != o.layoutW) || (lh != o.layoutH) ||
+        (strcmp(hosts, o.hosts) != 0);
+
+    o.orientYUY2 = yuy2;
+    o.orientRGB  = rgb;
+    o.dump       = dump;
+    o.guide      = guide;
+    o.layoutW    = lw;
+    o.layoutH    = lh;
+    _snprintf_s(o.hosts, sizeof(o.hosts), _TRUNCATE, "%s", hosts);
+
+    if (changed)
+        FLog("options: reloaded -> yuy2=%s rgb=%s dump=%d guide=%d layout=%dx%d hosts='%s'",
+             OrientName(yuy2), OrientName(rgb), dump ? 1 : 0, guide ? 1 : 0, lw, lh, hosts);
 }
 
 //---------------------------------------------------------------------
@@ -814,6 +980,77 @@ static void FitIntoRect(const BYTE *src, ULONG sw, ULONG sh,
             }
         }
     }
+}
+
+//---------------------------------------------------------------------
+// v11: paint the layout marker straight into the frame.  Everything drawn
+// is symmetric about the centre, so the optional vertical/horizontal flip
+// cannot move it.  Colours are BGR and the buffer is bottom-up: image row
+// y lives at buffer row (height-1-y).
+//---------------------------------------------------------------------
+static void GuideRow(BYTE *buf, ULONG dw, ULONG dh, int imgY, int x0, int x1,
+                     BYTE r, BYTE g, BYTE b, int thick)
+{
+    if (imgY < 0 || imgY >= (int)dh)
+        return;
+    if (x0 < 0) x0 = 0;
+    if (x1 > (int)dw - 1) x1 = (int)dw - 1;
+    if (x1 < x0)
+        return;
+    for (int t = 0; t < thick; ++t)
+    {
+        const int y = imgY + t;
+        if (y >= (int)dh)
+            break;
+        BYTE *row = buf + (size_t)(dh - 1 - y) * dw * 3;
+        for (int x = x0; x <= x1; ++x)
+        {
+            row[x * 3 + 0] = b;
+            row[x * 3 + 1] = g;
+            row[x * 3 + 2] = r;
+        }
+    }
+}
+
+static void GuideBox(BYTE *buf, ULONG dw, ULONG dh, int x, int y, int w, int h,
+                     BYTE r, BYTE g, BYTE b, int thick)
+{
+    if (w < 2 || h < 2)
+        return;
+    GuideRow(buf, dw, dh, y,             x, x + w - 1, r, g, b, thick);
+    GuideRow(buf, dw, dh, y + h - thick, x, x + w - 1, r, g, b, thick);
+    for (int i = 0; i < h; ++i)
+    {
+        GuideRow(buf, dw, dh, y + i, x,             x + thick - 1, r, g, b, 1);
+        GuideRow(buf, dw, dh, y + i, x + w - thick, x + w - 1,     r, g, b, 1);
+    }
+}
+
+static void DrawGuide(BYTE *buf, ULONG dw, ULONG dh, int boxW, int boxH)
+{
+    // yellow: the whole frame, i.e. everything the camera handed over
+    GuideBox(buf, dw, dh, 0, 0, (int)dw, (int)dh, 255, 255, 0, 2);
+
+    int rw = 0, rh = 0;
+    if (boxW > 0 && boxH > 0)
+    {
+        rw = boxW;
+        rh = boxH;
+        if (rw * (int)dh > rh * (int)dw) rw = (rh * (int)dw) / (int)dh;
+        else                             rh = (rw * (int)dh) / (int)dw;
+        const int rx = ((int)dw - rw) / 2;
+        const int ry = ((int)dh - rh) / 2;
+        // red: the layout box, the part that is supposed to survive the crop
+        GuideBox(buf, dw, dh, rx, ry, rw, rh, 255, 0, 0, 2);
+    }
+
+    // white cross dead centre, so a screenshot can be measured
+    const int cx  = (int)dw / 2;
+    const int cy  = (int)dh / 2;
+    const int arm = 24;
+    GuideRow(buf, dw, dh, cy, cx - arm, cx + arm, 255, 255, 255, 1);
+    for (int i = -arm; i <= arm; ++i)
+        GuideRow(buf, dw, dh, cy + i, cx, cx, 255, 255, 255, 1);
 }
 
 //---------------------------------------------------------------------
@@ -1563,6 +1800,11 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
 {
     CheckPointer(pSample, E_POINTER);
 
+    // v11: pick up edits to iSightCam.ini (orientation, layout, guide) so the
+    // picture can be reshaped while the call is up.  Cheap: the ini is only
+    // stat()ed twice a second.
+    MaybeReloadTunables();
+
     // the connected type decides the layout we must produce
     SubTypeInfo si = SubTypeFor(&m_mt.subtype);
     ULONG need = FrameBytesFor(si);
@@ -1644,25 +1886,31 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
                     }
                 }
 
-                // v10: if the host cuts the picture down to its own window
-                // shape, hand it a frame whose content already sits inside
-                // that shape (see the [layout] notes at the top of this file)
-                if (Opts().layoutW > 0 && Opts().layoutH > 0)
+                // v10/v11: if this host cuts the picture down to its own
+                // window shape, hand it a frame whose content already sits
+                // inside that shape (see the [layout] notes at the top of
+                // this file).  The box applies per host, and the fit buffer
+                // is cleared every frame so live edits leave no leftovers.
+                int lw = 0, lh = 0;
+                LayoutTarget(&lw, &lh);
+                if (lw > 0 && lh > 0)
                 {
                     if (m_pFit == NULL)
-                    {
                         m_pFit = new BYTE[ISIGHT_DIB_BYTES];
-                        if (m_pFit)
-                            ZeroMemory(m_pFit, ISIGHT_DIB_BYTES);   // black surround
-                    }
                     if (m_pFit)
                     {
+                        ZeroMemory(m_pFit, ISIGHT_DIB_BYTES);   // black surround
                         FitIntoRect(src, ISIGHT_WIDTH, ISIGHT_HEIGHT,
                                     m_pFit, ISIGHT_WIDTH, ISIGHT_HEIGHT,
-                                    (ULONG)Opts().layoutW, (ULONG)Opts().layoutH);
+                                    (ULONG)lw, (ULONG)lh);
                         src = m_pFit;
                     }
                 }
+
+                // v11: the marker goes on last, so it is visible both in the
+                // host's window and in the dumped frame.
+                if (Opts().guide)
+                    DrawGuide((PBYTE)src, ISIGHT_WIDTH, ISIGHT_HEIGHT, lw, lh);
 
                 int orient = OrientForSubType(si.subtype);
                 EmitFrame(src, pBuf, ISIGHT_WIDTH, ISIGHT_HEIGHT, orient, si);
