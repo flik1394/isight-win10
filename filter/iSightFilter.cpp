@@ -1,3 +1,21 @@
+// v6 changes  (the version that finally streams inside real hosts)
+//   * Active() no longer initialises the camera. CMU's InitCamera walks the
+//     whole capability table (~15 s here) and Active() runs inside the
+//     host's Pause()/Run() call, so applications timed out with "device
+//     detected but cannot open". Bring-up now happens on the streaming
+//     thread; black frames are delivered until it completes.
+//   * ConfigureVideo() no longer takes the first mode the driver reports.
+//     It used to select Mode 1 (320x240) while advertising 640x480, which
+//     made every AcquireImageEx return -16 (CAM_ERROR_FRAME_TIMEOUT): no
+//     picture ever appeared anywhere. It now verifies the frame size of
+//     each candidate and only accepts 640x480.
+//   * StartImageAcquisitionEx(8, 3000) instead of the 6/1000 ms default:
+//     the first frame legitimately takes 1-2 s after the stream starts.
+//   * the filter implements IAMFilterMiscFlags (IS_SOURCE) -- a capture
+//     filter that does not answer this query gets treated as a file reader.
+//   * every QueryInterface on the filter and on the pin is logged, so the
+//     log shows exactly which interface a host wanted when it refused to
+//     open the device.
 //=====================================================================
 // iSightFilter.cpp
 //
@@ -134,6 +152,32 @@ void FLog(const char *fmt, ...)
     LeaveCriticalSection(&s_cs);
 }
 
+static DWORD TickMs() { return (DWORD)GetTickCount64(); }
+
+// name the interfaces hosts ask for; __uuidof() keeps us free of any
+// dependency on which IID symbols a given SDK/lib happens to export.
+static const char *GuidName(REFIID g)
+{
+    if (g == __uuidof(IUnknown))              return "IUnknown";
+    if (g == __uuidof(IClassFactory))         return "IClassFactory";
+    if (g == __uuidof(IBaseFilter))           return "IBaseFilter";
+    if (g == __uuidof(IMediaFilter))          return "IMediaFilter";
+    if (g == __uuidof(IPersist))              return "IPersist";
+    if (g == __uuidof(IPersistStream))        return "IPersistStream";
+    if (g == __uuidof(IAMStreamConfig))       return "IAMStreamConfig";
+    if (g == __uuidof(IAMFilterMiscFlags))    return "IAMFilterMiscFlags";
+    if (g == __uuidof(ISpecifyPropertyPages)) return "ISpecifyPropertyPages";
+    if (g == __uuidof(IKsPropertySet))        return "IKsPropertySet";
+    if (g == __uuidof(IAMBufferNegotiation))  return "IAMBufferNegotiation";
+    if (g == __uuidof(IAMVideoProcAmp))       return "IAMVideoProcAmp";
+    if (g == __uuidof(IAMCameraControl))      return "IAMCameraControl";
+    if (g == __uuidof(IReferenceClock))       return "IReferenceClock";
+    if (g == __uuidof(IQualityControl))       return "IQualityControl";
+    if (g == __uuidof(IPin))                  return "IPin";
+    if (g == __uuidof(IMemInputPin))          return "IMemInputPin";
+    return "?";
+}
+
 //---------------------------------------------------------------------
 // format helpers
 //---------------------------------------------------------------------
@@ -253,7 +297,9 @@ public:
     STDMETHODIMP NonDelegatingQueryInterface(REFIID riid, void **ppv);
 
 private:
-    bool  TryStart();          // lazily init camera + start acquisition
+    bool  TryStart();          // background bring-up worker
+    void  KickBringUp();       // start TryStart() off-thread (never blocks)
+    static DWORD WINAPI BringUpThunk(LPVOID p);
     void  ReleaseCamera();     // stop acquisition + drop the CMU handle
     void  ConfigureVideo();
     void  BuildMediaType(const GUID *subtype, REFERENCE_TIME interval, CMediaType *pmt) const;
@@ -271,19 +317,32 @@ private:
     unsigned long    m_frameCount;    // frames delivered since Active
     PBYTE            m_pScratch;      // RGB24 DIB scratch buffer
     ULONG            m_scratchBytes;
+    PBYTE            m_pFull;         // 640x480 BGR scratch (letterbox path)
+    volatile PVOID   m_hBringUp;      // background bring-up thread
+    volatile LONG    m_bringUpState;  // 0 idle, 1 running, 2 ok, 3 failed
+    int              m_bringUpRetry;  // frames to wait before retrying
 };
 
 //---------------------------------------------------------------------
 // CiSightSource : the filter
 //---------------------------------------------------------------------
-class CiSightSource : public CSource
+class CiSightSource : public CSource, public IAMFilterMiscFlags
 {
 public:
     DECLARE_IUNKNOWN
     static CUnknown *WINAPI CreateInstance(LPUNKNOWN lpunk, HRESULT *phr);
 
+    // Live source. Hosts (WeChat/QQ and ICaptureGraphBuilder2 alike) query
+    // this to decide whether the device is a real-time source; a capture
+    // filter that does not answer IAMFilterMiscFlags gets treated like a
+    // file reader and the preview path bails out.
+    STDMETHODIMP_(ULONG) GetMiscFlags() override { return AM_FILTER_MISC_FLAGS_IS_SOURCE; }
+
+    STDMETHODIMP NonDelegatingQueryInterface(REFIID riid, void **ppv);
+
 private:
     CiSightSource(LPUNKNOWN lpunk, HRESULT *phr);
+    ~CiSightSource() { FLog("~CiSightSource: filter destroyed"); }
 };
 
 //---------------------------------------------------------------------
@@ -306,6 +365,21 @@ CUnknown *WINAPI CiSightSource::CreateInstance(LPUNKNOWN lpunk, HRESULT *phr)
     return punk;
 }
 
+// every QI a host makes on the filter is logged: when an application
+// "sees the camera but cannot open it", this is the list that shows
+// which interface it was looking for.
+STDMETHODIMP CiSightSource::NonDelegatingQueryInterface(REFIID riid, void **ppv)
+{
+    HRESULT hr;
+    if (riid == __uuidof(IAMFilterMiscFlags))
+        hr = GetInterface((IAMFilterMiscFlags *)this, ppv);
+    else
+        hr = CSource::NonDelegatingQueryInterface(riid, ppv);
+
+    FLog("filter QI %s -> %s", GuidName(riid), SUCCEEDED(hr) ? "OK" : "E_NOINTERFACE");
+    return hr;
+}
+
 //---------------------------------------------------------------------
 // CiSightStream implementation
 //---------------------------------------------------------------------
@@ -323,6 +397,10 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_frameCount(0)
     , m_pScratch(NULL)
     , m_scratchBytes(0)
+    , m_pFull(NULL)
+    , m_hBringUp(NULL)
+    , m_bringUpState(0)
+    , m_bringUpRetry(0)
 {
 }
 
@@ -335,6 +413,46 @@ CiSightStream::~CiSightStream()
         delete[] m_pScratch;
         m_pScratch = NULL;
     }
+    if (m_pFull)
+    {
+        delete[] m_pFull;
+        m_pFull = NULL;
+    }
+}
+
+// Camera bring-up takes ~15 s (the CMU library reads the whole capability
+// table register by register). It therefore must not run on a thread the
+// host is waiting on: Active()/Pause()/Run() and FillBuffer() all have to
+// return promptly, so the work is handed to this one-shot thread and the
+// pin keeps emitting black frames until the camera is live.
+void CiSightStream::KickBringUp()
+{
+    if (InterlockedCompareExchange(&m_bringUpState, 0, 0) == 1)
+        return;                                   // already running
+
+    // drop the handle of the previous (finished) attempt
+    PVOID old = InterlockedExchangePointer(&m_hBringUp, NULL);
+    if (old) CloseHandle((HANDLE)old);
+
+    InterlockedExchange(&m_bringUpState, 1);
+    HANDLE h = CreateThread(NULL, 0, &CiSightStream::BringUpThunk, this, 0, NULL);
+    if (h == NULL)
+    {
+        // no thread available: do it synchronously (old behaviour) rather
+        // than never bringing the camera up at all
+        InterlockedExchange(&m_bringUpState, TryStart() ? 2 : 3);
+        return;
+    }
+    InterlockedExchangePointer(&m_hBringUp, (PVOID)h);   // closed in ReleaseCamera
+    FLog("KickBringUp: camera bring-up started on a worker thread");
+}
+
+DWORD WINAPI CiSightStream::BringUpThunk(LPVOID p)
+{
+    CiSightStream *self = (CiSightStream *)p;
+    bool ok = self->TryStart();
+    InterlockedExchange(&self->m_bringUpState, ok ? 2 : 3);
+    return 0;
 }
 
 // bring the camera up and start isochronous acquisition. never throws,
@@ -359,6 +477,7 @@ bool CiSightStream::TryStart()
             }
         }
 
+        DWORD t0 = TickMs();
         int cameras = m_pCam->RefreshCameraList();
         if (cameras <= 0)
         {
@@ -370,6 +489,7 @@ bool CiSightStream::TryStart()
             FLog("TryStart: SelectCamera(0) failed");
             return false;
         }
+        DWORD t1 = TickMs();
 
         int rc = m_pCam->InitCamera(FALSE);
         if (rc != CAM_SUCCESS)
@@ -377,12 +497,23 @@ bool CiSightStream::TryStart()
             FLog("TryStart: InitCamera -> %d (CAM_SUCCESS=%d)", rc, CAM_SUCCESS);
             return false;
         }
-        FLog("TryStart: InitCamera OK, MaxSpeed=%d", m_pCam->GetMaxSpeed());
+        DWORD t2 = TickMs();
+        // NOTE: this is a slow call (it walks the whole capability table
+        // register by register -- ~15 s on this driver/hardware). That is
+        // why it must never run inside Active(): it is done here on the
+        // streaming thread instead.
+        FLog("TryStart: InitCamera OK, MaxSpeed=%d (enum=%lums init=%lums)",
+             m_pCam->GetMaxSpeed(), (unsigned long)(t1 - t0), (unsigned long)(t2 - t1));
         ConfigureVideo();
         m_bInit = true;
     }
 
-    int rc = m_pCam->StartImageAcquisition();
+    // 8 buffers and a 3 s frame timeout. StartImageAcquisition() would use
+    // the 6 / 1000 ms defaults, and the iSight needs a good second or two
+    // after the stream starts before its first frame appears -- with the
+    // tight default the very first AcquireImageEx comes back as
+    // CAM_ERROR_FRAME_TIMEOUT (-16) and the host sees nothing but black.
+    int rc = m_pCam->StartImageAcquisitionEx(8, 3000, ACQ_START_VIDEO_STREAM);
     if (rc != CAM_SUCCESS)
     {
         FLog("TryStart: StartImageAcquisition -> %d, dropping init state", rc);
@@ -398,6 +529,14 @@ bool CiSightStream::TryStart()
 
 void CiSightStream::ReleaseCamera()
 {
+    // never pull the camera object out from under the bring-up thread
+    PVOID h = InterlockedExchangePointer(&m_hBringUp, NULL);
+    if (h)
+    {
+        WaitForSingleObject((HANDLE)h, 30000);
+        CloseHandle((HANDLE)h);
+    }
+
     CAutoLock lock(&m_csCamera);
     if (m_pCam)
     {
@@ -412,55 +551,93 @@ void CiSightStream::ReleaseCamera()
     }
     m_bInit = false;
     m_consecFail = 0;
+    InterlockedExchange(&m_bringUpState, 0);   // allow a fresh bring-up later
+    m_bringUpRetry = 0;
 }
 
-// prefer Format 0 / Mode 2 (640x480 YUV422). The iSight is an S100
-// (100 Mbit/s) device: 640x480 YUV422 @ 30fps needs ~150 Mbit/s of
-// isochronous bandwidth and does NOT fit. Cap the rate at 15 fps
-// (~74 Mbit/s), which is the classic working setting for this camera.
-// The iSight always exposes mode 2.
+// Must end up with Format 0 / Mode 2 (640x480 YUV422). The iSight also
+// advertises smaller modes, and the naive "first supported mode wins"
+// scan picks Mode 1 (320x240) -- the driver then streams 320x240 while
+// the media type we advertise (and the direct-show buffer we hand out)
+// is 640x480, so every AcquireImageEx fails. So: verify the size after
+// every candidate and only accept an exact 640x480.
+// Rate is capped at 15 fps: the iSight is an S100 (100 Mbit/s) device
+// and 640x480 YUV422 @ 30 fps (~150 Mbit/s) does not fit on the bus.
 void CiSightStream::ConfigureVideo()
 {
-    bool found = false;
-
-    for (unsigned long f = 0; f < 3 && !found; f++)
+    static const struct { unsigned long fmt, mode; } kCandidates[] =
     {
+        { 0, 2 },      // Format 0 / Mode 2 -> 640x480  (what we want)
+        { 1, 0 },      // Format 1 / Mode 0 -> 800x600  (never on an iSight)
+        { 0, 1 }       // last resort: 320x240 (will be letterboxed)
+    };
+
+    bool ok = false;
+    unsigned long w = 0, h = 0;
+    int bestRate = kMaxRateIndex;
+
+    for (int ci = 0; ci < (int)_countof(kCandidates) && !ok; ++ci)
+    {
+        unsigned long f = kCandidates[ci].fmt;
+        unsigned long m = kCandidates[ci].mode;
+
         if (!m_pCam->HasVideoFormat(f))
             continue;
-        for (unsigned long m = 0; m < 8 && !found; m++)
+        if (!m_pCam->HasVideoMode(f, m))
+            continue;
+
+        for (int r = kMaxRateIndex; r >= 0 && !ok; --r)
         {
-            if (!m_pCam->HasVideoMode(f, m))
+            if (!m_pCam->HasVideoFrameRate(f, m, (unsigned long)r))
                 continue;
-            for (int r = kMaxRateIndex; r >= 0 && !found; r--)
+
+            if (m_pCam->SetVideoFormat(f) != CAM_SUCCESS) continue;
+            if (m_pCam->SetVideoMode(m) != CAM_SUCCESS)   continue;
+            if (m_pCam->SetVideoFrameRate((unsigned long)r) != CAM_SUCCESS) continue;
+
+            m_pCam->UpdateParameters(TRUE);
+            w = h = 0;
+            m_pCam->GetVideoFrameDimensions(&w, &h);
+
+            if (w == ISIGHT_WIDTH && h == ISIGHT_HEIGHT)
             {
-                if (!m_pCam->HasVideoFrameRate(f, m, (unsigned long)r))
-                    continue;
-                m_pCam->SetVideoFormat(f);
-                m_pCam->SetVideoMode(m);
-                m_pCam->SetVideoFrameRate((unsigned long)r);
                 m_rateIndex = r;
-                found = true;
-                FLog("ConfigureVideo: format=%lu mode=%lu rate=%d", f, m, r);
+                m_width = w;
+                m_height = h;
+                ok = true;
+                FLog("ConfigureVideo: format=%lu mode=%lu rate=%d -> %lux%lu", f, m, r, w, h);
+            }
+            else
+            {
+                FLog("ConfigureVideo: format=%lu mode=%lu rate=%d gave %lux%lu, next",
+                     f, m, r, w, h);
+                if (bestRate > r)
+                    bestRate = r;
             }
         }
     }
 
-    if (!found)
+    if (!ok)
     {
-        m_rateIndex = kMaxRateIndex;
-        FLog("ConfigureVideo: no supported format/mode/rate found, keeping %d", m_rateIndex);
-    }
-    else
-    {
-        unsigned long w = 0, h = 0;
-        m_pCam->GetVideoFrameDimensions(&w, &h);
+        // nothing gave us 640x480: fall back to mode 2 at the slowest
+        // usable rate and let FillBuffer letterbox whatever arrives.
+        m_rateIndex = bestRate;
+        if (m_pCam->HasVideoFormat(0) && m_pCam->HasVideoMode(0, 2))
+        {
+            m_pCam->SetVideoFormat(0);
+            m_pCam->SetVideoMode(2);
+            m_pCam->SetVideoFrameRate((unsigned long)m_rateIndex);
+            m_pCam->UpdateParameters(TRUE);
+            w = h = 0;
+            m_pCam->GetVideoFrameDimensions(&w, &h);
+        }
+        FLog("ConfigureVideo: NO 640x480 mode found, falling back to %lux%lu @ rate %d",
+             w, h, m_rateIndex);
         if (w && h)
         {
             m_width = w;
             m_height = h;
         }
-        if (w != ISIGHT_WIDTH || h != ISIGHT_HEIGHT)
-            FLog("ConfigureVideo: unexpected frame size %lux%lu", w, h);
     }
     m_pCam->UpdateParameters(TRUE);
 }
@@ -478,7 +655,13 @@ HRESULT CiSightStream::Active()
         return hr;
     }
     FLog("Active: pin active");
-    TryStart();   // failure is not fatal; FillBuffer retries per-frame
+    // DO NOT touch the camera here. Camera bring-up costs ~15 s (the CMU
+    // library reads the whole capability table) and Active() runs inside
+    // the host's Pause()/Run() call: blocking here makes every application
+    // -- WeChat, QQ, OBS -- give up with "cannot open camera". We just
+    // start it on its own thread and hand out black frames until it is up.
+    if (IsConnected())
+        KickBringUp();
     return S_OK;
 }
 
@@ -503,7 +686,30 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
         return E_FAIL;
 
     bool got = false;
-    if (TryStart())
+    if (!m_bAcquiring)
+    {
+        // camera not live yet: keep the graph fed with black frames and
+        // make sure the bring-up thread is running (or retry it after a
+        // failure). Never block this thread on the ~15 s hardware init.
+        LONG st = InterlockedCompareExchange(&m_bringUpState, 0, 0);
+        if (st == 2 || st == 0)
+        {
+            if (st == 2)   // finished, but the stream was stopped again
+                InterlockedExchange(&m_bringUpState, 0);
+            KickBringUp();
+        }
+        else if (st == 3)
+        {
+            if (++m_bringUpRetry >= 150)   // ~10 s at 15 fps
+            {
+                m_bringUpRetry = 0;
+                FLog("FillBuffer: retrying camera bring-up");
+                InterlockedExchange(&m_bringUpState, 0);
+                KickBringUp();
+            }
+        }
+    }
+    if (m_bAcquiring)
     {
         CAutoLock lock(&m_csCamera);
         int dropped = 0;
@@ -511,20 +717,46 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
 
         if (rc == CAM_SUCCESS)
         {
-            if (m_pScratch == NULL)
+            // size the scratch buffer from what the camera actually streams
+            ULONG frameBytes = m_width * m_height * 3;
+            if (m_pScratch == NULL || m_scratchBytes < frameBytes)
             {
-                m_pScratch = new BYTE[ISIGHT_DIB_BYTES];
-                m_scratchBytes = m_pScratch ? ISIGHT_DIB_BYTES : 0;
+                if (m_pScratch) { delete[] m_pScratch; m_pScratch = NULL; }
+                m_pScratch = new BYTE[frameBytes];
+                m_scratchBytes = m_pScratch ? frameBytes : 0;
             }
             if (m_pScratch &&
                 m_pCam->getDIB(m_pScratch, m_scratchBytes) == CAM_SUCCESS)
             {
+                const BYTE *src = m_pScratch;
+                if (m_width != ISIGHT_WIDTH || m_height != ISIGHT_HEIGHT)
+                {
+                    // the driver gave us a smaller mode than the 640x480 we
+                    // advertise: letterbox into a black full-size frame so
+                    // the downstream buffer is always the agreed size
+                    if (m_pFull == NULL)
+                    {
+                        m_pFull = new BYTE[ISIGHT_DIB_BYTES];
+                        if (m_pFull) ZeroMemory(m_pFull, ISIGHT_DIB_BYTES);
+                    }
+                    if (m_pFull)
+                    {
+                        ULONG cw = (m_width  < ISIGHT_WIDTH)  ? m_width  : ISIGHT_WIDTH;
+                        ULONG ch = (m_height < ISIGHT_HEIGHT) ? m_height : ISIGHT_HEIGHT;
+                        for (ULONG y = 0; y < ch; ++y)
+                            memcpy(m_pFull + (size_t)y * ISIGHT_WIDTH * 3,
+                                   m_pScratch + (size_t)y * m_width * 3,
+                                   (size_t)cw * 3);
+                        src = m_pFull;
+                    }
+                }
+
                 if (*si.subtype == MEDIASUBTYPE_YUY2)
-                    ConvToYUY2(m_pScratch, pBuf, m_width, m_height);
+                    ConvToYUY2(src, pBuf, ISIGHT_WIDTH, ISIGHT_HEIGHT);
                 else if (*si.subtype == MEDIASUBTYPE_RGB32)
-                    ConvToRGB32(m_pScratch, pBuf, m_width * m_height);
+                    ConvToRGB32(src, pBuf, ISIGHT_WIDTH * ISIGHT_HEIGHT);
                 else
-                    memcpy(pBuf, m_pScratch, ISIGHT_DIB_BYTES);
+                    memcpy(pBuf, src, ISIGHT_DIB_BYTES);
 
                 got = true;
                 m_consecFail = 0;
@@ -546,13 +778,21 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
         {
             m_consecFail++;
             if (m_consecFail <= 3 || (m_consecFail % 60) == 0)
-                FLog("FillBuffer: AcquireImageEx -> %d (fail streak %d)", rc, m_consecFail);
-            if (m_consecFail == 100)
+                FLog("FillBuffer: AcquireImageEx -> %d (fail streak %d, %lux%lu @ rate %d)",
+                     rc, m_consecFail, m_width, m_height, m_rateIndex);
+            if (m_consecFail == 12)
             {
-                FLog("FillBuffer: camera unresponsive, re-initialising");
+                // a 3 s-timeout grab failing a dozen times in a row means the
+                // stream really is gone: drop it and let the bring-up thread
+                // start a clean one (never here -- this is the streaming
+                // thread and it must keep producing samples)
+                FLog("FillBuffer: camera unresponsive, dropping stream for re-init");
                 m_pCam->StopImageAcquisition();
                 m_bAcquiring = false;
                 m_bInit = false;
+                m_consecFail = 0;
+                InterlockedExchange(&m_bringUpState, 0);
+                KickBringUp();
             }
         }
     }
@@ -814,9 +1054,13 @@ STDMETHODIMP CiSightStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE **ppmt, BYTE
 STDMETHODIMP CiSightStream::NonDelegatingQueryInterface(REFIID riid, void **ppv)
 {
     CheckPointer(ppv, E_POINTER);
-    if (riid == IID_IAMStreamConfig)
-        return GetInterface((IAMStreamConfig *)this, ppv);
-    return CSourceStream::NonDelegatingQueryInterface(riid, ppv);
+    HRESULT hr;
+    if (riid == __uuidof(IAMStreamConfig))
+        hr = GetInterface((IAMStreamConfig *)this, ppv);
+    else
+        hr = CSourceStream::NonDelegatingQueryInterface(riid, ppv);
+    FLog("pin QI %s -> %s", GuidName(riid), SUCCEEDED(hr) ? "OK" : "E_NOINTERFACE");
+    return hr;
 }
 
 //---------------------------------------------------------------------
@@ -880,7 +1124,7 @@ public:
         if (pUnkOuter != NULL && !IsEqualIID(riid, IID_IUnknown))
             return CLASS_E_NOAGGREGATION;
 
-        FLog("CreateInstance: riid requested by %s", HostExeName());
+        FLog("CreateInstance: riid=%s requested by %s", GuidName(riid), HostExeName());
 
         HRESULT hr = S_OK;
         CUnknown *punk = m_pTemplate->CreateInstance(pUnkOuter, &hr);
