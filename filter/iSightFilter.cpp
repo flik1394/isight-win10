@@ -887,15 +887,24 @@ DWORD WINAPI CiSightStream::BusMonThunk(LPVOID p)
         {
             if (self->m_monPath[0] == 0)
             {
-                // the path is derived from the camera's EUI-64, so it stays
-                // valid across resets.  Resolve it through the CMU library
-                // while holding the camera lock (same driver).
-                char path[512] = "";
+                // Resolve the camera's device path.  It contains the camera's
+                // EUI-64, so it survives bus resets and only has to be looked
+                // up again while the camera is off the bus.
+                //
+                // t1394CmdrGetDeviceList() builds a fresh SetupAPI device list
+                // on every call and never frees it (the CMU library leaks one
+                // per RefreshCameraList as well), so we destroy it ourselves --
+                // a camera left switched off would otherwise leak a handle
+                // every 200 ms.  GetDevicePath keeps no state, so calling it
+                // here needs no lock.
+                HDEVINFO list = t1394CmdrGetDeviceList();
+                if (list != INVALID_HANDLE_VALUE)
                 {
-                    CAutoLock lock(&self->m_csCamera);
+                    char path[512] = "";
                     ULONG sz = sizeof(path);
-                    if (t1394CmdrGetDevicePath(t1394CmdrGetDeviceList(), 0, path, &sz) > 0)
+                    if (t1394CmdrGetDevicePath(list, 0, path, &sz) > 0)
                         strncpy_s(self->m_monPath, path, _TRUNCATE);
+                    SetupDiDestroyDeviceInfoList(list);
                 }
                 if (self->m_monPath[0] == 0)
                 {
