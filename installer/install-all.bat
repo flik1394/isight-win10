@@ -1,16 +1,22 @@
 @echo off
 setlocal EnableExtensions
+rem 本文件以 GBK(936) 编码打包，先锁定控制台代码页，避免中文变乱码
+chcp 936 >nul 2>&1
 rem ============================================================
 rem  install-all.bat  -  注册 Apple iSight (FireWire) DirectShow 摄像头
-rem  v7：必须右键"以管理员身份运行"
+rem  v8：必须右键"以管理员身份运行"
 rem
-rem  这一版多做三件事，因为上一版把 64 位组件漏装了（表现为
-rem  "微信/QQ 还是老样子"，实际它们加载的是 System32 里的旧文件）：
-rem    1. 拒绝在 32 位 cmd 里运行——那会让对 System32 的写入被重定向到
-rem       SysWOW64，"64 位没装上"却毫无提示
-rem    2. 目标文件被占用时先改名再复制（Windows 允许改名已映射的 DLL，
-rem       不允许直接覆盖，这就是上次 copy 静默失败的原因）
-rem    3. 复制后按内置版本标记校验，装没装上一眼可见
+rem  这一版修的是画面显示：
+rem    1. 微信把 YUY2 缓冲当成自上而下读，导致画面上下颠倒；
+rem       现在 YUY2 输出改为自上而下 + biHeight 取负，QQ/微信
+rem       都能得到正向画面
+rem    2. 朝向可运行期调整，不必重新编译：改
+rem         %LOCALAPPDATA%\iSightCam.ini
+rem       里的 yuy2 / rgb（0=不变 1=上下翻 2=左右翻 3=旋转180）
+rem
+rem  沿用上一版的两条保护（曾经把 64 位组件静默漏装过）：
+rem    * 拒绝在 32 位 cmd 里运行
+rem    * 目标文件被占用时先改名再复制，复制后按版本标记自检
 rem ============================================================
 
 set "TAG=ISIGHTFILTER-BUILD-V7-20260912-PINCAT"
@@ -98,6 +104,11 @@ echo  "Apple iSight (FireWire)"。
 echo.
 echo  验证版本：运行 isight-graphtest.exe，日志里会打印实际
 echo  加载的 build tag（应为 %TAG%）。
+echo.
+echo  画面朝向不对时（例如微信里上下颠倒）：编辑
+echo    %LOCALAPPDATA%\iSightCam.ini
+echo  把 [orientation] 下的 yuy2 改成 0/2/3 逐个试，
+echo  保存后重开微信即可，不需要重装或重编译。
 echo ============================================================
 pause
 exit /b 0
@@ -130,10 +141,10 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V7" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V8" "%~1" >nul 2>&1
 if errorlevel 1 (
-    echo     [FAIL] %~1 里没有 v7 标记 —— 这个文件还是旧版！
+    echo     [FAIL] %~1 里没有 v8 标记 —— 这个文件还是旧版！
     exit /b 1
 )
-for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v7 标记
+for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v8 标记
 exit /b 0
