@@ -56,9 +56,38 @@
 //     table: on this driver that walk is ~14 s of synchronous IOCTLs, far
 //     longer than a host is willing to wait for a first frame
 //     (g_bISightFastBringUp in the CMU library).
+//
+// v8 additions
+//   * YUY2 rows are written top-down and biHeight is declared negative, so
+//     both kinds of consumer (those that honour the sign and WeChat, which
+//     ignores it) end up with an upright picture.
+//   * %LOCALAPPDATA%\iSightCam.ini: orientation and debug options that can
+//     be changed without rebuilding the filter.
+//
+// v9 additions -- recovering from a bus reset (the camera was switched off
+// and on again while a host was streaming):
+//   * a bus monitor thread watches IOCTL_GET_GENERATION_COUNT on the camera
+//     device and also notices when the device disappears from the bus, so a
+//     power cycle is seen within ~200 ms instead of after 12 acquire
+//     timeouts (24 s+). The generation counter is the authoritative signal:
+//     every plug/unplug resets the bus and bumps it.
+//   * on such an event the CMU handle is dropped and a *fresh* C1394Camera
+//     is created after a short delay (the camera needs ~2 s to boot), then
+//     re-enumerated, re-configured and restarted. The stale handle is the
+//     trap: after a bus reset the node address changes and the old one
+//     never produces another frame.
+//   * bring-up retries now run on a 1 s cadence (they used to be 10 s
+//     apart) and the acquire-failure threshold dropped from 12 to 3, so a
+//     host that is merely streaming (no bus monitor available) still
+//     recovers in a few seconds.
+//   * every per-QI log line is throttled and the log file is kept open.
+//     QQ asks for IKsPropertySet ~11 000 times during one enumeration and a
+//     line + fopen/fclose per probe wrote 3.8 MB in three minutes, which
+//     both hid the real events and slowed the host down.
 //=====================================================================
 
 #include <windows.h>
+#include <winioctl.h>       // CTL_CODE for the 1394 generation-count IOCTL
 #include <streams.h>
 #include <setupapi.h>
 #include <shlwapi.h>
@@ -86,7 +115,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V8-20260912-ORIENT"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V9-20260912-BUSRESET"
 
 //---------------------------------------------------------------------
 // AMPROPSETID_Pin -- the pin category property set.
@@ -176,32 +205,95 @@ static const char *LogPath()
     return s_path;
 }
 
-void FLog(const char *fmt, ...)
+static void BuildLogLine(char *out, size_t cb, const char *msg)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    _snprintf_s(out, cb, _TRUNCATE, "[%02d:%02d:%02d.%03d pid=%lu %s] %s\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                (unsigned long)GetCurrentProcessId(), HostExeName(), msg);
+}
+
+// one critical section for the log and for the throttle table; the file
+// handle is opened once and kept open (fopen/fclose per line was a real
+// cost in the hot path -- see the v9 notes at the top of this file).
+static CRITICAL_SECTION &LogLock()
 {
     static CRITICAL_SECTION s_cs;
     static LONG s_once = 0;
     if (InterlockedCompareExchange(&s_once, 1, 0) == 0)
         InitializeCriticalSection(&s_cs);
+    return s_cs;
+}
+
+static void LogWrite(const char *msg)
+{
+    char line[1200];
+    BuildLogLine(line, sizeof(line), msg);
+
+    EnterCriticalSection(&LogLock());
+    static FILE *s_f = NULL;
+    static LONG s_tried = 0;
+    if (s_f == NULL && InterlockedCompareExchange(&s_tried, 1, 0) == 0)
+        s_f = fopen(LogPath(), "a");
+    if (s_f)
+    {
+        fputs(line, s_f);
+        fflush(s_f);
+    }
+    LeaveCriticalSection(&LogLock());
+}
+
+void FLog(const char *fmt, ...)
+{
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    LogWrite(msg);
+}
+
+// Throttled log: the first few occurrences of a "key" are written, then
+// only every 200th. Hosts probe interfaces in tight loops (see v9 notes),
+// and a per-probe line buries the events that actually matter.
+void FLogT(const char *key, const char *fmt, ...)
+{
+    static struct { char key[48]; LONG n; } s_tab[128];
+    static int s_used = 0;
+    LONG n = 1;
+
+    EnterCriticalSection(&LogLock());
+    for (int i = 0; i < s_used; ++i)
+    {
+        if (strcmp(s_tab[i].key, key) == 0)
+        {
+            n = InterlockedIncrement(&s_tab[i].n);
+            break;
+        }
+    }
+    if (n == 1 && s_used < (int)(sizeof(s_tab) / sizeof(s_tab[0])))
+    {
+        strncpy_s(s_tab[s_used].key, key, _TRUNCATE);
+        s_tab[s_used].n = 1;
+        ++s_used;
+    }
+    LeaveCriticalSection(&LogLock());
+
+    if (n > 3 && (n % 200) != 0)
+        return;
 
     char msg[1024];
     va_list ap;
     va_start(ap, fmt);
     _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, fmt, ap);
     va_end(ap);
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-
-    EnterCriticalSection(&s_cs);
-    FILE *f = fopen(LogPath(), "a");
-    if (f)
+    if (n > 3)
     {
-        fprintf(f, "[%02d:%02d:%02d.%03d pid=%lu %s] %s\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                (unsigned long)GetCurrentProcessId(), HostExeName(), msg);
-        fclose(f);
+        size_t len = strlen(msg);
+        _snprintf_s(msg + len, sizeof(msg) - len, _TRUNCATE, "  [x%ld]", n);
     }
-    LeaveCriticalSection(&s_cs);
+    LogWrite(msg);
 }
 
 static DWORD TickMs() { return (DWORD)GetTickCount64(); }
@@ -300,6 +392,8 @@ struct ISightOptions
     int  orientYUY2;
     int  orientRGB;
     bool dump;
+    int  bootDelayMs;   // wait after a bus reset before touching the camera
+    bool busMon;        // watch the bus generation counter
 };
 
 // hand the user a commented file on first use, so changing the
@@ -324,7 +418,15 @@ static void WriteDefaultIni(const char *path)
         "; debug: dump=1 writes the first two frames of every process to\n"
         "; <LOCALAPPDATA>\\iSightCam-dump\\frame-*.raw\n"
         "[debug]\n"
-        "dump=0\n");
+        "dump=0\n"
+        ";\n"
+        "; recovery: what to do when the camera is switched off while a call\n"
+        "; is running.  busmon=1 watches the 1394 generation counter and\n"
+        "; restarts the stream as soon as the camera is back; bootdelay is how\n"
+        "; long the camera needs to boot before it answers again (ms).\n"
+        "[recovery]\n"
+        "busmon=1\n"
+        "bootdelay=2000\n");
     fclose(f);
 }
 
@@ -341,10 +443,14 @@ static const ISightOptions &Opts()
         s_o.orientYUY2 = ClampOrient(GetPrivateProfileIntA("orientation", "yuy2", ORIENT_VFLIP, ini));
         s_o.orientRGB  = ClampOrient(GetPrivateProfileIntA("orientation", "rgb",  ORIENT_NONE,   ini));
         s_o.dump       = GetPrivateProfileIntA("debug", "dump", 0, ini) != 0;
+        s_o.bootDelayMs = GetPrivateProfileIntA("recovery", "bootdelay", 2000, ini);
+        if (s_o.bootDelayMs < 0)     s_o.bootDelayMs = 0;
+        if (s_o.bootDelayMs > 20000) s_o.bootDelayMs = 20000;
+        s_o.busMon     = GetPrivateProfileIntA("recovery", "busmon", 1, ini) != 0;
 
-        FLog("options: yuy2=%s rgb=%s dump=%d (ini=%s)",
+        FLog("options: yuy2=%s rgb=%s dump=%d busmon=%d bootdelay=%dms (ini=%s)",
              OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
-             s_o.dump ? 1 : 0, ini);
+             s_o.dump ? 1 : 0, s_o.busMon ? 1 : 0, s_o.bootDelayMs, ini);
     }
     return s_o;
 }
@@ -563,6 +669,10 @@ private:
     void  KickBringUp();       // start TryStart() off-thread (never blocks)
     static DWORD WINAPI BringUpThunk(LPVOID p);
     void  ReleaseCamera();     // stop acquisition + drop the CMU handle
+    void  DropStreamForRecovery(const char *why);   // safe teardown from FillBuffer
+    void  KickBusMonitor();    // start watching the 1394 bus generation
+    void  StopBusMonitor();
+    static DWORD WINAPI BusMonThunk(LPVOID p);
     void  ConfigureVideo();
     void  BuildMediaType(const GUID *subtype, REFERENCE_TIME interval, CMediaType *pmt) const;
     bool  MediaTypeCompatible(const CMediaType *pmt, CMediaType *pNormalized) const;
@@ -583,7 +693,18 @@ private:
     ULONG            m_dumpCount;     // frames written to the debug dump (max 2)
     volatile PVOID   m_hBringUp;      // background bring-up thread
     volatile LONG    m_bringUpState;  // 0 idle, 1 running, 2 ok, 3 failed
-    int              m_bringUpRetry;  // frames to wait before retrying
+    int              m_bringUpTries;  // bring-up attempts since the last good frame
+    DWORD            m_nextTryMs;     // earliest tick for the next bring-up attempt
+    DWORD            m_retryNotBefore;// after a bus reset: let the camera boot first
+
+    // bus monitor: notices a power cycle (bus reset / device disappears)
+    // long before any acquire can time out
+    volatile PVOID   m_hMon;          // monitor thread
+    HANDLE           m_evMonStop;     // signalled to stop the monitor
+    volatile LONG    m_busResetSeen;  // generation changed while streaming
+    volatile LONG    m_camGoneSeen;   // camera left the bus (switched off)
+    volatile LONG    m_needReset;     // teardown pending (done in TryStart)
+    char             m_monPath[512];  // cached 1394 device path
 };
 
 //---------------------------------------------------------------------
@@ -639,7 +760,12 @@ STDMETHODIMP CiSightSource::NonDelegatingQueryInterface(REFIID riid, void **ppv)
     else
         hr = CSource::NonDelegatingQueryInterface(riid, ppv);
 
-    FLog("filter QI %s -> %s", GuidName(riid), SUCCEEDED(hr) ? "OK" : "E_NOINTERFACE");
+    // throttled per interface: the first few probes of each interface are
+    // logged (that is the list that matters when a host refuses to open the
+    // device), the 11 000th repeat of the same probe is not.
+    char key[64];
+    _snprintf_s(key, sizeof(key), _TRUNCATE, "filter-qi-%s", GuidName(riid));
+    FLogT(key, "filter QI %s -> %s", GuidName(riid), SUCCEEDED(hr) ? "OK" : "E_NOINTERFACE");
     return hr;
 }
 
@@ -664,8 +790,16 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_dumpCount(0)
     , m_hBringUp(NULL)
     , m_bringUpState(0)
-    , m_bringUpRetry(0)
+    , m_bringUpTries(0)
+    , m_nextTryMs(0)
+    , m_retryNotBefore(0)
+    , m_hMon(NULL)
+    , m_evMonStop(NULL)
+    , m_busResetSeen(0)
+    , m_camGoneSeen(0)
+    , m_needReset(0)
 {
+    m_monPath[0] = 0;
 }
 
 CiSightStream::~CiSightStream()
@@ -708,7 +842,7 @@ void CiSightStream::KickBringUp()
         return;
     }
     InterlockedExchangePointer(&m_hBringUp, (PVOID)h);   // closed in ReleaseCamera
-    FLog("KickBringUp: camera bring-up started on a worker thread");
+    FLogT("kick-bringup", "KickBringUp: camera bring-up started on a worker thread");
 }
 
 DWORD WINAPI CiSightStream::BringUpThunk(LPVOID p)
@@ -719,11 +853,213 @@ DWORD WINAPI CiSightStream::BringUpThunk(LPVOID p)
     return 0;
 }
 
+//---------------------------------------------------------------------
+// bus monitor
+//
+// The front ring of the iSight is its power switch.  Switching it off and
+// on again resets the 1394 bus: the camera comes back at a different node
+// address and the isochronous stream we were running is gone for good --
+// the handle we still hold never produces another frame.  Every bus reset
+// bumps IOCTL_GET_GENERATION_COUNT, and while the camera is off its device
+// object leaves the bus, so polling that single value every 200 ms reports
+// the event almost immediately.  (Waiting for it through acquire timeouts
+// took a minute: three 2 s timeouts is already 6 s, and after the camera
+// disappears the driver's waits get longer still.)
+//---------------------------------------------------------------------
+static const DWORD kIoctlGetGenerationCount =
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x0800 + 26, METHOD_BUFFERED, FILE_ANY_ACCESS);
+
+DWORD WINAPI CiSightStream::BusMonThunk(LPVOID p)
+{
+    CiSightStream *self = (CiSightStream *)p;
+    HANDLE dev = INVALID_HANDLE_VALUE;
+    DWORD  lastGen = 0;
+    bool   haveGen = false;
+    bool   wasPresent = false;
+    int    openFails = 0;
+
+    for (;;)
+    {
+        if (WaitForSingleObject(self->m_evMonStop, 200) != WAIT_TIMEOUT)
+            break;                                  // asked to stop
+
+        if (dev == INVALID_HANDLE_VALUE)
+        {
+            if (self->m_monPath[0] == 0)
+            {
+                // the path is derived from the camera's EUI-64, so it stays
+                // valid across resets.  Resolve it through the CMU library
+                // while holding the camera lock (same driver).
+                char path[512] = "";
+                {
+                    CAutoLock lock(&self->m_csCamera);
+                    ULONG sz = sizeof(path);
+                    if (t1394CmdrGetDevicePath(t1394CmdrGetDeviceList(), 0, path, &sz) > 0)
+                        strncpy_s(self->m_monPath, path, _TRUNCATE);
+                }
+                if (self->m_monPath[0] == 0)
+                {
+                    if (wasPresent)
+                    {
+                        wasPresent = false;
+                        haveGen = false;
+                        InterlockedIncrement(&self->m_camGoneSeen);
+                        FLog("busmon: camera left the bus (switched off?)");
+                    }
+                    continue;                       // look again in 200 ms
+                }
+            }
+
+            dev = CreateFileA(self->m_monPath, GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, 0, NULL);
+            if (dev == INVALID_HANDLE_VALUE)
+            {
+                DWORD err = GetLastError();
+                if (wasPresent)
+                {
+                    wasPresent = false;
+                    haveGen = false;
+                    InterlockedIncrement(&self->m_camGoneSeen);
+                    FLog("busmon: camera device gone (open err=%lu)", err);
+                }
+                else if (++openFails > 30)
+                {
+                    // the camera is on the bus (the CMU library sees it) but
+                    // this process may not open it: stop watching rather than
+                    // keep poking.  The acquire-failure path still recovers.
+                    FLog("busmon: cannot open the device (err=%lu) - monitoring disabled", err);
+                    break;
+                }
+                self->m_monPath[0] = 0;             // node is not there any more
+                continue;
+            }
+            openFails = 0;
+            if (!wasPresent)
+            {
+                wasPresent = true;
+                FLog("busmon: camera present, watching the bus generation");
+            }
+            haveGen = false;                        // the counter belonged to the old handle
+        }
+
+        DWORD gen = 0, ret = 0;
+        if (DeviceIoControl(dev, kIoctlGetGenerationCount, NULL, 0,
+                            &gen, sizeof(gen), &ret, NULL))
+        {
+            if (haveGen && gen != lastGen)
+            {
+                InterlockedIncrement(&self->m_busResetSeen);
+                FLog("busmon: BUS RESET detected (generation %lu -> %lu)", lastGen, gen);
+            }
+            lastGen = gen;
+            haveGen = true;
+        }
+        else
+        {
+            CloseHandle(dev);                       // handle died with the bus
+            dev = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    if (dev != INVALID_HANDLE_VALUE)
+        CloseHandle(dev);
+    return 0;
+}
+
+void CiSightStream::KickBusMonitor()
+{
+    if (!Opts().busMon)
+        return;
+    if (InterlockedCompareExchangePointer(&m_hMon, NULL, NULL) != NULL)
+        return;                                     // already running
+
+    if (m_evMonStop == NULL)
+    {
+        m_evMonStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (m_evMonStop == NULL)
+            return;
+    }
+    ResetEvent(m_evMonStop);
+    InterlockedExchange(&m_busResetSeen, 0);
+    InterlockedExchange(&m_camGoneSeen, 0);
+
+    HANDLE h = CreateThread(NULL, 0, &CiSightStream::BusMonThunk, this, 0, NULL);
+    if (h == NULL)
+    {
+        FLog("busmon: could not start the monitor thread");
+        return;
+    }
+    InterlockedExchangePointer(&m_hMon, (PVOID)h);
+    FLog("busmon: watching for bus resets / camera power cycles");
+}
+
+void CiSightStream::StopBusMonitor()
+{
+    if (m_evMonStop)
+        SetEvent(m_evMonStop);
+    PVOID h = InterlockedExchangePointer(&m_hMon, NULL);
+    if (h)
+    {
+        WaitForSingleObject((HANDLE)h, 3000);
+        CloseHandle((HANDLE)h);
+    }
+    if (m_evMonStop)
+    {
+        CloseHandle(m_evMonStop);
+        m_evMonStop = NULL;
+    }
+}
+
+// Called from the streaming thread when the bus monitor reports a reset.
+//
+// It deliberately does NOT touch m_pCam: the bring-up thread may be holding
+// the camera lock for several seconds (InitCamera + ConfigureVideo), and
+// blocking the streaming thread on that lock would stall the whole graph --
+// hosts drop a source that stops delivering samples.  So this only
+// invalidates the stream; the teardown itself happens in TryStart(), which
+// already runs under that lock.
+void CiSightStream::DropStreamForRecovery(const char *why)
+{
+    InterlockedExchange(&m_needReset, 1);
+    m_bAcquiring = false;      // only the streaming thread writes this
+    m_bInit = false;
+    m_consecFail = 0;
+    m_bringUpTries = 0;
+    // give the camera time to boot before we talk to it again, otherwise the
+    // first attempt is wasted on a node that is not listening yet
+    m_retryNotBefore = TickMs() + (DWORD)Opts().bootDelayMs;
+    m_nextTryMs = m_retryNotBefore;
+    InterlockedExchange(&m_bringUpState, 0);   // re-arm the bring-up worker
+    FLog("recovery: stream invalidated (%s) after %lu frames, new attempt in %d ms",
+         why, m_frameCount, Opts().bootDelayMs);
+}
+
 // bring the camera up and start isochronous acquisition. never throws,
 // returns false quietly when hardware is absent/unready.
 bool CiSightStream::TryStart()
 {
     CAutoLock lock(&m_csCamera);
+
+    // A bus reset (camera switched off / on) invalidated everything we had:
+    // the node address changed, so the handle we hold is dead and must go
+    // before we enumerate again.  Doing it here keeps the (slow) teardown
+    // off the streaming thread -- see DropStreamForRecovery().
+    if (InterlockedExchange(&m_needReset, 0))
+    {
+        if (m_pCam)
+        {
+            if (m_bAcquiring)
+            {
+                m_pCam->StopImageAcquisition();
+                m_bAcquiring = false;
+            }
+            delete m_pCam;
+            m_pCam = NULL;
+            FLog("recovery: stale camera handle released, re-enumerating");
+        }
+        m_bInit = false;
+    }
 
     if (m_bAcquiring)
         return true;
@@ -751,12 +1087,14 @@ bool CiSightStream::TryStart()
         int cameras = m_pCam->RefreshCameraList();
         if (cameras <= 0)
         {
-            FLog("TryStart: RefreshCameraList -> %d (no camera)", cameras);
+            FLogT("no-camera", "TryStart: RefreshCameraList -> %d (camera off the bus?)", cameras);
+            delete m_pCam; m_pCam = NULL;
             return false;
         }
         if (m_pCam->SelectCamera(0) != CAM_SUCCESS)
         {
-            FLog("TryStart: SelectCamera(0) failed");
+            FLogT("select-fail", "TryStart: SelectCamera(0) failed");
+            delete m_pCam; m_pCam = NULL;
             return false;
         }
         DWORD t1 = TickMs();
@@ -764,7 +1102,8 @@ bool CiSightStream::TryStart()
         int rc = m_pCam->InitCamera(FALSE);
         if (rc != CAM_SUCCESS)
         {
-            FLog("TryStart: InitCamera -> %d (CAM_SUCCESS=%d)", rc, CAM_SUCCESS);
+            FLogT("init-fail", "TryStart: InitCamera -> %d (CAM_SUCCESS=%d)", rc, CAM_SUCCESS);
+            delete m_pCam; m_pCam = NULL;
             return false;
         }
         DWORD t2 = TickMs();
@@ -789,19 +1128,31 @@ bool CiSightStream::TryStart()
     int rc = m_pCam->StartImageAcquisitionEx(8, 2000, ACQ_START_VIDEO_STREAM);
     if (rc != CAM_SUCCESS)
     {
-        FLog("TryStart: StartImageAcquisition -> %d, dropping init state", rc);
-        m_bInit = false;          // allow a clean re-init on the next frame
+        // -1 is what the driver returns when another process already holds
+        // the camera.  Either way the handle is suspect now, so drop it: the
+        // next attempt (1 s later, see FillBuffer) starts from a clean one
+        // and re-enumerates the bus.
+        FLogT("start-acq-fail", "TryStart: StartImageAcquisition -> %d%s, dropping the handle",
+              rc, (rc == -1) ? " (camera held by another process?)" : "");
+        delete m_pCam;
+        m_pCam = NULL;
+        m_bInit = false;
         return false;
     }
 
+    FLog("TryStart: acquisition started (%ux%u @ %d, attempt %d)",
+         m_width, m_height, m_rateIndex, m_bringUpTries + 1);
     m_bAcquiring = true;
     m_consecFail = 0;
-    FLog("TryStart: acquisition started (%ux%u @ %d)", m_width, m_height, m_rateIndex);
+    m_bringUpTries = 0;
     return true;
 }
 
 void CiSightStream::ReleaseCamera()
 {
+    // the bus monitor must be gone before the camera handle is dropped
+    StopBusMonitor();
+
     // never pull the camera object out from under the bring-up thread
     PVOID h = InterlockedExchangePointer(&m_hBringUp, NULL);
     if (h)
@@ -824,8 +1175,13 @@ void CiSightStream::ReleaseCamera()
     }
     m_bInit = false;
     m_consecFail = 0;
+    m_bringUpTries = 0;
+    m_nextTryMs = 0;
+    m_retryNotBefore = 0;
     InterlockedExchange(&m_bringUpState, 0);   // allow a fresh bring-up later
-    m_bringUpRetry = 0;
+    InterlockedExchange(&m_busResetSeen, 0);
+    InterlockedExchange(&m_camGoneSeen, 0);
+    InterlockedExchange(&m_needReset, 0);
 }
 
 // Must end up with Format 0 / Mode 2 (640x480 YUV422). The iSight also
@@ -938,7 +1294,13 @@ HRESULT CiSightStream::Active()
     // -- WeChat, QQ, OBS -- give up with "cannot open camera". We just
     // start it on its own thread and hand out black frames until it is up.
     if (IsConnected())
+    {
+        m_bringUpTries   = 0;
+        m_nextTryMs      = 0;      // first attempt right away
+        m_retryNotBefore = 0;
+        KickBusMonitor();          // notice a power cycle within ~200 ms
         KickBringUp();
+    }
     return S_OK;
 }
 
@@ -951,6 +1313,12 @@ HRESULT CiSightStream::Inactive()
     return hr;
 }
 
+// how often the streaming thread may start another bring-up attempt.  The
+// attempt itself runs on its own thread, so this is only a cadence limit:
+// fast enough to pick the camera up as soon as it has booted, slow enough
+// not to hammer a camera that is switched off.
+static const DWORD kBringUpRetryMs = 1000;
+
 HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
 {
     CheckPointer(pSample, E_POINTER);
@@ -962,31 +1330,39 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
     if (FAILED(pSample->GetPointer(&pBuf)) || pBuf == NULL)
         return E_FAIL;
 
+    // A bus reset (the camera switched off and on again, or anything else
+    // joining / leaving the bus) invalidates the stream instantly: the node
+    // address changed and the handle we hold is stale.  The bus monitor
+    // reports that within ~200 ms, far sooner than any acquire can time out,
+    // so the teardown happens here -- on the streaming thread and never
+    // while the camera lock below is held.
+    if (InterlockedExchange(&m_busResetSeen, 0) || InterlockedExchange(&m_camGoneSeen, 0))
+        DropStreamForRecovery("bus reset / camera power cycle");
+
     bool got = false;
     if (!m_bAcquiring)
     {
-        // camera not live yet: keep the graph fed with black frames and
-        // make sure the bring-up thread is running (or retry it after a
-        // failure). Never block this thread on the ~15 s hardware init.
-        LONG st = InterlockedCompareExchange(&m_bringUpState, 0, 0);
-        if (st == 2 || st == 0)
+        // Camera not live yet: keep the graph fed with black frames and keep
+        // one bring-up attempt in flight.  Never block this thread on the
+        // hardware init, and never hammer a camera that is switched off --
+        // one attempt per second is plenty.
+        DWORD now = TickMs();
+        LONG  st  = InterlockedCompareExchange(&m_bringUpState, 0, 0);
+        bool  armed = ((LONG)(now - m_nextTryMs) >= 0) &&
+                      ((LONG)(now - m_retryNotBefore) >= 0);
+        if (st != 1 && armed)
         {
-            if (st == 2)   // finished, but the stream was stopped again
+            m_nextTryMs = now + kBringUpRetryMs;
+            if (st == 2)                    // finished, but the stream went away
                 InterlockedExchange(&m_bringUpState, 0);
+            ++m_bringUpTries;
+            if (m_bringUpTries <= 3 || (m_bringUpTries % 20) == 0)
+                FLog("FillBuffer: camera bring-up attempt #%d (state=%ld)",
+                     m_bringUpTries, st);
             KickBringUp();
         }
-        else if (st == 3)
-        {
-            if (++m_bringUpRetry >= 150)   // ~10 s at 15 fps
-            {
-                m_bringUpRetry = 0;
-                FLog("FillBuffer: retrying camera bring-up");
-                InterlockedExchange(&m_bringUpState, 0);
-                KickBringUp();
-            }
-        }
     }
-    if (m_bAcquiring)
+    if (m_bAcquiring && m_pCam != NULL)
     {
         CAutoLock lock(&m_csCamera);
         int dropped = 0;
@@ -1056,19 +1432,28 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
             if (m_consecFail <= 3 || (m_consecFail % 60) == 0)
                 FLog("FillBuffer: AcquireImageEx -> %d (fail streak %d, %lux%lu @ rate %d)",
                      rc, m_consecFail, m_width, m_height, m_rateIndex);
-            if (m_consecFail == 12)
+            if (m_consecFail >= 3)
             {
-                // a 3 s-timeout grab failing a dozen times in a row means the
-                // stream really is gone: drop it and let the bring-up thread
-                // start a clean one (never here -- this is the streaming
-                // thread and it must keep producing samples)
-                FLog("FillBuffer: camera unresponsive, dropping stream for re-init");
-                m_pCam->StopImageAcquisition();
-                m_bAcquiring = false;
+                // Three failed grabs in a row (2 s timeout each) means the
+                // stream is really gone.  This is also the fallback path when
+                // the bus monitor could not open its own device handle.  We
+                // already hold the camera lock here, so tear everything down
+                // inline and let the bring-up worker start a clean stream.
+                FLog("FillBuffer: %d consecutive grab failures -> dropping the camera handle",
+                     m_consecFail);
+                if (m_bAcquiring)
+                {
+                    m_pCam->StopImageAcquisition();
+                    m_bAcquiring = false;
+                }
+                delete m_pCam;          // stale after a reset, see the v9 notes
+                m_pCam = NULL;
                 m_bInit = false;
                 m_consecFail = 0;
+                m_bringUpTries = 0;
+                m_retryNotBefore = TickMs() + (DWORD)Opts().bootDelayMs;
+                m_nextTryMs = m_retryNotBefore;
                 InterlockedExchange(&m_bringUpState, 0);
-                KickBringUp();
             }
         }
     }
@@ -1342,7 +1727,9 @@ STDMETHODIMP CiSightStream::NonDelegatingQueryInterface(REFIID riid, void **ppv)
         hr = GetInterface((IKsPropertySet *)this, ppv);
     else
         hr = CSourceStream::NonDelegatingQueryInterface(riid, ppv);
-    FLog("pin QI %s -> %s", GuidName(riid), SUCCEEDED(hr) ? "OK" : "E_NOINTERFACE");
+    char key[64];
+    _snprintf_s(key, sizeof(key), _TRUNCATE, "pin-qi-%s", GuidName(riid));
+    FLogT(key, "pin QI %s -> %s", GuidName(riid), SUCCEEDED(hr) ? "OK" : "E_NOINTERFACE");
     return hr;
 }
 
@@ -1377,7 +1764,7 @@ STDMETHODIMP CiSightStream::Get(REFGUID guidPropSet, DWORD dwID,
         if (cbPropData < sizeof(GUID))
             return E_UNEXPECTED;
         *(GUID *)pPropData = PIN_CATEGORY_CAPTURE;
-        FLog("pin IKsPropertySet Get(PIN_CATEGORY) -> CAPTURE");
+        FLogT("pin-cat", "pin IKsPropertySet Get(PIN_CATEGORY) -> CAPTURE");
         return S_OK;
     }
 
