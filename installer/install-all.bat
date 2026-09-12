@@ -4,25 +4,32 @@ rem 本文件以 GBK(936) 编码打包，先锁定控制台代码页，避免中
 chcp 936 >nul 2>&1
 rem ============================================================
 rem  install-all.bat  -  注册 Apple iSight (FireWire) DirectShow 摄像头
-rem  v9：必须右键"以管理员身份运行"
+rem  v10：必须右键"以管理员身份运行"
 rem
-rem  这一版修的是"通话中把相机拧掉再拧开，画面就再也不出来了"：
-rem    1. 新增总线监视线程，200ms 级发现总线复位/相机掉线，立刻丢弃
-rem       旧的相机句柄，等相机启动完成后自动重新枚举、重新推流
-rem    2. 取帧连续失败 3 次即判定流已死（原来要 12 次、最长一分钟）
-rem    3. 重连节奏 1 秒一次（原来 10 秒），并大幅减少日志写入量
+rem  这一版解决的是"发给宿主程序的画面形状"问题，而且全部可以在
+rem  %LOCALAPPDATA%\iSightCam.ini 里运行期调整，不用重装：
+rem    1. 微信的视频通话会把 4:3 画面裁掉一部分再放大（画面本身是完整的
+rem       640x480，日志可以证明），所以出现"大脑袋占满屏"。把
+rem       [layout] target 设成宿主实际显示的那块矩形（例如 480x480、
+rem       360x480、270x480），滤镜就会把整幅画面缩进这块矩形、四周填黑，
+rem       宿主裁的就是这块矩形 —— 整个场景又能看见，代价是分辨率。
+rem    2. [format] types= 可以选择/排序对外提供的子类型
+rem       （rgb24 / yuy2 / rgb32；QQ 走 RGB32，微信走 RGB24）。
+rem    3. [orientation] yuy2=4 = 数据上翻但仍声明正高度，给"忽略符号"的
+rem       宿主（微信）用。
+rem    4. 媒体类型里补上了 rcSource / rcTarget（以前是 0），并增加子类型枚举
+rem       与协商缓冲区的日志。
 rem
-rem  上一版（v8）修的是画面显示：
-rem    微信把 YUY2 缓冲当成自上而下读，导致画面上下颠倒；现在 YUY2
-rem    输出改为自上而下 + biHeight 取负，QQ/微信都能得到正向画面。
-rem    朝向可在 %LOCALAPPDATA%\iSightCam.ini 里运行期调整。
+rem  上一版（v9）修的是"通话中把相机拧掉再拧开，画面就再也不出来了"：
+rem    总线监视线程 200ms 发现总线复位即丢弃旧句柄、等相机启动后自动重连。
+rem  上上版（v8）修的是画面显示：微信把 YUY2 当自上而下读导致画面颠倒。
 rem
-rem  沿用上一版的两条保护（曾经把 64 位组件静默漏装过）：
+rem  沿用两条保护（曾经把 64 位组件静默漏装过）：
 rem    * 拒绝在 32 位 cmd 里运行
 rem    * 目标文件被占用时先改名再复制，复制后按版本标记自检
 rem ============================================================
 
-set "TAG=ISIGHTFILTER-BUILD-V9-20260912-BUSRESET"
+set "TAG=ISIGHTFILTER-BUILD-V10-20260912-LAYOUT"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
@@ -112,6 +119,14 @@ echo  画面朝向不对时（例如微信里上下颠倒）：编辑
 echo    %LOCALAPPDATA%\iSightCam.ini
 echo  把 [orientation] 下的 yuy2 改成 0/2/3 逐个试，
 echo  保存后重开微信即可，不需要重装或重编译。
+echo.
+echo  微信里"人太大/画面被切掉"（QQ 正常）时：微信会按自己的
+echo  窗口形状裁掉画面再放大。编辑同一个 ini，加上：
+echo    [layout]
+echo    target=480x480
+echo  滤镜会把整幅画面缩进这块居中矩形、四周填黑，微信裁到的
+echo  就是这块矩形，整个场景就回来了。还嫌近就依次试
+echo  360x480、270x480；设回 0 恢复原样。改完重开微信。
 echo ============================================================
 pause
 exit /b 0
@@ -144,10 +159,10 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V9" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V10" "%~1" >nul 2>&1
 if errorlevel 1 (
-    echo     [FAIL] %~1 里没有 v9 标记 —— 这个文件还是旧版！
+    echo     [FAIL] %~1 里没有 v10 标记 —— 这个文件还是旧版！
     exit /b 1
 )
-for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v9 标记
+for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v10 标记
 exit /b 0
