@@ -644,13 +644,13 @@ bool CiSightStream::MediaTypeCompatible(const CMediaType *pmt, CMediaType *pNorm
     if (pmt->majortype != MEDIATYPE_Video) return false;
     if (pmt->formattype != FORMAT_VideoInfo && pmt->formattype != FORMAT_VideoInfo2) return false;
     if (pmt->cbFormat < sizeof(VIDEOINFOHEADER)) return false;
-    if (!SubTypeKnown(pmt->subtype)) return false;
+    if (!SubTypeKnown(&pmt->subtype)) return false;
 
     const VIDEOINFOHEADER *pvi = (const VIDEOINFOHEADER *)pmt->pbFormat;
     if (pvi->bmiHeader.biWidth != (LONG)ISIGHT_WIDTH) return false;
     if (labs(pvi->bmiHeader.biHeight) != (LONG)ISIGHT_HEIGHT) return false;
 
-    SubTypeInfo si = SubTypeFor(pmt->subtype);
+    SubTypeInfo si = SubTypeFor(&pmt->subtype);
     if (pvi->bmiHeader.biBitCount != (WORD)si.bpp) return false;
     if (pvi->bmiHeader.biCompression != si.compression &&
         pvi->bmiHeader.biCompression != BI_RGB &&
@@ -663,7 +663,7 @@ bool CiSightStream::MediaTypeCompatible(const CMediaType *pmt, CMediaType *pNorm
             interval = kFrameDurations[kMaxRateIndex];
         if (interval < kFrameDurations[kMaxRateIndex])       // faster than 15 fps: clamp
             interval = kFrameDurations[kMaxRateIndex];
-        BuildMediaType(pmt->subtype, interval, pNormalized);
+        BuildMediaType(&pmt->subtype, interval, pNormalized);
     }
     return true;
 }
@@ -692,7 +692,7 @@ HRESULT CiSightStream::CheckMediaType(const CMediaType *pmt)
     if (!MediaTypeCompatible(pmt, NULL))
     {
         FLog("CheckMediaType: REJECT subtype=%s fmt=%s %ldx%ld bpp=%u comp=%08X",
-             pmt ? SubTypeName(pmt->subtype) : "null",
+             pmt ? SubTypeName(&pmt->subtype) : "null",
              pmt ? ((pmt->formattype == FORMAT_VideoInfo) ? "VideoInfo" :
                     (pmt->formattype == FORMAT_VideoInfo2) ? "VideoInfo2" : "other") : "-",
              pvi ? (long)pvi->bmiHeader.biWidth : -1,
@@ -703,7 +703,7 @@ HRESULT CiSightStream::CheckMediaType(const CMediaType *pmt)
     }
 
     FLog("CheckMediaType: accept %s %ldx%ld bpp=%u interval=%lld",
-         SubTypeName(pmt->subtype),
+         SubTypeName(&pmt->subtype),
          pvi ? (long)pvi->bmiHeader.biWidth : -1,
          pvi ? (long)pvi->bmiHeader.biHeight : -1,
          pvi ? (unsigned)pvi->bmiHeader.biBitCount : 0,
@@ -748,7 +748,7 @@ STDMETHODIMP CiSightStream::SetFormat(AM_MEDIA_TYPE *pmt)
     {
         const VIDEOINFOHEADER *pvi = (const VIDEOINFOHEADER *)pmt->pbFormat;
         FLog("SetFormat: REJECT subtype=%s fmt=%s %ldx%ld bpp=%u comp=%08X",
-             SubTypeName(pmt->subtype),
+             SubTypeName(&pmt->subtype),
              (pmt->formattype == FORMAT_VideoInfo) ? "VideoInfo" :
              (pmt->formattype == FORMAT_VideoInfo2) ? "VideoInfo2" : "other",
              pvi ? (long)pvi->bmiHeader.biWidth : -1,
@@ -760,7 +760,7 @@ STDMETHODIMP CiSightStream::SetFormat(AM_MEDIA_TYPE *pmt)
 
     const VIDEOINFOHEADER *pvi = (const VIDEOINFOHEADER *)pmt->pbFormat;
     FLog("SetFormat: %s %ldx%ld bpp=%u interval=%lld -> S_OK",
-         SubTypeName(pmt->subtype),
+         SubTypeName(&pmt->subtype),
          (long)pvi->bmiHeader.biWidth, (long)pvi->bmiHeader.biHeight,
          (unsigned)pvi->bmiHeader.biBitCount, (long long)pvi->AvgTimePerFrame);
     return S_OK;
@@ -808,8 +808,6 @@ STDMETHODIMP CiSightStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE **ppmt, BYTE
     caps->MaxBitsPerSecond      = bytes * 8 * 15;
     caps->MinFrameInterval      = kFrameDurations[kMaxRateIndex];   // fastest = 15 fps
     caps->MaxFrameInterval      = kFrameDurations[0];               // slowest = 1.875 fps
-    caps->MinSampleSize         = bytes;
-    caps->MaxSampleSize         = bytes;
     return S_OK;
 }
 
