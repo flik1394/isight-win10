@@ -41,6 +41,12 @@
 
 #include "pch.h"
 
+/* Defined in 1394Camera.h.  See the comment there: skipping the per-feature
+ * inquiry/status walk takes InitCamera() from ~14 s down to a couple of
+ * hundred milliseconds, which is the difference between a DirectShow host
+ * accepting the device and timing out on it. */
+BOOL g_bISightFastBringUp = FALSE;
+
 /** \defgroup camcore Camera Control
  *  \brief This is the core functionality for dealing with cameras via 1394
  */
@@ -516,9 +522,13 @@ int C1394Camera::InitCamera(BOOL reset)
 		goto _exit;
 	}
 	
-	// Poke the error bits, if available
-	this->StatusVideoErrors(TRUE);
-	this->StatusFeatureError(FEATURE_BRIGHTNESS,TRUE);
+	// Poke the error bits, if available.  Pure diagnostics: skipped when the
+	// caller does not care about control registers (see g_bISightFastBringUp).
+	if(!g_bISightFastBringUp)
+	{
+		this->StatusVideoErrors(TRUE);
+		this->StatusFeatureError(FEATURE_BRIGHTNESS,TRUE);
+	}
 	
 	// the core registers have been updated, so it's safe to set this here
 	// NOTE: this flag is very hackish, and should be replaced by explicitly nuking
@@ -624,8 +634,17 @@ int C1394Camera::InitCamera(BOOL reset)
 		}
 	}
 	
-	RefreshControlRegisters(FALSE);
-	UpdateParameters();
+	// The expensive part of InitCamera(): Inquire()+Status() for every camera
+	// control (about 15 features x ~8 synchronous 1394 register accesses,
+	// ~100 ms each on this driver) plus a full video-settings sanity pass.
+	// Nothing here is used by a capture filter, so a fast bring-up skips it.
+	// The video format/mode/rate tables and the bandwidth information read
+	// above are what StartImageAcquisitionEx() needs and they are unaffected.
+	if(!g_bISightFastBringUp)
+	{
+		RefreshControlRegisters(FALSE);
+		UpdateParameters();
+	}
 	ret = CAM_SUCCESS;
 	
 _exit:
