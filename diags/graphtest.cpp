@@ -180,6 +180,49 @@ static bool FindInputPin(IBaseFilter *pFilter, IPin **ppPin, const char **pName)
     return found;
 }
 
+// Which interfaces does our filter/pin actually expose? Hosts refuse to
+// open a capture device over one missing interface far more often than
+// over a bad media type, and this list is the only way to see it.
+#define PROBE(unk, what, iface)                                                \
+    do {                                                                       \
+        void *pv__ = NULL;                                                     \
+        HRESULT hr__ = (unk)->QueryInterface(__uuidof(iface), &pv__);           \
+        LOG("  %s QI %-22s -> %s", what, #iface, SUCCEEDED(hr__) ? "OK" : HrName(hr__)); \
+        if (SUCCEEDED(hr__) && pv__) ((IUnknown *)pv__)->Release();            \
+    } while (0)
+
+static void ProbeFilterInterfaces(IBaseFilter *pF)
+{
+    LOG("interface probe on the filter:");
+    PROBE(pF, "filter", IBaseFilter);
+    PROBE(pF, "filter", IMediaFilter);
+    PROBE(pF, "filter", IPersist);
+    PROBE(pF, "filter", IPersistStream);
+    PROBE(pF, "filter", IAMFilterMiscFlags);
+    PROBE(pF, "filter", ISpecifyPropertyPages);
+    PROBE(pF, "filter", IAMStreamConfig);
+    PROBE(pF, "filter", IAMVideoProcAmp);
+    PROBE(pF, "filter", IAMCameraControl);
+    PROBE(pF, "filter", IKsPropertySet);
+    PROBE(pF, "filter", IAMBufferNegotiation);
+    PROBE(pF, "filter", IReferenceClock);
+}
+
+static void ProbePinInterfaces(IPin *pP)
+{
+    LOG("interface probe on the capture pin:");
+    PROBE(pP, "pin", IPin);
+    PROBE(pP, "pin", IAMStreamConfig);
+    PROBE(pP, "pin", IQualityControl);
+    PROBE(pP, "pin", IMemInputPin);
+    PROBE(pP, "pin", IKsPropertySet);
+    PROBE(pP, "pin", IAMBufferNegotiation);
+    PROBE(pP, "pin", IAMVideoProcAmp);
+    PROBE(pP, "pin", IAMCameraControl);
+    PROBE(pP, "pin", ISpecifyPropertyPages);
+    PROBE(pP, "pin", IReferenceClock);
+}
+
 int main(void)
 {
     HRESULT hr = S_OK;
@@ -281,6 +324,10 @@ int main(void)
             }
         }
     }
+
+    ProbeFilterInterfaces(pFilter);
+    if (pOutPin)
+        ProbePinInterfaces(pOutPin);
 
     if (pOutPin)
     {
@@ -450,6 +497,74 @@ int main(void)
 
         if (pNull) pNull->Release();
         pGraph->Release();
+    }
+
+    //---------------------------------------------------------------
+    // 5. the mainstream host path: ICaptureGraphBuilder2::RenderStream on
+    //    PIN_CATEGORY_CAPTURE -- exactly what WeChat / QQ / OBS execute.
+    //    It also exercises live-source detection (IAMFilterMiscFlags),
+    //    because that is what makes the builder insert a Smart Tee.
+    //---------------------------------------------------------------
+    {
+        LOG("----- capture-graph-builder round -----");
+
+        IGraphBuilder *pGraph = NULL;
+        ICaptureGraphBuilder2 *pBuild = NULL;
+        IBaseFilter *pNull = NULL;
+
+        hr = CoCreateInstance(CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER,
+                              IID_IGraphBuilder, (void **)&pGraph);
+        LOG("create graph -> %s", HrName(hr));
+
+        hr = CoCreateInstance(CLSID_CaptureGraphBuilder2, NULL, CLSCTX_INPROC_SERVER,
+                              __uuidof(ICaptureGraphBuilder2), (void **)&pBuild);
+        LOG("create CaptureGraphBuilder2 -> %s", HrName(hr));
+
+        if (pGraph && pBuild)
+        {
+            hr = pBuild->SetFiltergraph(pGraph);
+            LOG("SetFiltergraph -> %s", HrName(hr));
+
+            hr = pGraph->AddFilter(pFilter, L"iSight");
+            LOG("AddFilter -> %s", HrName(hr));
+
+            hr = CoCreateInstance(CLSID_NullRendererLocal, NULL, CLSCTX_INPROC_SERVER,
+                                  IID_IBaseFilter, (void **)&pNull);
+            if (SUCCEEDED(hr) && pNull)
+            {
+                hr = pBuild->RenderStream(&PIN_CATEGORY_CAPTURE, &MEDIATYPE_Video,
+                                          pFilter, NULL, pNull);
+                LOG("RenderStream(CAPTURE, Video, iSight, NULL, NullRenderer) -> %s", HrName(hr));
+
+                if (SUCCEEDED(hr))
+                {
+                    IMediaControl *pCtl = NULL;
+                    IMediaEvent   *pEvt = NULL;
+                    pGraph->QueryInterface(IID_IMediaControl, (void **)&pCtl);
+                    pGraph->QueryInterface(IID_IMediaEvent, (void **)&pEvt);
+                    if (pCtl)
+                    {
+                        hr = pCtl->Run();
+                        LOG("Run -> %s", HrName(hr));
+                        PumpFor(6000);
+                        DrainEvents(pEvt);
+                        hr = pCtl->Stop();
+                        LOG("Stop -> %s", HrName(hr));
+                        PumpFor(300);
+                        pCtl->Release();
+                    }
+                    if (pEvt) pEvt->Release();
+                }
+            }
+            else
+            {
+                LOG("create NullRenderer -> %s", HrName(hr));
+            }
+        }
+
+        if (pNull)  pNull->Release();
+        if (pBuild) pBuild->Release();
+        if (pGraph) pGraph->Release();
     }
 
 done:
