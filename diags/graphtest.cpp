@@ -86,6 +86,25 @@ static const char *SubTypeName(const GUID *g)
 static const GUID CLSID_NullRendererLocal =
 { 0xc1f400a4, 0x3f08, 0x11d3, { 0x9f, 0x0b, 0x00, 0x60, 0x08, 0x03, 0x9e, 0x37 } };
 
+// FreeMediaType/DeleteMediaType come from the DirectShow base classes,
+// which this tool deliberately does not link.
+static void FreeMediaTypeLocal(AM_MEDIA_TYPE &mt)
+{
+    if (mt.cbFormat)
+    {
+        CoTaskMemFree((PVOID)mt.pbFormat);
+        mt.cbFormat = 0;
+        mt.pbFormat = NULL;
+    }
+}
+
+static void DeleteMediaTypeLocal(AM_MEDIA_TYPE *pmt)
+{
+    if (!pmt) return;
+    FreeMediaTypeLocal(*pmt);
+    CoTaskMemFree((PVOID)pmt);
+}
+
 static void DescribeMediaType(const char *prefix, const AM_MEDIA_TYPE *pmt)
 {
     if (!pmt)
@@ -293,7 +312,7 @@ int main(void)
                     (long long)caps.MinFrameInterval, (long long)caps.MaxFrameInterval,
                     (long)caps.MinOutputSize.cx, (long)caps.MinOutputSize.cy,
                     (unsigned long)caps.MinBitsPerSecond, (unsigned long)caps.MaxBitsPerSecond);
-                DeleteMediaType(pmt);
+                DeleteMediaTypeLocal(pmt);
             }
             else
             {
@@ -330,14 +349,14 @@ int main(void)
             LOG("SetFormat(cap[0] 320px) -> %s (expected VFW_E_INVALIDMEDIATYPE)", HrName(hr));
             pvi->bmiHeader.biWidth = savedW;
 
-            DeleteMediaType(pmt0);
+            DeleteMediaTypeLocal(pmt0);
         }
 
         AM_MEDIA_TYPE *pCur = NULL;
         if (SUCCEEDED(pCfg->GetFormat(&pCur)) && pCur)
         {
             DescribeMediaType("GetFormat", pCur);
-            DeleteMediaType(pCur);
+            DeleteMediaTypeLocal(pCur);
         }
     }
 
@@ -401,7 +420,7 @@ int main(void)
             if (pOutPin && SUCCEEDED(pOutPin->ConnectionMediaType(&mt)))
             {
                 DescribeMediaType("negotiated", &mt);
-                FreeMediaType(mt);
+                FreeMediaTypeLocal(mt);
             }
 
             IMediaControl *pCtl = NULL;
