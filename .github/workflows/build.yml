@@ -125,7 +125,7 @@ jobs:
           cl /nologo /O2 /W3 /EHsc /GR /FS /Zc:twoPhase- /MD ^
              /D_CRT_SECURE_NO_WARNINGS ^
              diags\graphtest.cpp ^
-             strmiids.lib ole32.lib oleaut32.lib uuid.lib ^
+             strmiids.lib ole32.lib oleaut32.lib uuid.lib user32.lib ^
              /Fe:isight-graphtest.exe
 
       - name: Setup MSVC (x86)
@@ -139,7 +139,7 @@ jobs:
           cl /nologo /O2 /W3 /EHsc /GR /FS /Zc:twoPhase- /MD ^
              /D_CRT_SECURE_NO_WARNINGS ^
              diags\graphtest.cpp ^
-             strmiids.lib ole32.lib oleaut32.lib uuid.lib ^
+             strmiids.lib ole32.lib oleaut32.lib uuid.lib user32.lib ^
              /Fe:isight-graphtest32.exe
 
       - name: Upload diagnostic tool
