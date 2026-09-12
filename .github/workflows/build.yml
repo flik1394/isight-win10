@@ -58,8 +58,8 @@ jobs:
             Write-Host ("packaged {0} as GBK, {1} bytes" -f $f, (Get-Item "package\$f").Length)
           }
           $chk = [IO.File]::ReadAllText("package\install-all.bat", $gbk)
-          if ($chk -notmatch "ISIGHTFILTER-BUILD-V9") { throw "install-all.bat does not carry the V9 tag" }
-          Write-Host "[OK] install-all.bat reads back as GBK and carries the V9 tag"
+          if ($chk -notmatch "ISIGHTFILTER-BUILD-V10") { throw "install-all.bat does not carry the V10 tag" }
+          Write-Host "[OK] install-all.bat reads back as GBK and carries the V10 tag"
           $src = "https://github.com/Andrew-Dyachenko/apple-firewire-isight-on-windows/raw/main/CMU%201394%20Digital%20Camera%20Driver%206.4.6%20(signed)%20(September%2026%2C%202011).exe"
           Invoke-WebRequest -Uri $src -OutFile "package/1394camera646.exe"
           Get-ChildItem package
