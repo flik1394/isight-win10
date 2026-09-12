@@ -84,6 +84,37 @@
 //     QQ asks for IKsPropertySet ~11 000 times during one enumeration and a
 //     line + fopen/fclose per probe wrote 3.8 MB in three minutes, which
 //     both hid the real events and slowed the host down.
+//
+// v10 additions -- all of it about *what shape the host ends up showing*, and
+// all of it changeable at runtime through iSightCam.ini, because a host's
+// display behaviour cannot be tested from inside the filter:
+//   * [layout] target=WxH -- some hosts do not letterbox a 4:3 camera into
+//     their own window: they cut the picture down to their frame shape.  The
+//     image arrives complete, upright and 640x480 (verified in the log) and
+//     is then cropped/magnified, which is why a WeChat call shows a giant
+//     head while QQ, which fits the whole frame, looks normal.  With
+//     target=480x480 (or 360x480, 270x480 ...) the camera picture is scaled
+//     down into that rectangle in the middle of the frame, the rest is black,
+//     and the host's crop lands on our rectangle: the whole scene is visible
+//     again at its normal size.  target=0 (the default) sends the frame
+//     untouched.  The cost is resolution -- whatever box is chosen is
+//     magnified back up by the host.
+//   * [format] types=rgb24,yuy2,rgb32 -- which subtypes the pin offers and in
+//     what order.  This moves a host onto a different subtype without a
+//     rebuild, which is how we test whether a host's picture depends on the
+//     subtype it negotiated (QQ takes RGB32, WeChat takes RGB24).
+//   * [orientation] yuy2=4 -- new mode: rows are written top-down but the
+//     height is declared *positive*.  Hosts that ignore the sign (WeChat)
+//     then get an upright picture without the negative height that makes it
+//     skip the YUY2 type altogether (v7 behaved differently from v8+ for
+//     exactly that reason).
+//   * rcSource / rcTarget are filled in with the real frame rectangle.  They
+//     used to be left zeroed, which is a deviation from every sample source
+//     and could make a host compute its own scaling from an empty rect.
+//   * the IAMStreamConfig enumeration (GetStreamCaps / GetFormat /
+//     GetNumberOfCapabilities) and the negotiated sample size are logged, so
+//     the log shows which capability a host picked and how big its buffers
+//     really are.
 //=====================================================================
 
 #include <windows.h>
@@ -115,7 +146,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V9-20260912-BUSRESET"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V10-20260912-LAYOUT"
 
 //---------------------------------------------------------------------
 // AMPROPSETID_Pin -- the pin category property set.
@@ -355,21 +386,41 @@ enum OrientMode
     ORIENT_NONE   = 0,
     ORIENT_VFLIP  = 1,
     ORIENT_HFLIP  = 2,
-    ORIENT_ROT180 = 3
+    ORIENT_ROT180 = 3,
+    // v10: rows top-down like ORIENT_VFLIP, but the height is deliberately
+    // declared *positive* (bottom-up).  For hosts that always read the buffer
+    // top-down no matter what the media type says -- WeChat does that -- this
+    // is the only way to be upright through the YUY2 path, because the
+    // consistent mode (ORIENT_VFLIP) declares -480 and WeChat then skips the
+    // whole subtype.  A host that *does* honour the sign will show it
+    // mirrored vertically, which is exactly why this is opt-in.
+    ORIENT_VFLIP_POS = 4
 };
 
 static const char *OrientName(int m)
 {
     switch (m)
     {
-    case ORIENT_VFLIP:  return "vflip";
-    case ORIENT_HFLIP:  return "hflip";
-    case ORIENT_ROT180: return "rot180";
-    default:            return "none";
+    case ORIENT_VFLIP:     return "vflip";
+    case ORIENT_HFLIP:     return "hflip";
+    case ORIENT_ROT180:    return "rot180";
+    case ORIENT_VFLIP_POS: return "vflip+";     // data flipped, sign left positive
+    default:               return "none";
     }
 }
 
-static bool OrientTopDown(int m) { return m == ORIENT_VFLIP || m == ORIENT_ROT180; }
+// Are the rows written top-down?
+static bool OrientDataTopDown(int m)
+{
+    return m == ORIENT_VFLIP || m == ORIENT_ROT180 || m == ORIENT_VFLIP_POS;
+}
+// Is biHeight declared negative?  Only for the self-consistent modes: the
+// data order and the declared sign always have to agree for a host that
+// honours the sign, and ORIENT_VFLIP_POS trades that away on purpose.
+static bool OrientDeclareNegative(int m)
+{
+    return m == ORIENT_VFLIP || m == ORIENT_ROT180;
+}
 static bool OrientMirror (int m) { return m == ORIENT_HFLIP || m == ORIENT_ROT180; }
 
 static const char *IniPath()
@@ -385,7 +436,7 @@ static const char *IniPath()
     return s_path;
 }
 
-static int ClampOrient(int v) { return (v < 0 || v > 3) ? ORIENT_NONE : v; }
+static int ClampOrient(int v) { return (v < 0 || v > 4) ? ORIENT_NONE : v; }
 
 struct ISightOptions
 {
@@ -394,7 +445,41 @@ struct ISightOptions
     bool dump;
     int  bootDelayMs;   // wait after a bus reset before touching the camera
     bool busMon;        // watch the bus generation counter
+    // v10 -- what the pin offers, and how the picture is laid out inside the
+    // frame for hosts that cut it to their own shape
+    int  layoutW, layoutH;          // [layout] target=WxH, 0 = untouched
+    int  typeOrder[3];              // [format] types=...  (indices into kAllSubs)
+    int  typeCount;
 };
+
+// the three subtypes we can produce, in the order they used to be advertised
+static const ISightOptions &Opts();          // defined below, used by SubTypeEnabled
+
+static const GUID *const kAllSubs[3] =
+{
+    &MEDIASUBTYPE_RGB24, &MEDIASUBTYPE_YUY2, &MEDIASUBTYPE_RGB32
+};
+
+static int SubIndex(const GUID *sub)
+{
+    if (!sub) return -1;
+    for (int i = 0; i < 3; ++i)
+        if (*kAllSubs[i] == *sub) return i;
+    return -1;
+}
+
+// the pin offers RGB24 / YUY2 for 24-bit consumers and RGB32 as well, because
+// hosts differ: QQ enumerates all three and takes RGB32, WeChat takes RGB24.
+// [format] types=... overrides the list (and the order) at runtime.
+static bool SubTypeEnabled(const GUID *sub)
+{
+    int idx = SubIndex(sub);
+    if (idx < 0) return false;
+    const ISightOptions &o = Opts();
+    for (int i = 0; i < o.typeCount; ++i)
+        if (o.typeOrder[i] == idx) return true;
+    return false;
+}
 
 // hand the user a commented file on first use, so changing the
 // orientation is a two-second text edit instead of a rebuild
@@ -409,6 +494,7 @@ static void WriteDefaultIni(const char *path)
         "; Edit a value, then restart WeChat / QQ / the capture app.\n"
         ";\n"
         "; orientation: 0=none  1=vertical flip  2=horizontal flip  3=rotate 180\n"
+        ";              4 = vflip+, like 1 but the height is declared positive.\n"
         "; The camera hands out a bottom-up image and RGB consumers honour that,\n"
         "; so rgb=0 is right for QQ. WeChat reads YUY2 as top-down, hence yuy2=1.\n"
         "[orientation]\n"
@@ -426,7 +512,22 @@ static void WriteDefaultIni(const char *path)
         "; long the camera needs to boot before it answers again (ms).\n"
         "[recovery]\n"
         "busmon=1\n"
-        "bootdelay=2000\n");
+        "bootdelay=2000\n"
+        ";\n"
+        "; format: which subtypes the pin offers, and in which order.\n"
+        ";[format]\n"
+        ";types=rgb24,yuy2,rgb32\n"
+        ";\n"
+        "; layout: some hosts do not letterbox a 4:3 camera into their window,\n"
+        "; they cut the picture down to their own shape, so the face fills the\n"
+        "; whole window (WeChat's video call does this; QQ does not).  Set\n"
+        "; target to the rectangle the host actually shows and the camera\n"
+        "; picture is scaled down into it, centred, with black around it -- the\n"
+        "; host's crop then lands on that rectangle and the whole scene is\n"
+        "; visible again.  Try 480x480, then 360x480 or 270x480 if it is still\n"
+        "; too close.  0 = off (send the frame untouched).\n"
+        ";[layout]\n"
+        ";target=0\n");
     fclose(f);
 }
 
@@ -448,9 +549,68 @@ static const ISightOptions &Opts()
         if (s_o.bootDelayMs > 20000) s_o.bootDelayMs = 20000;
         s_o.busMon     = GetPrivateProfileIntA("recovery", "busmon", 1, ini) != 0;
 
+        // [format] types=rgb24,yuy2,rgb32 -- what the pin offers, in order.
+        // Anything not listed is neither advertised nor accepted, which is how
+        // a host gets moved onto another subtype without a rebuild.
+        char types[128] = "";
+        GetPrivateProfileStringA("format", "types", "rgb24,yuy2,rgb32", types, sizeof(types), ini);
+        s_o.typeCount = 0;
+        for (char *p = strtok(types, ",; \t"); p != NULL && s_o.typeCount < 3; p = strtok(NULL, ",; \t"))
+        {
+            int idx = -1;
+            if      (_stricmp(p, "rgb24") == 0) idx = 0;
+            else if (_stricmp(p, "yuy2")  == 0) idx = 1;
+            else if (_stricmp(p, "rgb32") == 0) idx = 2;
+            if (idx < 0)
+            {
+                FLog("options: [format] types= has an unknown entry '%s'", p);
+                continue;
+            }
+            bool dup = false;
+            for (int i = 0; i < s_o.typeCount; ++i)
+                if (s_o.typeOrder[i] == idx) dup = true;
+            if (!dup) s_o.typeOrder[s_o.typeCount++] = idx;
+        }
+        if (s_o.typeCount == 0)
+        {
+            s_o.typeOrder[0] = 0; s_o.typeOrder[1] = 1; s_o.typeOrder[2] = 2;
+            s_o.typeCount = 3;
+        }
+
+        // [layout] target=WxH -- the rectangle the host is expected to show.
+        // 0 / empty / "full" leaves the frame alone.
+        char lay[64] = "";
+        s_o.layoutW = s_o.layoutH = 0;
+        GetPrivateProfileStringA("layout", "target", "0", lay, sizeof(lay), ini);
+        int lw = 0, lh = 0;
+        if (sscanf_s(lay, "%dx%d", &lw, &lh) == 2 && lw > 0 && lh > 0)
+        {
+            if (lw < 64)  lw = 64;
+            if (lw > ISIGHT_WIDTH)  lw = ISIGHT_WIDTH;
+            if (lh < 64)  lh = 64;
+            if (lh > ISIGHT_HEIGHT) lh = ISIGHT_HEIGHT;
+            s_o.layoutW = lw;
+            s_o.layoutH = lh;
+        }
+
         FLog("options: yuy2=%s rgb=%s dump=%d busmon=%d bootdelay=%dms (ini=%s)",
              OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
              s_o.dump ? 1 : 0, s_o.busMon ? 1 : 0, s_o.bootDelayMs, ini);
+        {
+            char order[64] = "";
+            for (int i = 0; i < s_o.typeCount; ++i)
+            {
+                const char *n = (s_o.typeOrder[i] == 0) ? "rgb24"
+                              : (s_o.typeOrder[i] == 1) ? "yuy2" : "rgb32";
+                if (i) strncat_s(order, sizeof(order), ",", _TRUNCATE);
+                strncat_s(order, sizeof(order), n, _TRUNCATE);
+            }
+            if (s_o.layoutW > 0)
+                FLog("options: types=%s layout target=%dx%d (picture scaled into that box, rest black)",
+                     order, s_o.layoutW, s_o.layoutH);
+            else
+                FLog("options: types=%s layout target=off (full 640x480 frame)", order);
+        }
     }
     return s_o;
 }
@@ -482,15 +642,6 @@ static SubTypeInfo SubTypeFor(const GUID *sub)
         si.subtype = &MEDIASUBTYPE_RGB24; si.bpp = 24; si.compression = BI_RGB;
     }
     return si;
-}
-
-static bool SubTypeKnown(const GUID *sub)
-{
-    if (!sub) return false;
-    if (*sub == MEDIASUBTYPE_RGB24) return true;
-    if (*sub == MEDIASUBTYPE_RGB32) return true;
-    if (*sub == MEDIASUBTYPE_YUY2)  return true;
-    return false;
 }
 
 static const char *SubTypeName(const GUID *sub)
@@ -576,7 +727,7 @@ static void EmitFrame(const BYTE *src, BYTE *dst, ULONG width, ULONG height,
 {
     const ULONG sstride = width * 3;
     const ULONG dstride = width * (ULONG)si.bpp / 8;
-    const bool  vf      = OrientTopDown(orient);
+    const bool  vf      = OrientDataTopDown(orient);
     const bool  hf      = OrientMirror(orient);
     const bool  yuy2    = (*si.subtype == MEDIASUBTYPE_YUY2);
     const bool  rgb32   = (*si.subtype == MEDIASUBTYPE_RGB32);
@@ -589,6 +740,79 @@ static void EmitFrame(const BYTE *src, BYTE *dst, ULONG width, ULONG height,
         if (yuy2)       RowToYUY2(srow, drow, width, hf);
         else if (rgb32) RowToRGB32(srow, drow, width, hf);
         else            RowToRGB24(srow, drow, width, hf);
+    }
+}
+
+//---------------------------------------------------------------------
+// v10: scale the whole camera picture down into a rectangle in the middle
+// of the frame.
+//
+// Some hosts do not letterbox a 4:3 camera into their own window, they cut
+// the picture down to their window shape.  The image we hand over is
+// complete and upright (the log proves that), so the only way to get the
+// whole scene back into such a host is to put the scene inside the very
+// rectangle the host is going to cut out: whatever box it is configured for
+// ([layout] target=WxH) gets the scaled-down picture, everything outside it
+// stays black, and the host magnifies exactly that box.  Resolution is the
+// price -- the box is what survives.
+//
+// src/dst are both bottom-up BGR buffers of sw x sh and dw x dh.  Only the
+// rectangle is written, so the black surround can be prepared once.
+//---------------------------------------------------------------------
+static void FitIntoRect(const BYTE *src, ULONG sw, ULONG sh,
+                        BYTE *dst, ULONG dw, ULONG dh,
+                        ULONG boxW, ULONG boxH)
+{
+    if (sw < 2 || sh < 2 || dw < 2 || dh < 2)
+        return;
+
+    // the picture keeps its own aspect ratio inside the box
+    ULONG rw = boxW, rh = boxH;
+    if (rw * sh > rh * sw) rw = (rh * sw) / sh;      // too wide: fit the height
+    else                   rh = (rw * sh) / sw;
+    if (rw < 2) rw = 2;
+    if (rh < 2) rh = 2;
+    if (rw > dw) rw = dw;
+    if (rh > dh) rh = dh;
+
+    const ULONG rx    = (dw - rw) / 2;
+    const ULONG ryTop = (dh - rh) / 2;               // top-down coordinates
+    const ULONG sstride = sw * 3;
+    const ULONG dstride = dw * 3;
+
+    for (ULONG dy = 0; dy < rh; ++dy)
+    {
+        // 16.16 source row, top-down within the picture
+        ULONG syF = (ULONG)(((unsigned long long)dy * sh * 65536ULL) / rh);
+        ULONG sy0 = syF >> 16;
+        if (sy0 >= sh - 1) sy0 = sh - 2;
+        const ULONG fy = (syF >> 8) & 0xFF;
+
+        // buffer rows grow upwards, so image row sy0 is at sh-1-sy0
+        const BYTE *r0 = src + (size_t)(sh - 1 - sy0) * sstride;
+        const BYTE *r1 = src + (size_t)(sh - 2 - sy0) * sstride;
+        BYTE *drow = dst + (size_t)(dh - 1 - (ryTop + dy)) * dstride + (size_t)rx * 3;
+
+        for (ULONG dx = 0; dx < rw; ++dx)
+        {
+            ULONG sxF = (ULONG)(((unsigned long long)dx * sw * 65536ULL) / rw);
+            ULONG sx0 = sxF >> 16;
+            if (sx0 >= sw - 1) sx0 = sw - 2;
+            const ULONG fx = (sxF >> 8) & 0xFF;
+
+            const BYTE *p00 = r0 + (size_t)sx0 * 3;
+            const BYTE *p10 = p00 + 3;
+            const BYTE *p01 = r1 + (size_t)sx0 * 3;
+            const BYTE *p11 = p01 + 3;
+            BYTE *d = drow + (size_t)dx * 3;
+
+            for (int c = 0; c < 3; ++c)
+            {
+                const ULONG top = (ULONG)p00[c] * (256 - fx) + (ULONG)p10[c] * fx;
+                const ULONG bot = (ULONG)p01[c] * (256 - fx) + (ULONG)p11[c] * fx;
+                d[c] = (BYTE)((top * (256 - fy) + bot * fy) >> 16);
+            }
+        }
     }
 }
 
@@ -613,7 +837,7 @@ static void DumpFrame(const BYTE *buf, const SubTypeInfo &si, ULONG width, ULONG
     char file[MAX_PATH] = "";
     _snprintf_s(file, sizeof(file), _TRUNCATE, "%s\\frame-%s-%s-pid%lu-%lu.raw",
                 path, SubTypeName(si.subtype),
-                OrientTopDown(orient) ? "topdown" : "bottomup",
+                OrientDataTopDown(orient) ? "topdown" : "bottomup",
                 (unsigned long)GetCurrentProcessId(), (unsigned long)index);
 
     ULONG bytes = width * height * (ULONG)si.bpp / 8;
@@ -690,6 +914,7 @@ private:
     PBYTE            m_pScratch;      // RGB24 DIB scratch buffer
     ULONG            m_scratchBytes;
     PBYTE            m_pFull;         // 640x480 BGR scratch (letterbox path)
+    PBYTE            m_pFit;          // v10: [layout] target= box, black outside
     ULONG            m_dumpCount;     // frames written to the debug dump (max 2)
     volatile PVOID   m_hBringUp;      // background bring-up thread
     volatile LONG    m_bringUpState;  // 0 idle, 1 running, 2 ok, 3 failed
@@ -787,6 +1012,7 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_pScratch(NULL)
     , m_scratchBytes(0)
     , m_pFull(NULL)
+    , m_pFit(NULL)
     , m_dumpCount(0)
     , m_hBringUp(NULL)
     , m_bringUpState(0)
@@ -815,6 +1041,11 @@ CiSightStream::~CiSightStream()
     {
         delete[] m_pFull;
         m_pFull = NULL;
+    }
+    if (m_pFit)
+    {
+        delete[] m_pFit;
+        m_pFit = NULL;
     }
 }
 
@@ -1413,6 +1644,26 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
                     }
                 }
 
+                // v10: if the host cuts the picture down to its own window
+                // shape, hand it a frame whose content already sits inside
+                // that shape (see the [layout] notes at the top of this file)
+                if (Opts().layoutW > 0 && Opts().layoutH > 0)
+                {
+                    if (m_pFit == NULL)
+                    {
+                        m_pFit = new BYTE[ISIGHT_DIB_BYTES];
+                        if (m_pFit)
+                            ZeroMemory(m_pFit, ISIGHT_DIB_BYTES);   // black surround
+                    }
+                    if (m_pFit)
+                    {
+                        FitIntoRect(src, ISIGHT_WIDTH, ISIGHT_HEIGHT,
+                                    m_pFit, ISIGHT_WIDTH, ISIGHT_HEIGHT,
+                                    (ULONG)Opts().layoutW, (ULONG)Opts().layoutH);
+                        src = m_pFit;
+                    }
+                }
+
                 int orient = OrientForSubType(si.subtype);
                 EmitFrame(src, pBuf, ISIGHT_WIDTH, ISIGHT_HEIGHT, orient, si);
 
@@ -1515,6 +1766,9 @@ HRESULT CiSightStream::DecideBufferSize(IMemAllocator *pAlloc, ALLOCATOR_PROPERT
         FLog("DecideBufferSize: SetProperties -> 0x%08X", (unsigned)hr);
         return hr;
     }
+    FLog("DecideBufferSize: negotiated %ld buffers x %ld bytes (asked %lu x %lu)",
+         (long)actual.cBuffers, (long)actual.cbBuffer,
+         (unsigned long)pprop->cBuffers, (unsigned long)pprop->cbBuffer);
     if (actual.cbBuffer < pprop->cbBuffer)
         return E_OUTOFMEMORY;
     return S_OK;
@@ -1539,12 +1793,22 @@ void CiSightStream::BuildMediaType(const GUID *subtype, REFERENCE_TIME interval,
     // vertical flip (see Opts()), and getDIB's native bottom-up
     // otherwise.  Declaring the matching sign is what keeps a
     // conformant renderer and a sign-ignoring host both correct.
-    vih.bmiHeader.biHeight      = OrientTopDown(OrientForSubType(si.subtype))
+    vih.bmiHeader.biHeight      = OrientDeclareNegative(OrientForSubType(si.subtype))
                                     ? -ISIGHT_HEIGHT : ISIGHT_HEIGHT;
     vih.bmiHeader.biPlanes      = 1;
     vih.bmiHeader.biBitCount    = (WORD)si.bpp;
     vih.bmiHeader.biCompression = si.compression;
     vih.bmiHeader.biSizeImage   = FrameBytesFor(si);
+
+    // v10: publish the real frame rectangle.  These were left zeroed before,
+    // which is not what any sample source does and gives a host that derives
+    // its own scaling from them an empty rect to work with.
+    // (assigned field by field: SetRect() would pull in a user32 import)
+    vih.rcSource.left   = 0;
+    vih.rcSource.top    = 0;
+    vih.rcSource.right  = ISIGHT_WIDTH;
+    vih.rcSource.bottom = ISIGHT_HEIGHT;
+    vih.rcTarget        = vih.rcSource;
 
     pmt->SetFormat((PBYTE)&vih, sizeof(vih));
     pmt->SetSampleSize(FrameBytesFor(si));
@@ -1559,7 +1823,8 @@ bool CiSightStream::MediaTypeCompatible(const CMediaType *pmt, CMediaType *pNorm
     if (pmt->majortype != MEDIATYPE_Video) return false;
     if (pmt->formattype != FORMAT_VideoInfo && pmt->formattype != FORMAT_VideoInfo2) return false;
     if (pmt->cbFormat < sizeof(VIDEOINFOHEADER)) return false;
-    if (!SubTypeKnown(&pmt->subtype)) return false;
+    // v10: only the subtypes [format] types= lists are accepted
+    if (!SubTypeEnabled(&pmt->subtype)) return false;
 
     const VIDEOINFOHEADER *pvi = (const VIDEOINFOHEADER *)pmt->pbFormat;
     if (pvi->bmiHeader.biWidth != (LONG)ISIGHT_WIDTH) return false;
@@ -1589,11 +1854,14 @@ HRESULT CiSightStream::GetMediaType(int iPosition, CMediaType *pmt)
     if (iPosition < 0)
         return E_INVALIDARG;
 
-    static const GUID *kSubs[] = { &MEDIASUBTYPE_RGB24, &MEDIASUBTYPE_YUY2, &MEDIASUBTYPE_RGB32 };
-    if (iPosition >= (int)(sizeof(kSubs) / sizeof(kSubs[0])))
+    // v10: the advertised list (and order) comes from [format] types=
+    const ISightOptions &o = Opts();
+    if (iPosition >= o.typeCount)
         return VFW_S_NO_MORE_ITEMS;
 
-    BuildMediaType(kSubs[iPosition], kFrameDurations[kMaxRateIndex], pmt);
+    const GUID *sub = kAllSubs[o.typeOrder[iPosition]];
+    FLogT("enum-mt", "EnumMediaTypes: #%d -> %s", iPosition, SubTypeName(sub));
+    BuildMediaType(sub, kFrameDurations[kMaxRateIndex], pmt);
     return S_OK;
 }
 
@@ -1634,14 +1902,18 @@ STDMETHODIMP CiSightStream::GetFormat(AM_MEDIA_TYPE **ppmt)
     CheckPointer(ppmt, E_POINTER);
     CAutoLock lock(m_pFilter->pStateLock());
 
+    const ISightOptions &o = Opts();
     CMediaType mt;
     if (MediaTypeCompatible(&m_mt, &mt))
     {
+        FLog("GetFormat: -> current %s", SubTypeName(&mt.subtype));
         *ppmt = CreateMediaType(&mt);
     }
     else
     {
-        BuildMediaType(&MEDIASUBTYPE_RGB24, kFrameDurations[kMaxRateIndex], &mt);
+        const GUID *sub = kAllSubs[o.typeOrder[0]];
+        FLog("GetFormat: no current format, -> default %s", SubTypeName(sub));
+        BuildMediaType(sub, kFrameDurations[kMaxRateIndex], &mt);
         *ppmt = CreateMediaType(&mt);
     }
     return (*ppmt != NULL) ? S_OK : E_OUTOFMEMORY;
@@ -1685,8 +1957,10 @@ STDMETHODIMP CiSightStream::GetNumberOfCapabilities(int *piCount, int *piSize)
 {
     CheckPointer(piCount, E_POINTER);
     CheckPointer(piSize, E_POINTER);
-    *piCount = 3;
+    *piCount = Opts().typeCount;
     *piSize  = sizeof(VIDEO_STREAM_CONFIG_CAPS);
+    FLogT("caps-count", "GetNumberOfCapabilities -> count=%d (picked by hosts that walk the caps)",
+          *piCount);
     return S_OK;
 }
 
@@ -1695,19 +1969,23 @@ STDMETHODIMP CiSightStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE **ppmt, BYTE
     CheckPointer(ppmt, E_POINTER);
     CheckPointer(pSCC, E_POINTER);
 
-    static const GUID *kSubs[] = { &MEDIASUBTYPE_RGB24, &MEDIASUBTYPE_YUY2, &MEDIASUBTYPE_RGB32 };
-    if (iIndex < 0 || iIndex >= 3)
+    const ISightOptions &o = Opts();
+    if (iIndex < 0 || iIndex >= o.typeCount)
         return S_FALSE;
 
     CAutoLock lock(m_pFilter->pStateLock());
 
+    const GUID *sub = kAllSubs[o.typeOrder[iIndex]];
+    FLog("GetStreamCaps: #%d -> %s (the capability a host picks is the subtype it connects with)",
+         iIndex, SubTypeName(sub));
+
     CMediaType mt;
-    BuildMediaType(kSubs[iIndex], kFrameDurations[kMaxRateIndex], &mt);
+    BuildMediaType(sub, kFrameDurations[kMaxRateIndex], &mt);
     *ppmt = CreateMediaType(&mt);
     if (*ppmt == NULL)
         return E_OUTOFMEMORY;
 
-    ULONG bytes = FrameBytesFor(SubTypeFor(kSubs[iIndex]));
+    ULONG bytes = FrameBytesFor(SubTypeFor(sub));
 
     VIDEO_STREAM_CONFIG_CAPS *caps = (VIDEO_STREAM_CONFIG_CAPS *)pSCC;
     ZeroMemory(caps, sizeof(*caps));
