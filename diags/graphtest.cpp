@@ -86,6 +86,10 @@ static const char *SubTypeName(const GUID *g)
 static const GUID CLSID_NullRendererLocal =
 { 0xc1f400a4, 0x3f08, 0x11d3, { 0x9f, 0x0b, 0x00, 0x60, 0x08, 0x03, 0x9e, 0x37 } };
 
+// same for the system reference clock
+static const GUID CLSID_SystemClockLocal =
+{ 0xe436ebb1, 0x524f, 0x11ce, { 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70 } };
+
 // FreeMediaType/DeleteMediaType come from the DirectShow base classes,
 // which this tool deliberately does not link.
 static void FreeMediaTypeLocal(AM_MEDIA_TYPE &mt)
@@ -616,12 +620,20 @@ int main(void)
                 // is how an earlier run managed to report "0 frames
                 // delivered" while WeChat was pulling 811 frames from the
                 // very same filter minutes later.
-                IMediaFilter *pMf = NULL;
-                if (SUCCEEDED(pGraph->QueryInterface(__uuidof(IMediaFilter), (void **)&pMf)) && pMf)
+                IReferenceClock *pClock = NULL;
+                hr = CoCreateInstance(CLSID_SystemClockLocal, NULL, CLSCTX_INPROC_SERVER,
+                                      __uuidof(IReferenceClock), (void **)&pClock);
+                LOG("create SystemClock -> %s", HrName(hr));
+                if (SUCCEEDED(hr) && pClock)
                 {
-                    hr = pMf->SetDefaultSyncSource();
-                    LOG("SetDefaultSyncSource -> %s", HrName(hr));
-                    pMf->Release();
+                    IMediaFilter *pMf = NULL;
+                    if (SUCCEEDED(pGraph->QueryInterface(__uuidof(IMediaFilter), (void **)&pMf)) && pMf)
+                    {
+                        hr = pMf->SetSyncSource(pClock);
+                        LOG("SetSyncSource(SystemClock) -> %s", HrName(hr));
+                        pMf->Release();
+                    }
+                    pClock->Release();
                 }
 
                 hr = pCtl->Run();
