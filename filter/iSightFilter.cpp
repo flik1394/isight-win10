@@ -231,6 +231,125 @@ static const char *GuidName(REFIID g)
 }
 
 //---------------------------------------------------------------------
+// orientation + debug options  (%LOCALAPPDATA%\iSightCam.ini)
+//
+// getDIB() hands us a *bottom-up* BGR DIB (row 0 = bottom scanline) and
+// biHeight = +480 says exactly that.  RGB consumers (QQ, the DirectShow
+// renderers) honour the sign and show the picture upright -- but WeChat
+// feeds a YUY2 buffer straight into its own converter as if it were
+// top-down, no matter what the media type declares, so it shows the same
+// frame upside down.
+//
+// yuy2=vflip fixes that the robust way: the YUY2 buffer is written
+// top-down and biHeight is declared *negative*.  A host that honours the
+// sign renders correctly, and a host that ignores it also gets it right,
+// because the data is already top-down.
+//
+// Everything is overridable at runtime -- no rebuild needed to try a
+// different orientation, which matters because we cannot test the host's
+// expectation from here:
+//
+//   [orientation]
+//   yuy2=1      0 none | 1 vertical flip | 2 horizontal flip | 3 rotate 180
+//   rgb=0       same values
+//   [debug]
+//   dump=0      1 = write the first two frames of each process to
+//               %LOCALAPPDATA%\iSightCam-dump\*.raw for inspection
+//
+// Edit the ini and restart the host application to apply.
+//---------------------------------------------------------------------
+enum OrientMode
+{
+    ORIENT_NONE   = 0,
+    ORIENT_VFLIP  = 1,
+    ORIENT_HFLIP  = 2,
+    ORIENT_ROT180 = 3
+};
+
+static const char *OrientName(int m)
+{
+    switch (m)
+    {
+    case ORIENT_VFLIP:  return "vflip";
+    case ORIENT_HFLIP:  return "hflip";
+    case ORIENT_ROT180: return "rot180";
+    default:            return "none";
+    }
+}
+
+static bool OrientTopDown(int m) { return m == ORIENT_VFLIP || m == ORIENT_ROT180; }
+static bool OrientMirror (int m) { return m == ORIENT_HFLIP || m == ORIENT_ROT180; }
+
+static const char *IniPath()
+{
+    static char s_path[MAX_PATH] = "";
+    if (s_path[0] == 0)
+    {
+        char dir[MAX_PATH] = "";
+        if (GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH) == 0)
+            GetTempPathA(MAX_PATH, dir);
+        _snprintf_s(s_path, sizeof(s_path), _TRUNCATE, "%s\\iSightCam.ini", dir);
+    }
+    return s_path;
+}
+
+static int ClampOrient(int v) { return (v < 0 || v > 3) ? ORIENT_NONE : v; }
+
+struct ISightOptions
+{
+    int  orientYUY2;
+    int  orientRGB;
+    bool dump;
+};
+
+// hand the user a commented file on first use, so changing the
+// orientation is a two-second text edit instead of a rebuild
+static void WriteDefaultIni(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (f == NULL)
+        return;
+    // written in text mode, so plain \n turns into the CRLF Notepad wants
+    fprintf(f,
+        "; iSightCam DirectShow filter -- runtime options\n"
+        "; Edit a value, then restart WeChat / QQ / the capture app.\n"
+        ";\n"
+        "; orientation: 0=none  1=vertical flip  2=horizontal flip  3=rotate 180\n"
+        "; The camera hands out a bottom-up image and RGB consumers honour that,\n"
+        "; so rgb=0 is right for QQ. WeChat reads YUY2 as top-down, hence yuy2=1.\n"
+        "[orientation]\n"
+        "yuy2=1\n"
+        "rgb=0\n"
+        ";\n"
+        "; debug: dump=1 writes the first two frames of every process to\n"
+        "; <LOCALAPPDATA>\\iSightCam-dump\\frame-*.raw\n"
+        "[debug]\n"
+        "dump=0\n");
+    fclose(f);
+}
+
+static const ISightOptions &Opts()
+{
+    static ISightOptions s_o;
+    static LONG s_once = 0;
+    if (InterlockedCompareExchange(&s_once, 1, 0) == 0)
+    {
+        const char *ini = IniPath();
+        if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES)
+            WriteDefaultIni(ini);       // hand the user a file to edit
+
+        s_o.orientYUY2 = ClampOrient(GetPrivateProfileIntA("orientation", "yuy2", ORIENT_VFLIP, ini));
+        s_o.orientRGB  = ClampOrient(GetPrivateProfileIntA("orientation", "rgb",  ORIENT_NONE,   ini));
+        s_o.dump       = GetPrivateProfileIntA("debug", "dump", 0, ini) != 0;
+
+        FLog("options: yuy2=%s rgb=%s dump=%d (ini=%s)",
+             OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
+             s_o.dump ? 1 : 0, ini);
+    }
+    return s_o;
+}
+
+//---------------------------------------------------------------------
 // format helpers
 //---------------------------------------------------------------------
 struct SubTypeInfo
@@ -282,43 +401,124 @@ static ULONG FrameBytesFor(const SubTypeInfo &si)
     return (ULONG)(ISIGHT_WIDTH * ISIGHT_HEIGHT * si.bpp / 8);
 }
 
-// BGR bottom-up (from getDIB) -> RGB32 bottom-up
-static void ConvToRGB32(const BYTE *src, BYTE *dst, ULONG pixels)
+// which orientation the host of this subtype needs (see Opts())
+static int OrientForSubType(const GUID *sub)
 {
-    for (ULONG i = 0; i < pixels; ++i)
+    SubTypeInfo si = SubTypeFor(sub);
+    return (*si.subtype == MEDIASUBTYPE_YUY2) ? Opts().orientYUY2 : Opts().orientRGB;
+}
+
+//---------------------------------------------------------------------
+// row writers.  src is one BGR scanline of the getDIB buffer (bottom-up
+// over the whole frame); mirror reverses the pixel order inside a row.
+//---------------------------------------------------------------------
+static inline ULONG SrcX(ULONG outX, ULONG width, bool mirror)
+{
+    return mirror ? (width - 1 - outX) : outX;
+}
+
+// BGR -> RGB24
+static void RowToRGB24(const BYTE *s, BYTE *d, ULONG width, bool mirror)
+{
+    for (ULONG x = 0; x < width; ++x)
     {
-        dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 0xFF;
-        src += 3; dst += 4;
+        const BYTE *p = s + (size_t)SrcX(x, width, mirror) * 3;
+        *d++ = p[0]; *d++ = p[1]; *d++ = p[2];
     }
 }
 
-// BGR bottom-up (from getDIB) -> YUY2 bottom-up (BT.601, chroma averaged)
-static void ConvToYUY2(const BYTE *src, BYTE *dst, ULONG width, ULONG height)
+// BGR -> RGB32 (alpha left opaque, the usual convention)
+static void RowToRGB32(const BYTE *s, BYTE *d, ULONG width, bool mirror)
 {
+    for (ULONG x = 0; x < width; ++x)
+    {
+        const BYTE *p = s + (size_t)SrcX(x, width, mirror) * 3;
+        *d++ = p[0]; *d++ = p[1]; *d++ = p[2]; *d++ = 0xFF;
+    }
+}
+
+// BGR -> YUY2 (BT.601, chroma averaged over each pair, layout Y0 U Y1 V)
+static void RowToYUY2(const BYTE *s, BYTE *d, ULONG width, bool mirror)
+{
+    for (ULONG x = 0; x < width; x += 2)
+    {
+        const BYTE *p0 = s + (size_t)SrcX(x,     width, mirror) * 3;
+        const BYTE *p1 = s + (size_t)SrcX(x + 1, width, mirror) * 3;
+        int B0 = p0[0], G0 = p0[1], R0 = p0[2];
+        int B1 = p1[0], G1 = p1[1], R1 = p1[2];
+        int Rc = (R0 + R1) >> 1, Gc = (G0 + G1) >> 1, Bc = (B0 + B1) >> 1;
+
+        int Y0 = ((66 * R0 + 129 * G0 + 25 * B0 + 128) >> 8) + 16;
+        int Y1 = ((66 * R1 + 129 * G1 + 25 * B1 + 128) >> 8) + 16;
+        int U  = ((-38 * Rc - 74 * Gc + 112 * Bc + 128) >> 8) + 128;
+        int V  = ((112 * Rc - 94 * Gc - 18 * Bc + 128) >> 8) + 128;
+
+        d[0] = (BYTE)(Y0 < 0 ? 0 : (Y0 > 255 ? 255 : Y0));
+        d[1] = (BYTE)(U  < 0 ? 0 : (U  > 255 ? 255 : U));
+        d[2] = (BYTE)(Y1 < 0 ? 0 : (Y1 > 255 ? 255 : Y1));
+        d[3] = (BYTE)(V  < 0 ? 0 : (V  > 255 ? 255 : V));
+        d += 4;
+    }
+}
+
+//---------------------------------------------------------------------
+// copy a whole frame from the getDIB BGR buffer into the outgoing
+// buffer, applying the orientation the host for this subtype needs.
+//---------------------------------------------------------------------
+static void EmitFrame(const BYTE *src, BYTE *dst, ULONG width, ULONG height,
+                      int orient, const SubTypeInfo &si)
+{
+    const ULONG sstride = width * 3;
+    const ULONG dstride = width * (ULONG)si.bpp / 8;
+    const bool  vf      = OrientTopDown(orient);
+    const bool  hf      = OrientMirror(orient);
+    const bool  yuy2    = (*si.subtype == MEDIASUBTYPE_YUY2);
+    const bool  rgb32   = (*si.subtype == MEDIASUBTYPE_RGB32);
+
     for (ULONG y = 0; y < height; ++y)
     {
-        const BYTE *s = src + (size_t)y * width * 3;
-        BYTE *d = dst + (size_t)y * width * 2;
-        for (ULONG x = 0; x < width; x += 2)
-        {
-            int B0 = s[0], G0 = s[1], R0 = s[2];
-            int B1 = s[3], G1 = s[4], R1 = s[5];
-            int Rc = (R0 + R1) >> 1, Gc = (G0 + G1) >> 1, Bc = (B0 + B1) >> 1;
+        const BYTE *srow = src + (size_t)(vf ? (height - 1 - y) : y) * sstride;
+        BYTE *drow = dst + (size_t)y * dstride;
 
-            int Y0 = ((66 * R0 + 129 * G0 + 25 * B0 + 128) >> 8) + 16;
-            int Y1 = ((66 * R1 + 129 * G1 + 25 * B1 + 128) >> 8) + 16;
-            int U  = ((-38 * Rc - 74 * Gc + 112 * Bc + 128) >> 8) + 128;
-            int V  = ((112 * Rc - 94 * Gc - 18 * Bc + 128) >> 8) + 128;
-
-            d[0] = (BYTE)(Y0 < 0 ? 0 : (Y0 > 255 ? 255 : Y0));
-            d[1] = (BYTE)(U  < 0 ? 0 : (U  > 255 ? 255 : U));
-            d[2] = (BYTE)(Y1 < 0 ? 0 : (Y1 > 255 ? 255 : Y1));
-            d[3] = (BYTE)(V  < 0 ? 0 : (V  > 255 ? 255 : V));
-
-            s += 6;
-            d += 4;
-        }
+        if (yuy2)       RowToYUY2(srow, drow, width, hf);
+        else if (rgb32) RowToRGB32(srow, drow, width, hf);
+        else            RowToRGB24(srow, drow, width, hf);
     }
+}
+
+//---------------------------------------------------------------------
+// debug: throw one outgoing frame at %LOCALAPPDATA%\iSightCam-dump so it
+// can be decoded offline.  The file holds the buffer in *memory order*,
+// exactly as the host receives it, and the file name records which
+// biHeight sign was declared -- enough to tell whether the host flipped
+// it.  Only active when "dump=1" is in the ini.
+//---------------------------------------------------------------------
+static void DumpFrame(const BYTE *buf, const SubTypeInfo &si, ULONG width, ULONG height,
+                      int orient, ULONG index)
+{
+    char dir[MAX_PATH] = "";
+    if (GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH) == 0)
+        GetTempPathA(MAX_PATH, dir);
+
+    char path[MAX_PATH] = "";
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\iSightCam-dump", dir);
+    CreateDirectoryA(path, NULL);
+
+    char file[MAX_PATH] = "";
+    _snprintf_s(file, sizeof(file), _TRUNCATE, "%s\\frame-%s-%s-pid%lu-%lu.raw",
+                path, SubTypeName(si.subtype),
+                OrientTopDown(orient) ? "topdown" : "bottomup",
+                (unsigned long)GetCurrentProcessId(), (unsigned long)index);
+
+    ULONG bytes = width * height * (ULONG)si.bpp / 8;
+    FILE *f = fopen(file, "wb");
+    if (f == NULL)
+        return;
+    fwrite(buf, 1, bytes, f);
+    fclose(f);
+    FLog("DumpFrame: %s (%s %lux%lu orient=%s, %lu bytes)",
+         file, SubTypeName(si.subtype), width, height, OrientName(orient),
+         (unsigned long)bytes);
 }
 
 //---------------------------------------------------------------------
@@ -566,10 +766,10 @@ bool CiSightStream::TryStart()
             return false;
         }
         DWORD t2 = TickMs();
-        // NOTE: this is a slow call (it walks the whole capability table
-        // register by register -- ~15 s on this driver/hardware). That is
-        // why it must never run inside Active(): it is done here on the
-        // streaming thread instead.
+        // Still run on the bring-up thread rather than inside Active(): even
+        // with the feature walk skipped this is a hardware round trip (and
+        // the camera needs ~1 s after the stream starts before frame 0), so
+        // the host's Pause()/Run() must not be made to wait for it.
         FLog("TryStart: InitCamera OK, MaxSpeed=%d (enum=%lums init=%lums)",
              m_pCam->GetMaxSpeed(), (unsigned long)(t1 - t0), (unsigned long)(t2 - t1));
         ConfigureVideo();
@@ -726,6 +926,10 @@ HRESULT CiSightStream::Active()
         return hr;
     }
     FLog("Active: pin active");
+    FLog("Active: connected=%d subtype=%s orient=%s",
+         IsConnected() ? 1 : 0,
+         SubTypeName(&m_mt.subtype),
+         OrientName(OrientForSubType(&m_mt.subtype)));
     // DO NOT touch the camera here. Camera bring-up costs ~15 s (the CMU
     // library reads the whole capability table) and Active() runs inside
     // the host's Pause()/Run() call: blocking here makes every application
@@ -822,12 +1026,11 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
                     }
                 }
 
-                if (*si.subtype == MEDIASUBTYPE_YUY2)
-                    ConvToYUY2(src, pBuf, ISIGHT_WIDTH, ISIGHT_HEIGHT);
-                else if (*si.subtype == MEDIASUBTYPE_RGB32)
-                    ConvToRGB32(src, pBuf, ISIGHT_WIDTH * ISIGHT_HEIGHT);
-                else
-                    memcpy(pBuf, src, ISIGHT_DIB_BYTES);
+                int orient = OrientForSubType(si.subtype);
+                EmitFrame(src, pBuf, ISIGHT_WIDTH, ISIGHT_HEIGHT, orient, si);
+
+                if (Opts().dump && m_dumpCount < 2)
+                    DumpFrame(pBuf, si, ISIGHT_WIDTH, ISIGHT_HEIGHT, orient, ++m_dumpCount);
 
                 got = true;
                 m_consecFail = 0;
@@ -936,7 +1139,12 @@ void CiSightStream::BuildMediaType(const GUID *subtype, REFERENCE_TIME interval,
     vih.AvgTimePerFrame = interval;
     vih.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
     vih.bmiHeader.biWidth       = ISIGHT_WIDTH;
-    vih.bmiHeader.biHeight      = ISIGHT_HEIGHT;   // positive = bottom-up (getDIB format)
+    // The data we hand out is top-down when the orientation needs a
+    // vertical flip (see Opts()), and getDIB's native bottom-up
+    // otherwise.  Declaring the matching sign is what keeps a
+    // conformant renderer and a sign-ignoring host both correct.
+    vih.bmiHeader.biHeight      = OrientTopDown(OrientForSubType(si.subtype))
+                                    ? -ISIGHT_HEIGHT : ISIGHT_HEIGHT;
     vih.bmiHeader.biPlanes      = 1;
     vih.bmiHeader.biBitCount    = (WORD)si.bpp;
     vih.bmiHeader.biCompression = si.compression;
