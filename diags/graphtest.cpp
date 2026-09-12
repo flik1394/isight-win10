@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 
 static FILE *g_log = NULL;
 
@@ -77,10 +78,13 @@ static const char *SubTypeName(const GUID *g)
     if (*g == MEDIASUBTYPE_YUYV)  return "YUYV";
     if (*g == MEDIASUBTYPE_UYVY)  return "UYVY";
     if (*g == MEDIASUBTYPE_MJPG)  return "MJPG";
-    if (*g == MEDIASUBTYPE_NV12)  return "NV12";
-    if (*g == MEDIASUBTYPE_I420)  return "I420";
     return "other";
 }
+
+// CLSID_NullRenderer lives in strmiids/uuids but is not always declared
+// by the Windows SDK headers; define it locally.
+static const GUID CLSID_NullRendererLocal =
+{ 0xc1f400a4, 0x3f08, 0x11d3, { 0x9f, 0x0b, 0x00, 0x60, 0x08, 0x03, 0x9e, 0x37 } };
 
 static void DescribeMediaType(const char *prefix, const AM_MEDIA_TYPE *pmt)
 {
@@ -123,10 +127,11 @@ static void PumpFor(DWORD ms)
 static void DrainEvents(IMediaEvent *pEvent)
 {
     if (!pEvent) return;
-    long code = 0, p1 = 0, p2 = 0;
+    long code = 0;
+    LONG_PTR p1 = 0, p2 = 0;
     while (pEvent->GetEvent(&code, &p1, &p2, 0) == S_OK)
     {
-        LOG("  graph event: code=0x%04X p1=%ld p2=%ld", (unsigned)code, p1, p2);
+        LOG("  graph event: code=0x%04X p1=%ld p2=%ld", (unsigned)code, (long)p1, (long)p2);
         pEvent->FreeEventParams(code, p1, p2);
     }
 }
@@ -356,7 +361,7 @@ int main(void)
         LOG("AddFilter -> %s", HrName(hr));
 
         IBaseFilter *pNull = NULL;
-        hr = CoCreateInstance(CLSID_NullRenderer, NULL, CLSCTX_INPROC_SERVER,
+        hr = CoCreateInstance(CLSID_NullRendererLocal, NULL, CLSCTX_INPROC_SERVER,
                               IID_IBaseFilter, (void **)&pNull);
         LOG("create NullRenderer -> %s", HrName(hr));
 
