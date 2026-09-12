@@ -580,6 +580,7 @@ private:
     PBYTE            m_pScratch;      // RGB24 DIB scratch buffer
     ULONG            m_scratchBytes;
     PBYTE            m_pFull;         // 640x480 BGR scratch (letterbox path)
+    ULONG            m_dumpCount;     // frames written to the debug dump (max 2)
     volatile PVOID   m_hBringUp;      // background bring-up thread
     volatile LONG    m_bringUpState;  // 0 idle, 1 running, 2 ok, 3 failed
     int              m_bringUpRetry;  // frames to wait before retrying
@@ -660,6 +661,7 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_pScratch(NULL)
     , m_scratchBytes(0)
     , m_pFull(NULL)
+    , m_dumpCount(0)
     , m_hBringUp(NULL)
     , m_bringUpState(0)
     , m_bringUpRetry(0)
