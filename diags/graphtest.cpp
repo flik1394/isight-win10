@@ -126,6 +126,139 @@ static void DescribeMediaType(const char *prefix, const AM_MEDIA_TYPE *pmt)
         pvi ? (unsigned long)pvi->bmiHeader.biSizeImage : 0);
 }
 
+//---------------------------------------------------------------------
+// pin category -- the exact lookup ICaptureGraphBuilder2::FindPin() does.
+// If the pin does not answer this, RenderStream() returns E_INVALIDARG
+// and the host gives up before negotiating any media type.
+//---------------------------------------------------------------------
+static const GUID kAMPROPSETID_PinLocal =
+{ 0x9b00f101, 0x1567, 0x11d1, { 0xb3, 0xf1, 0x00, 0xaa, 0x00, 0x37, 0x61, 0xc5 } };
+#define AMPROPERTY_PIN_CATEGORY_LOCAL 0
+
+// IID_IKsPropertySet lives in ksuser/uuid rather than strmiids, which is all
+// this tool links -- so carry the value locally.
+static const GUID kIID_IKsPropertySet =
+{ 0x886d8eeb, 0x8cf2, 0x4446, { 0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0xdb } };
+
+static void GuidText(const GUID &g, char *out, size_t cb)
+{
+    _snprintf_s(out, cb, _TRUNCATE,
+                "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                (unsigned long)g.Data1, g.Data2, g.Data3,
+                g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+                g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+}
+
+static const char *CategoryName(const GUID &g)
+{
+    if (IsEqualGUID(g, PIN_CATEGORY_CAPTURE)) return "PIN_CATEGORY_CAPTURE";
+    return "(not PIN_CATEGORY_CAPTURE)";
+}
+
+static void ProbePinCategory(IPin *pPin)
+{
+    LOG("pin category lookup (what the capture graph builder runs first):");
+    if (!pPin) { LOG("  no pin"); return; }
+
+    IKsPropertySet *pPs = NULL;
+    HRESULT hr = pPin->QueryInterface(kIID_IKsPropertySet, (void **)&pPs);
+    if (FAILED(hr) || pPs == NULL)
+    {
+        LOG("  pin QI IKsPropertySet -> %s   <=== RenderStream(PIN_CATEGORY_CAPTURE) WILL FAIL", HrName(hr));
+        return;
+    }
+
+    DWORD supported = 0;
+    hr = pPs->QuerySupported(kAMPROPSETID_PinLocal, AMPROPERTY_PIN_CATEGORY_LOCAL, &supported);
+    LOG("  QuerySupported(AMPROPSETID_Pin, CATEGORY) -> %s support=0x%X", HrName(hr), supported);
+
+    GUID cat;
+    ZeroMemory(&cat, sizeof(cat));
+    DWORD cb = 0;
+    hr = pPs->Get(kAMPROPSETID_PinLocal, AMPROPERTY_PIN_CATEGORY_LOCAL,
+                  NULL, 0, &cat, sizeof(cat), &cb);
+    if (SUCCEEDED(hr))
+    {
+        char txt[64];
+        GuidText(cat, txt, sizeof(txt));
+        LOG("  Get(PIN_CATEGORY) -> %s  %s", CategoryName(cat), txt);
+        LOG("  ==> capture graph builder can find this pin  (GOOD)");
+    }
+    else
+    {
+        LOG("  Get(PIN_CATEGORY) -> %s   <=== RenderStream WILL FAIL", HrName(hr));
+    }
+    pPs->Release();
+}
+
+//---------------------------------------------------------------------
+// The filter traces to %LOCALAPPDATA%\iSightCam.log.  Read it back and
+// report what actually happened inside the host process: which build was
+// loaded, how long the camera bring-up took and how many frames the
+// filter really delivered.  Only lines belonging to THIS process count.
+//---------------------------------------------------------------------
+static void ReportFilterLog(void)
+{
+    char path[MAX_PATH] = "";
+    const char *lad = getenv("LOCALAPPDATA");
+    if (lad && *lad)
+        _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\iSightCam.log", lad);
+
+    char pidTag[48];
+    _snprintf_s(pidTag, sizeof(pidTag), _TRUNCATE, "pid=%lu ", (unsigned long)GetCurrentProcessId());
+
+    FILE *f = (path[0] != 0) ? fopen(path, "r") : NULL;
+    if (f == NULL)
+    {
+        LOG("filter log: cannot open %s", path);
+        return;
+    }
+
+    LOG("--- filter log (%s), this process only ---", path);
+    char line[2048];
+    char lastBuild[400] = "";
+    char lastInit[400] = "";
+    char lastCfg[400] = "";
+    char lastStart[400] = "";
+    char lastErr[400] = "";
+    unsigned long maxFrame = 0;
+    int framesLogged = 0, acquireErrors = 0, qis = 0, buildSeen = 0;
+
+    while (fgets(line, sizeof(line), f))
+    {
+        if (strstr(line, pidTag) == NULL)
+            continue;
+        if (strstr(line, "ISIGHTFILTER-BUILD-"))  { buildSeen++; _snprintf_s(lastBuild, sizeof(lastBuild), _TRUNCATE, "%s", line); }
+        if (strstr(line, "init="))                { _snprintf_s(lastInit,  sizeof(lastInit),  _TRUNCATE, "%s", line); }
+        if (strstr(line, "ConfigureVideo done"))  { _snprintf_s(lastCfg,   sizeof(lastCfg),   _TRUNCATE, "%s", line); }
+        if (strstr(line, "acquisition started"))  { _snprintf_s(lastStart, sizeof(lastStart), _TRUNCATE, "%s", line); }
+        if (strstr(line, "AcquireImageEx ->"))    { acquireErrors++; _snprintf_s(lastErr, sizeof(lastErr), _TRUNCATE, "%s", line); }
+
+        char *p = strstr(line, "FillBuffer #");
+        if (p)
+        {
+            framesLogged++;
+            unsigned long n = strtoul(p + 11, NULL, 10);
+            if (n > maxFrame) maxFrame = n;
+        }
+        if (strstr(line, "QI ")) qis++;
+    }
+    fclose(f);
+
+    LOG("  loaded build ....... %s%s", buildSeen ? "" : "<no build tag line found>",
+        buildSeen ? lastBuild : "");
+    LOG("  bring-up ........... %s", lastInit[0]  ? lastInit  : "<none>");
+    LOG("  video config ....... %s", lastCfg[0]   ? lastCfg   : "<none>");
+    LOG("  stream start ....... %s", lastStart[0] ? lastStart : "<none>");
+    LOG("  frames delivered ... %lu  (filter logs frame #1..3 and every 150th; %d such lines)",
+        maxFrame, framesLogged);
+    if (acquireErrors)
+        LOG("  capture errors ..... %d, last: %s", acquireErrors, lastErr);
+    LOG("  queryinterface lines %d", qis);
+    LOG("  VERDICT: %s", maxFrame > 0 ? "FILTER DELIVERS REAL FRAMES" :
+                          "NO FRAMES DELIVERED BY THE FILTER");
+}
+
 // keep the pump alive so DirectShow messages/events get processed
 static void PumpFor(DWORD ms)
 {
@@ -328,6 +461,7 @@ int main(void)
     ProbeFilterInterfaces(pFilter);
     if (pOutPin)
         ProbePinInterfaces(pOutPin);
+    ProbePinCategory(pOutPin);
 
     if (pOutPin)
     {
@@ -479,7 +613,7 @@ int main(void)
             {
                 hr = pCtl->Run();
                 LOG("Run -> %s", HrName(hr));
-                PumpFor(round == 1 ? 5000 : 3000);
+                PumpFor(round == 1 ? 15000 : 10000);
                 DrainEvents(pEvt);
 
                 OAFilterState state = State_Stopped;
@@ -546,7 +680,7 @@ int main(void)
                     {
                         hr = pCtl->Run();
                         LOG("Run -> %s", HrName(hr));
-                        PumpFor(6000);
+                        PumpFor(12000);
                         DrainEvents(pEvt);
                         hr = pCtl->Stop();
                         LOG("Stop -> %s", HrName(hr));
@@ -568,6 +702,7 @@ int main(void)
     }
 
 done:
+    ReportFilterLog();
     LOG("=== done (see also %%LOCALAPPDATA%%\\iSightCam.log for the filter trace) ===");
     if (g_log) { fclose(g_log); g_log = NULL; }
     printf("\nPress Enter to exit...");
