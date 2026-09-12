@@ -611,6 +611,19 @@ int main(void)
 
             if (pCtl)
             {
+                // A NullRenderer paces itself on the graph clock.  Without
+                // one it never asks the source for a sample at all -- that
+                // is how an earlier run managed to report "0 frames
+                // delivered" while WeChat was pulling 811 frames from the
+                // very same filter minutes later.
+                IMediaFilter *pMf = NULL;
+                if (SUCCEEDED(pGraph->QueryInterface(__uuidof(IMediaFilter), (void **)&pMf)) && pMf)
+                {
+                    hr = pMf->SetDefaultSyncSource();
+                    LOG("SetDefaultSyncSource -> %s", HrName(hr));
+                    pMf->Release();
+                }
+
                 hr = pCtl->Run();
                 LOG("Run -> %s", HrName(hr));
                 PumpFor(round == 1 ? 15000 : 10000);
