@@ -4,22 +4,25 @@ rem 本文件以 GBK(936) 编码打包，先锁定控制台代码页，避免中
 chcp 936 >nul 2>&1
 rem ============================================================
 rem  install-all.bat  -  注册 Apple iSight (FireWire) DirectShow 摄像头
-rem  v8：必须右键"以管理员身份运行"
+rem  v9：必须右键"以管理员身份运行"
 rem
-rem  这一版修的是画面显示：
-rem    1. 微信把 YUY2 缓冲当成自上而下读，导致画面上下颠倒；
-rem       现在 YUY2 输出改为自上而下 + biHeight 取负，QQ/微信
-rem       都能得到正向画面
-rem    2. 朝向可运行期调整，不必重新编译：改
-rem         %LOCALAPPDATA%\iSightCam.ini
-rem       里的 yuy2 / rgb（0=不变 1=上下翻 2=左右翻 3=旋转180）
+rem  这一版修的是"通话中把相机拧掉再拧开，画面就再也不出来了"：
+rem    1. 新增总线监视线程，200ms 级发现总线复位/相机掉线，立刻丢弃
+rem       旧的相机句柄，等相机启动完成后自动重新枚举、重新推流
+rem    2. 取帧连续失败 3 次即判定流已死（原来要 12 次、最长一分钟）
+rem    3. 重连节奏 1 秒一次（原来 10 秒），并大幅减少日志写入量
+rem
+rem  上一版（v8）修的是画面显示：
+rem    微信把 YUY2 缓冲当成自上而下读，导致画面上下颠倒；现在 YUY2
+rem    输出改为自上而下 + biHeight 取负，QQ/微信都能得到正向画面。
+rem    朝向可在 %LOCALAPPDATA%\iSightCam.ini 里运行期调整。
 rem
 rem  沿用上一版的两条保护（曾经把 64 位组件静默漏装过）：
 rem    * 拒绝在 32 位 cmd 里运行
 rem    * 目标文件被占用时先改名再复制，复制后按版本标记自检
 rem ============================================================
 
-set "TAG=ISIGHTFILTER-BUILD-V8-20260912-ORIENT"
+set "TAG=ISIGHTFILTER-BUILD-V9-20260912-BUSRESET"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
@@ -141,10 +144,10 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V8" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V9" "%~1" >nul 2>&1
 if errorlevel 1 (
-    echo     [FAIL] %~1 里没有 v8 标记 —— 这个文件还是旧版！
+    echo     [FAIL] %~1 里没有 v9 标记 —— 这个文件还是旧版！
     exit /b 1
 )
-for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v8 标记
+for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v9 标记
 exit /b 0
