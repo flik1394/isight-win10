@@ -556,6 +556,10 @@ static int g_lastCompletions = -1;
 // command line switches back to v8's ad-hoc numbers for an A/B comparison.
 static BOOL g_cmu = TRUE;
 
+// v10: optional DCAM frame-rate override for the video engine we start as
+// the microphone's clock source.  -1 leaves the camera's setting alone.
+static int g_vidRate = -1;
+
 //---------------------------------------------------------------------
 // IRM helpers
 //---------------------------------------------------------------------
@@ -714,7 +718,7 @@ static ULONG ChannelOf60C(ULONG v)
 }
 
 static void VideoEngineOn(const char *dev, ULONG flag, int vidCh, ULONG ourCh,
-                          ULONG *pOldCh, ULONG *pOldEn, BOOL *pSaved)
+                          ULONG *pOldCh, ULONG *pOldEn, BOOL *pSaved, int forceRate)
 {
     ULONG oldCh = 0, oldEn = 0;
     *pSaved = RD(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, &oldCh, NULL) &&
@@ -742,6 +746,19 @@ static void VideoEngineOn(const char *dev, ULONG flag, int vidCh, ULONG ourCh,
     LOG("  -> video 0x60C = 0x%08X (video channel %lu, we listen on %u), was 0x%08X",
         v, vc, ourCh, oldCh);
     WR(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, v, "V_ISO_CHANNEL");
+
+    // Optional frame-rate override.  DCAM packs its FMR registers as
+    // value << 29, and the camera sends audio in the cycles the video
+    // leaves free - so a slower video frame rate means more free cycles,
+    // which is the one knob that should directly improve audio continuity.
+    if (forceRate >= 0)
+    {
+        ULONG before = 0;
+        RD(dev, VIDEO_ABS_BASE + V_FRAME_RATE, &before, NULL);
+        LOG("  -> video 0x600 (frame rate) = rate %d, was rate %u", forceRate, before >> 29);
+        WR(dev, VIDEO_ABS_BASE + V_FRAME_RATE, (ULONG)forceRate << 29, "V_FRAME_RATE");
+    }
+
     WR(dev, VIDEO_ABS_BASE + V_ISO_ENABLE,  V_ISO_ENABLE_ON, "V_ISO_ENABLE");
 
     ULONG rb = 0;
@@ -749,8 +766,11 @@ static void VideoEngineOn(const char *dev, ULONG flag, int vidCh, ULONG ourCh,
         LOG("     0x60C reads back 0x%08X  %s", rb,
             (rb == v) ? "(the write took)" : "(THE WRITE DID NOT TAKE!)");
     if (RD(dev, VIDEO_ABS_BASE + V_ISO_ENABLE, &rb, NULL))
+        // NOTE: in the v9 run where this read back 0, a full YUV video
+        // picture was nevertheless present in the capture - so this read
+        // is reported but must NOT be trusted as "is it streaming".
         LOG("     0x614 reads back 0x%08X  %s", rb,
-            (rb & V_ISO_ENABLE_ON) ? "(streaming)" : "(NOT streaming!)");
+            (rb & V_ISO_ENABLE_ON) ? "(streaming)" : "(says not streaming - not conclusive)");
 }
 
 //---------------------------------------------------------------------
@@ -784,7 +804,7 @@ static void FreeAcq(PACQUISITION_BUFFER *acq, int n)
 
 static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dumpRaw,
                      ULONG cfgBase, int restoreCh, BOOL enableAudio, BOOL vidEnable,
-                     int vidCh, BOOL vidFirst, BOOL cmuStyle)
+                     int vidCh, BOOL vidFirst, BOOL cmuStyle, int vidRate)
 {
     ULONG flag = 0;
     if (GetMaxIsochSpeed((PSTR)dev, &flag) != ERROR_SUCCESS || flag == 0) flag = SPEED_FLAGS_400;
@@ -959,11 +979,11 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     LOG("  -- programming the camera (video %s) --",
         vidFirst ? "FIRST, audio second" : "last, audio first");
     if (vidEnable && vidFirst)
-        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved);
+        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved, vidRate);
     if (cfgBase)
         CameraAudioOn(dev, cfgBase, sp.nChannel, flag, enableAudio);
     if (vidEnable && !vidFirst)
-        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved);
+        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved, vidRate);
 
     FILE *raw = fopen("isight-audio-raw.bin", "wb");
     double t0 = NowMs();
@@ -1075,34 +1095,48 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOO
         if (tx == 0 || curCh > 63) { curCh = -1; LOG("  -> that channel is invalid, treating as none"); }
     }
 
-    // v8 adds a fourth variant, and it is the one that finally matches what
-    // Apple's programming guide describes: the iSight's audio clock comes
-    // from the video engine, so with video stopped the audio engine may have
-    // no clock to run on.  Variant 4 therefore brings the video engine up
-    // *first* (on its own isochronous channel - the two never share one) and
-    // only then enables audio, while we stay listening on the audio channel.
-    struct { const char *what; BOOL audio, video, vidFirst; } variants[] = {
-        { "1/4  audio only: SAMPLE_RATE + ISO_TX_CONFIG, no enable",        FALSE, FALSE, FALSE },
-        { "2/4  + AUDIO_ENABLE = 0x80000000 (Linux isight.c's sequence)",   TRUE,  FALSE, FALSE },
-        { "3/4  + AUDIO_ENABLE, then the video engine up on its own ch",    TRUE,  TRUE,  FALSE },
-        { "4/4  video engine up FIRST, then audio (the camera clock)",      TRUE,  TRUE,  TRUE  },
+    // v10.  The v9 run of variant 3 finally produced audio - 1050 "sght"
+    // packets, a real YUV picture alongside them - but with 74 dropouts
+    // over 4.38 s: only ~43% of the microphone's frames.  The reason is
+    // visible in the dump: the video engine was put on OUR OWN receive
+    // channel, so the camera could only alternate one packet per cycle and
+    // half the audio went missing.  v9 passed -1 for the video channel,
+    // and -1 is VID_SAME, not VID_OTHER - the flag that was meant.
+    // Apple's guide is explicit that audio and video use *different*
+    // isochronous channels, so variant 3 now does exactly that.
+    // Variant 4 keeps the video-first ordering, and variant 5 slows the
+    // video frame rate down: the camera sends audio in the cycles video
+    // leaves free, so fewer video frames means more room for the mic.
+    struct { const char *what; BOOL audio, video, vidFirst; int vidCh; int vrate; }
+    variants[] = {
+        { "1/5  audio only: SAMPLE_RATE + ISO_TX_CONFIG, no enable",
+          FALSE, FALSE, FALSE, 0,         -1 },
+        { "2/5  + AUDIO_ENABLE, video engine still off",
+          TRUE,  FALSE, FALSE, 0,         -1 },
+        { "3/5  + AUDIO_ENABLE, video engine on ANOTHER channel",
+          TRUE,  TRUE,  FALSE, VID_OTHER, -1 },
+        { "4/5  video engine FIRST (another channel), then audio",
+          TRUE,  TRUE,  TRUE,  VID_OTHER, -1 },
+        { "5/5  as 4/5 but video frame rate lowered to 3.75 fps",
+          TRUE,  TRUE,  TRUE,  VID_OTHER,  1 },
     };
 
     int rc = 0;
     if (!configTx)
     {
         rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
-                       0, -1, FALSE, FALSE, -1, FALSE, g_cmu);
+                       0, -1, FALSE, FALSE, -1, FALSE, g_cmu, g_vidRate);
     }
     else
     {
-        for (int v = 0; v < 4; ++v)
+        for (int v = 0; v < 5; ++v)
         {
             LOG("");
             LOG("  ---------- variant %s ----------", variants[v].what);
             rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
-                           base, curCh, variants[v].audio, variants[v].video, -1,
-                           variants[v].vidFirst, g_cmu);
+                           base, curCh, variants[v].audio, variants[v].video,
+                           variants[v].vidCh, variants[v].vidFirst, g_cmu,
+                           variants[v].vrate >= 0 ? variants[v].vrate : g_vidRate);
             if (g_lastCompletions > 0)
             {
                 LOG("  *** variant %d produced data - stopping the escalation ***", v + 1);
@@ -1149,7 +1183,8 @@ static int DoVidListen(const char *dev, int ch, int seconds, ULONG bpf)
     // DoReceive does the whole sequence: SetupStream, buffers, Listen and then -
     // because vidEnable is set - the video 0x60C and 0x614 = 0x80000000 writes,
     // with both registers restored afterwards.
-    int rc = DoReceive(dev, ch, seconds, bpf, TRUE, 0, -1, FALSE, TRUE, VID_SAME, FALSE, g_cmu);
+    int rc = DoReceive(dev, ch, seconds, bpf, TRUE, 0, -1, FALSE, TRUE, VID_SAME, FALSE,
+                       g_cmu, g_vidRate);
 
     ULONG en = 0;
     RD(dev, VIDEO_ABS_BASE + V_ISO_ENABLE, &en, NULL);
@@ -1193,6 +1228,19 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
+    LOG("(v10 - THE MICROPHONE IS LIVE.  v9's variant 3 finally received audio:");
+    LOG("      1050 'sght' packets, 210000 frames, alongside a real YUV picture -");
+    LOG("      but with 74 dropouts, i.e. only ~43% of the microphone's frames.");
+    LOG("      The dump explains why: v9 handed -1 as the video channel, and -1 is");
+    LOG("      VID_SAME, not the VID_OTHER it was meant to be, so both streams");
+    LOG("      ended up on our single receive channel and the camera could only");
+    LOG("      alternate one packet per cycle.  Apple's guide is explicit that");
+    LOG("      audio and video use DIFFERENT isochronous channels, so v10: (a)");
+    LOG("      really does put the video engine on another channel, (b) adds a");
+    LOG("      variant that also lowers the video frame rate - the camera sends");
+    LOG("      audio in the cycles video leaves free, so a slower video means");
+    LOG("      more room for the mic - and (c) stops trusting 0x614's readback,");
+    LOG("      because in the run that produced a full video picture it read 0.)");
     LOG("(v9 - the receive path, reproduced from the one that works.  v8 let the");
     LOG("      driver ALLOCATE the channel, pointed the camera's video engine at");
     LOG("      it, saw 0x614 read back 0x80000000 ('streaming') - and still got");
@@ -1249,12 +1297,15 @@ int main(int argc, char **argv)
         if (!_stricmp(argv[i], "irm"))   g_irm = TRUE;
         if (!_stricmp(argv[i], "cmu"))   g_cmu = TRUE;
         if (!_stricmp(argv[i], "plain")) g_cmu = FALSE;
+        if (!_strnicmp(argv[i], "vrate=", 6)) g_vidRate = atoi(argv[i] + 6);
     }
     if (g_irm) LOG("IRM mode: on - the channel/bandwidth claim will be attempted (and will fail)");
     else       LOG("IRM mode: off (pass 'irm' as an extra argument to attempt the claim)");
     LOG("buffer mode: %s (pass 'plain' for v8's ad-hoc numbers, 'cmu' for C1394Camera's)",
         g_cmu ? "CMU-style - 8 x full-frame buffers, 960 B/packet, subBuffers+1"
               : "plain - one small buffer");
+    if (g_vidRate >= 0)
+        LOG("video frame rate override: rate %d (DCAM index, 0=1.875 .. 5=60 fps)", g_vidRate);
 
     HDEVINFO hDev = t1394CmdrGetDeviceList();
     if (hDev == INVALID_HANDLE_VALUE) { LOG("t1394CmdrGetDeviceList FAILED"); return 1; }
@@ -1317,7 +1368,8 @@ int main(int argc, char **argv)
         LOG("");
         LOG("== listen only: channel %s, %d s, %u bytes/frame max ==",
             ch < 0 ? "auto" : "explicit", secs, bpf);
-        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE, FALSE, -1, FALSE, g_cmu);
+        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE, FALSE, -1, FALSE,
+                           g_cmu, g_vidRate);
         LOG("listen exit code %d", rc);
     }
     else if (!_stricmp(mode, "vidlisten"))
