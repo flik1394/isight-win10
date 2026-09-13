@@ -141,6 +141,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Probe driver toolchain (WDK)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          & {
+            '=== Windows Kits\10\Include ==='
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty Name
+            '=== km headers (ntddk.h) ==='
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include\*\km\ntddk.h' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            '=== 1394 DDK headers ==='
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include\*\shared\1394.h' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include\*\shared\1394common.h' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            '=== km libs ==='
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Lib\*\km\x64\ntoskrnl.lib' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            '=== WDK build targets (VS extension) ==='
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\build' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty Name
+            '=== signtool / inf2cat ==='
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\inf2cat.exe' -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+            '=== New-SelfSignedCertificate ==='
+            ((Get-Command New-SelfSignedCertificate -ErrorAction SilentlyContinue) -ne $null)
+            '=== EWDK on disk? ==='
+            Test-Path 'C:\EWDK'
+          } *>&1 | Tee-Object -FilePath wdk-probe.txt
+
       - name: Setup MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -254,3 +287,4 @@ jobs:
             isight-audio.exe
             isight-graphtest.exe
             isight-graphtest32.exe
+            wdk-probe.txt
