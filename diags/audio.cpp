@@ -106,12 +106,40 @@
 // the CMU driver treats offsets whose top nibble is 0xF as absolute
 #define ABS_FLAG          0xF0000000UL
 #define ABS_IS(o)         (((o) & ABS_FLAG) == ABS_FLAG)
-
 // address of the node's config ROM, as an absolute driver offset
 #define ROM_ABS           0xF0000400UL
 
 // the DCAM video unit's base, quoted by the CMU documentation
 #define VIDEO_BASE        0xF0F00000UL          // -> 0xFFFFF0F00000
+
+//---------------------------------------------------------------------
+// IRM (isochronous resource manager) registers  --  the experiment that
+// matters most right now.
+//
+// Every node implements the CSR space at 0xFFFFF0000000, and the IRM
+// registers live at +0x220..0x22C inside it.  Same absolute encoding as
+// the config ROM, so the driver offsets are 0xF0000220 / 0xF0000224 /
+// 0xF0000228 / 0xF000022C.  (Linux: firewire-ohci.c
+// BANDWIDTH_AVAILABLE 0x220, CHANNELS_AVAILABLE_HI 0x224,
+// CHANNELS_AVAILABLE_LO 0x228, BROADCAST_CHANNEL 0x22C.)
+//
+// A *set* bit in CHANNELS_AVAILABLE means the channel is FREE.  Proper
+// 1394 allocation is a compare-swap lock, which CMU does not expose, so
+// this does the plain read-modify-write the register also accepts.
+//
+// Why it matters: the camera never transmits audio even after it is
+// fully programmed, and CMU's own IsochQueryResources always reports
+// "bytes/frame available = 0" and never locks a channel.  Real drivers
+// reserve the channel and the bandwidth *before* pointing a device at
+// it.  iSight's firmware may simply refuse to start its audio engine on
+// a channel that nobody has claimed.
+//---------------------------------------------------------------------
+#define IRM_BW_AVAIL      0xF0000220UL          // -> 0xFFFFF0000220
+#define IRM_CH_HI         0xF0000224UL          // channels 32..63
+#define IRM_CH_LO         0xF0000228UL          // channels  0..31
+#define IRM_BCAST         0xF000022CUL
+
+#define IRM_BW_UNITS      2000UL   // generous reserve for 1916 B/frame @ S400
 
 static FILE *g_log = NULL;
 static int   g_leakedThreads = 0;
@@ -485,6 +513,96 @@ static int SpeedIndex(ULONG flag)
 static int g_lastChannel = -1;
 static int g_lastCompletions = -1;
 
+//---------------------------------------------------------------------
+// IRM helpers
+//---------------------------------------------------------------------
+static BOOL g_irm       = FALSE;   // "irm" anywhere on the command line
+static BOOL g_irmLocked = FALSE;
+static ULONG g_irmChannel = 0;
+static ULONG g_irmBwTaken = 0;
+
+static void IrmDump(const char *dev)
+{
+    ULONG bw = 0, hi = 0, lo = 0, bc = 0;
+    LOG("");
+    LOG("== IRM registers (isochronous resource manager) ==");
+    BOOL ok = RD(dev, IRM_BW_AVAIL, &bw, "BANDWIDTH_AVAILABLE");
+    RD(dev, IRM_CH_HI, &hi, "CHANNELS_AVAILABLE_HI");
+    RD(dev, IRM_CH_LO, &lo, "CHANNELS_AVAILABLE_LO");
+    RD(dev, IRM_BCAST, &bc, "BROADCAST_CHANNEL");
+    if (!ok)
+    {
+        LOG("  *** the IRM registers do not answer.  Either this host is not the");
+        LOG("      IRM (the camera may be), or the OHCI driver filters writes here.");
+        return;
+    }
+    LOG("  bandwidth available : %u units", bw);
+    LOG("  free channels  0..31: %08X", lo);
+    LOG("  free channels 32..63: %08X", hi);
+    LOG("  broadcast channel   : %08X", bc);
+    char list[256]; size_t n = 0; list[0] = 0;
+    for (int c = 0; c < 64; ++c)
+    {
+        ULONG v = (c < 32) ? lo : hi;
+        if (v & (1u << (c & 31)))
+        {
+            if (n > sizeof(list) - 12) { strcat_s(list, sizeof(list), ",..."); break; }
+            _snprintf_s(list + n, sizeof(list) - n, _TRUNCATE, "%s%d", n ? "," : "", c);
+            n = strlen(list);
+        }
+    }
+    LOG("  free channel list   : %s", list[0] ? list : "(none)");
+}
+
+static BOOL IrmSetChannelBit(const char *dev, ULONG ch, BOOL freeIt)
+{
+    ULONG off = (ch < 32) ? IRM_CH_LO : IRM_CH_HI;
+    ULONG bit = 1u << (ch & 31);
+    ULONG v = 0;
+    if (!RD(dev, off, &v, NULL)) return FALSE;
+    ULONG want = freeIt ? (v | bit) : (v & ~bit);
+    if (v == want)
+    {
+        LOG("  channel %u: bit already %s (no change written)", ch, freeIt ? "set/free" : "clear/taken");
+        return TRUE;
+    }
+    if (!WR(dev, off, want, freeIt ? "CHANNELS_AVAILABLE (release)" : "CHANNELS_AVAILABLE (acquire)"))
+        return FALSE;
+    ULONG rb = 0;
+    if (RD(dev, off, &rb, NULL))
+        LOG("  channel %u: %08X -> %08X (%s)", ch, v, rb,
+            ((rb & bit) ? "FREE" : "TAKEN"));
+    return (rb & bit) ? freeIt : !freeIt;
+}
+
+static BOOL IrmReserveBandwidth(const char *dev, ULONG units)
+{
+    ULONG v = 0;
+    if (!RD(dev, IRM_BW_AVAIL, &v, NULL)) { LOG("  cannot read BANDWIDTH_AVAILABLE"); return FALSE; }
+    if (v <= units) { LOG("  only %u units free, refusing to reserve %u", v, units); return FALSE; }
+    if (!WR(dev, IRM_BW_AVAIL, v - units, "BANDWIDTH_AVAILABLE (reserve)")) return FALSE;
+    ULONG rb = 0;
+    if (RD(dev, IRM_BW_AVAIL, &rb, NULL))
+    {
+        LOG("  bandwidth %u -> %u units (reserved %u)", v, rb, units);
+        g_irmBwTaken = (v > rb) ? (v - rb) : 0;
+    }
+    return TRUE;
+}
+
+static void IrmReleaseBandwidth(const char *dev)
+{
+    if (!g_irmBwTaken) return;
+    ULONG v = 0;
+    if (!RD(dev, IRM_BW_AVAIL, &v, NULL)) return;
+    if (WR(dev, IRM_BW_AVAIL, v + g_irmBwTaken, "BANDWIDTH_AVAILABLE (release)"))
+    {
+        ULONG rb = 0;
+        if (RD(dev, IRM_BW_AVAIL, &rb, NULL)) LOG("  bandwidth restored %u -> %u units", v, rb);
+    }
+    g_irmBwTaken = 0;
+}
+
 static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dumpRaw,
                      ULONG cfgBase, int restoreCh, BOOL enableAudio)
 {
@@ -534,6 +652,19 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     }
     g_lastChannel = (int)sp.nChannel;
     LOG("  receiving on channel %u", sp.nChannel);
+
+    // -- IRM experiment -------------------------------------------------
+    // Claim the channel and the bandwidth *before* telling the camera to
+    // transmit on it.  This is the step CMU never performs.
+    if (g_irm)
+    {
+        IrmDump(dev);
+        LOG("  -- reserving channel %u and %u bandwidth units --", sp.nChannel, IRM_BW_UNITS);
+        IrmReserveBandwidth(dev, IRM_BW_UNITS);
+        g_irmLocked = IrmSetChannelBit(dev, sp.nChannel, FALSE);
+        g_irmChannel = sp.nChannel;
+        IrmDump(dev);
+    }
 
     // NOW tell the camera which channel we are listening on.  Doing this
     // before SetupStream is useless: we only learn the allocated channel
@@ -630,6 +761,13 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
         ULONG txv = (ULONG)restoreCh | ((ULONG)SpeedIndex(flag) << 16);
         LOG("  restoring the camera's original transmit channel %d", restoreCh);
         WR(dev, cfgBase + A_ISO_TX_CONFIG, txv, "ISO_TX_CONFIG");
+    }
+    if (g_irmLocked)
+    {
+        LOG("  -- releasing IRM channel %u / bandwidth --", g_irmChannel);
+        IrmSetChannelBit(dev, g_irmChannel, TRUE);
+        IrmReleaseBandwidth(dev);
+        g_irmLocked = FALSE;
     }
     (void)dumpRaw;
     return 0;
@@ -771,6 +909,27 @@ int main(int argc, char **argv)
         int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE);
         LOG("listen exit code %d", rc);
     }
+    else if (!_stricmp(mode, "irm"))
+    {
+        // Read (and optionally hand-edit) the isochronous resource manager
+        // registers.  "lock <ch>" claims a channel, "unlock <ch>" gives it
+        // back; with no argument it just reports what the bus looks like.
+        if (argc > 2 && !_stricmp(argv[2], "lock"))
+        {
+            ULONG ch = (argc > 3) ? (ULONG)strtoul(argv[3], NULL, 0) : 0;
+            LOG("");
+            LOG("== IRM: manually acquire channel %u ==", ch);
+            IrmSetChannelBit(path, ch, FALSE);
+        }
+        else if (argc > 2 && !_stricmp(argv[2], "unlock"))
+        {
+            ULONG ch = (argc > 3) ? (ULONG)strtoul(argv[3], NULL, 0) : 0;
+            LOG("");
+            LOG("== IRM: manually release channel %u ==", ch);
+            IrmSetChannelBit(path, ch, TRUE);
+        }
+        else IrmDump(path);
+    }
     else if (!_stricmp(mode, "poke"))
     {
         ULONG val = 0;
@@ -787,8 +946,14 @@ int main(int argc, char **argv)
         LOG("usage: isight-audio.exe rom [quadlets]");
         LOG("       isight-audio.exe regs <absBaseHex>");
         LOG("       isight-audio.exe poke <absOffsetHex> <valueHex>");
-        LOG("       isight-audio.exe listen <chan|auto> [seconds] [bytesPerFrame]");
-        LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig]");
+        LOG("       isight-audio.exe irm [lock|unlock <channel>]");
+        LOG("       isight-audio.exe listen <chan|auto> [seconds] [bytesPerFrame] [irm]");
+        LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig] [irm]");
+        LOG("       isight-audio.exe scan <fromHex> <toHex> <stepHex> [timeoutMs]");
+        LOG("       isight-audio.exe sweep <fromHex> <count> [timeoutMs]  (relative)");
+        LOG("");
+        LOG("The word 'irm' anywhere on the command line makes the tool claim the");
+        LOG("isochronous channel and bandwidth before it points the camera at them.");
         LOG("       isight-audio.exe scan <fromHex> <toHex> <stepHex> [timeoutMs]");
         LOG("       isight-audio.exe sweep <fromHex> <count> [timeoutMs]  (relative)");
     }
