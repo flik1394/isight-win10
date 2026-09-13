@@ -768,7 +768,7 @@ int main(int argc, char **argv)
         LOG("");
         LOG("== listen only: channel %s, %d s, %u bytes/frame max ==",
             ch < 0 ? "auto" : "explicit", secs, bpf);
-        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1);
+        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE);
         LOG("listen exit code %d", rc);
     }
     else if (!_stricmp(mode, "poke"))
