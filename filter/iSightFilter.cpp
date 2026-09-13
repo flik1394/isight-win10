@@ -133,6 +133,48 @@
 //     live with the call window open instead of restarting WeChat per
 //     attempt.  [format] types= and [recovery] still need a fresh graph,
 //     because they are answered during connection setup.
+//
+// v12 additions -- filling the box, and measuring the crop exactly:
+//   * the v11 measurement is in: WeChat's call window keeps the *full*
+//     height of the frame and cuts the middle out horizontally, so the
+//     320x480 box does land where it should -- but a 4:3 picture fitted
+//     into a 2:3 box only uses half the box height, so half of what the
+//     call shows was black (the v11 report: "上下边有黑色区域了").
+//   * [layout] mode=  now picks how the box is filled:
+//       fit     whole scene centred in the box, black around it (v11)
+//       blur    whole scene on top of a blurred, dimmed copy of the same
+//               frame -- edge to edge, nothing cropped, nothing distorted.
+//               This is the default now.
+//       fill    scene cropped to the box shape and magnified to fill it --
+//               no black, but the sides are gone and the face is magnified
+//               (exactly what the host does on its own)
+//       stretch whole scene squeezed into the box shape -- no black, no
+//               crop, but distorted
+//   * [layout] blur=/dim= tune the backdrop (block size in source pixels,
+//     and how much of its brightness survives).
+//   * [layout] guide= is now a level: 1 = the coloured boxes (plus a green
+//     box on the target rectangle, red on the part the picture fills),
+//     2 = a ruler drawn into the frame (thin lines every 40 px, colour
+//     coded landmarks at 160/320/480), 3 = both.  The ruler is what makes
+//     the host's crop measurable to the pixel from a screenshot.
+//
+// v13 additions -- "after the TI card was swapped, nothing comes up at all":
+//   * probes, because this failure is invisible from the outside.  The
+//     standalone CMU tool (isight-diag.exe) pulls 90 frames off the camera at
+//     the very same moment the filter's stream starts and never delivers one,
+//     and nothing in the log says where the streaming thread stopped.  So:
+//       - every FillBuffer entry is counted, and the count alongside the
+//         camera state is logged every 2 s by the bus-monitor thread.  A
+//         count that stops growing means DirectShow no longer calls us; a
+//         count that keeps growing means we are stuck inside the driver.
+//       - every AcquireImageEx is timed and its result logged, so a call
+//         that blocks (instead of returning CAM_ERROR_FRAME_TIMEOUT after
+//         2 s) is visible as such.
+//   * self-heal: if the stream is marked running and no frame has arrived
+//     four seconds later, the stream is invalidated and brought up again
+//     (fresh handle, fresh node address) instead of waiting for a timeout
+//     that never comes.  See the [recovery] notes -- this is the same path a
+//     bus reset takes, so it cannot make a working camera worse.
 //=====================================================================
 
 #include <windows.h>
@@ -164,7 +206,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V11-20260912-LAYOUT-LIVE"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V13-20260913-ACQPROBE"
 
 //---------------------------------------------------------------------
 // AMPROPSETID_Pin -- the pin category property set.
@@ -223,6 +265,9 @@ static const int kMaxRateIndex = 3;          // never ask the camera for more th
 #define ISIGHT_HEIGHT 480
 #define ISIGHT_BPP     24
 #define ISIGHT_DIB_BYTES  (ISIGHT_WIDTH * ISIGHT_HEIGHT * 3)
+// v12: room for the tiny copy of the frame the blur backdrop is built from
+// (a 4 px block over 640x480 is the finest setting we allow: 160x120x6 BGR)
+#define kBlurScratchBytes (96 * 1024)
 
 //---------------------------------------------------------------------
 // file log — the filter lives inside whatever process opens the camera,
@@ -471,8 +516,47 @@ struct ISightOptions
     // v11 -- who the layout box applies to, and a visible marker for
     // calibrating it (see the v11 notes at the top of this file)
     char hosts[160];                // [layout] hosts=..., empty = every host
-    bool guide;                     // [layout] guide=1 -> draw the marker
+    int  guide;                     // [layout] guide= 0 off / 1 boxes / 2 ruler / 3 both
+    // v12 -- how the box is filled (see the v12 notes at the top)
+    int  layoutMode;                // [layout] mode= fit | blur | fill | stretch
+    int  blurCells;                 // [layout] blur=  backdrop block, source pixels
+    int  blurShade;                 // [layout] dim=   backdrop brightness, 100 = off
 };
+
+enum LayoutMode
+{
+    LAYOUT_FIT     = 0,     // whole scene, centred, black around it (v10/v11)
+    LAYOUT_BLUR    = 1,     // whole scene over a blurred copy of itself (default)
+    LAYOUT_FILL    = 2,     // scene cropped to the box shape and magnified
+    LAYOUT_STRETCH = 3      // whole scene squeezed into the box shape
+};
+
+static const char *ModeName(int m)
+{
+    switch (m)
+    {
+    case LAYOUT_BLUR:    return "blur";
+    case LAYOUT_FILL:    return "fill";
+    case LAYOUT_STRETCH: return "stretch";
+    default:             return "fit";
+    }
+}
+
+static int ParseLayoutMode(const char *v)
+{
+    if (v == NULL || v[0] == '\0')
+        return LAYOUT_BLUR;
+    if (_stricmp(v, "fit") == 0 || _stricmp(v, "letterbox") == 0)
+        return LAYOUT_FIT;
+    if (_stricmp(v, "blur") == 0 || _stricmp(v, "soft") == 0)
+        return LAYOUT_BLUR;
+    if (_stricmp(v, "fill") == 0 || _stricmp(v, "crop") == 0 || _stricmp(v, "cover") == 0)
+        return LAYOUT_FILL;
+    if (_stricmp(v, "stretch") == 0 || _stricmp(v, "squash") == 0)
+        return LAYOUT_STRETCH;
+    const int n = atoi(v);
+    return (n >= 0 && n <= 3) ? n : LAYOUT_BLUR;
+}
 
 // the three subtypes we can produce, in the order they used to be advertised
 static const ISightOptions &Opts();          // defined below, used by SubTypeEnabled
@@ -546,20 +630,34 @@ static void WriteDefaultIni(const char *path)
         "; layout: some hosts do not letterbox a 4:3 camera into their window,\n"
         "; they cut the picture down to their own shape, so the face fills the\n"
         "; whole window (WeChat's video call does this; QQ does not).  Set\n"
-        "; target to the rectangle the host actually shows and the camera\n"
-        "; picture is scaled down into it, centred, with black around it -- the\n"
-        "; host's crop then lands on that rectangle and the whole scene is\n"
-        "; visible again.  0 = off (send the frame untouched).  WeChat's call\n"
-        "; window is portrait, so 320x480 (2:3) is the usual answer; go wider\n"
-        "; (360x480, 480x480) if the picture still looks cut, narrower\n"
-        "; (270x480) if black bars show on the sides.\n"
+        "; target to the rectangle the host actually shows and the picture is\n"
+        "; put inside that rectangle -- the host's crop then lands on it and\n"
+        "; the whole scene is visible again.  0 = off (send the frame as it\n"
+        "; comes).  WeChat's call window keeps the full height and cuts the\n"
+        "; middle out horizontally, so 320x480 is the usual answer.\n"
+        ";\n"
+        "; mode decides how the rectangle is filled:\n"
+        ";   blur    whole scene, with a blurred copy of it behind (default;\n"
+        ";           nothing cropped, nothing distorted, no black bars)\n"
+        ";   fit     whole scene, black where the scene does not reach\n"
+        ";   fill    the scene cropped to the box shape and magnified to fill\n"
+        ";           it -- no black bars, but the sides are gone\n"
+        ";   stretch the whole scene squeezed into the box shape -- distorted\n"
+        "; blur / dim tune the blurred backdrop: block size in pixels and how\n"
+        "; much brightness is left (100 = none).\n"
+        ";\n"
         "; hosts limits the box to those processes, so other hosts (QQ) keep\n"
-        "; the full frame; empty = every host.  guide=1 paints a yellow border\n"
-        "; on the full frame, a red border on the box and a white cross in its\n"
-        "; middle, which is how the box is matched to what the host shows.\n"
+        "; the full frame; empty = every host.\n"
+        "; guide draws markers into the picture, for measuring what the host\n"
+        "; really shows: 1 = coloured boxes and a centre cross, 2 = a ruler\n"
+        "; (thin lines every 40 px, coloured landmarks at 160/320/480),\n"
+        "; 3 = both.  Turn it off for normal calls.\n"
         "; orientation/layout/guide are re-read while a call is running.\n"
         ";[layout]\n"
         ";target=0\n"
+        ";mode=blur\n"
+        ";blur=16\n"
+        ";dim=70\n"
         ";hosts=Weixin.exe,WeChat.exe\n"
         ";guide=0\n");
     fclose(f);
@@ -627,9 +725,22 @@ static const ISightOptions &Opts()
             s_o.layoutH = lh;
         }
 
-        // [layout] hosts=...  and  [layout] guide=1  (v11)
+        // [layout] hosts=...  and  [layout] guide=N  (v11)
         GetPrivateProfileStringA("layout", "hosts", "", s_o.hosts, sizeof(s_o.hosts), ini);
-        s_o.guide = GetPrivateProfileIntA("layout", "guide", 0, ini) != 0;
+        s_o.guide = GetPrivateProfileIntA("layout", "guide", 0, ini);
+        if (s_o.guide < 0) s_o.guide = 0;
+        if (s_o.guide > 3) s_o.guide = 3;
+
+        // [layout] mode= / blur= / dim=  (v12)
+        char md[32] = "";
+        GetPrivateProfileStringA("layout", "mode", "blur", md, sizeof(md), ini);
+        s_o.layoutMode = ParseLayoutMode(md);
+        s_o.blurCells  = GetPrivateProfileIntA("layout", "blur", 16, ini);
+        if (s_o.blurCells < 4)  s_o.blurCells = 4;
+        if (s_o.blurCells > 64) s_o.blurCells = 64;
+        s_o.blurShade  = GetPrivateProfileIntA("layout", "dim", 70, ini);
+        if (s_o.blurShade < 10)  s_o.blurShade = 10;
+        if (s_o.blurShade > 100) s_o.blurShade = 100;
 
         FLog("options: yuy2=%s rgb=%s dump=%d busmon=%d bootdelay=%dms (ini=%s)",
              OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
@@ -644,12 +755,13 @@ static const ISightOptions &Opts()
                 strncat_s(order, sizeof(order), n, _TRUNCATE);
             }
             if (s_o.layoutW > 0)
-                FLog("options: types=%s layout target=%dx%d (picture scaled into that box, rest black)",
-                     order, s_o.layoutW, s_o.layoutH);
+                FLog("options: types=%s layout target=%dx%d mode=%s blur=%d dim=%d%%",
+                     order, s_o.layoutW, s_o.layoutH, ModeName(s_o.layoutMode),
+                     s_o.blurCells, s_o.blurShade);
             else
                 FLog("options: types=%s layout target=off (full 640x480 frame)", order);
             FLog("options: host='%s' layout hosts='%s' guide=%d -> layout %s",
-                 HostExeName(), s_o.hosts, s_o.guide ? 1 : 0,
+                 HostExeName(), s_o.hosts, s_o.guide,
                  (s_o.layoutW > 0 && HostInList(s_o.hosts)) ? "ACTIVE" : "inactive");
         }
     }
@@ -739,7 +851,20 @@ static void MaybeReloadTunables()
     const int  yuy2  = ClampOrient(GetPrivateProfileIntA("orientation", "yuy2", o.orientYUY2, ini));
     const int  rgb   = ClampOrient(GetPrivateProfileIntA("orientation", "rgb",  o.orientRGB,  ini));
     const bool dump  = GetPrivateProfileIntA("debug", "dump", o.dump ? 1 : 0, ini) != 0;
-    const bool guide = GetPrivateProfileIntA("layout", "guide", o.guide ? 1 : 0, ini) != 0;
+    int guide = GetPrivateProfileIntA("layout", "guide", o.guide, ini);
+    if (guide < 0) guide = 0;
+    if (guide > 3) guide = 3;
+
+    // v12: the box filler, re-read live as well
+    char md[32] = "";
+    GetPrivateProfileStringA("layout", "mode", ModeName(o.layoutMode), md, sizeof(md), ini);
+    const int mode  = ParseLayoutMode(md);
+    int cells = GetPrivateProfileIntA("layout", "blur", o.blurCells, ini);
+    if (cells < 4)  cells = 4;
+    if (cells > 64) cells = 64;
+    int shade = GetPrivateProfileIntA("layout", "dim", o.blurShade, ini);
+    if (shade < 10)  shade = 10;
+    if (shade > 100) shade = 100;
 
     int lw = o.layoutW, lh = o.layoutH;
     char lay[64] = "";
@@ -766,6 +891,7 @@ static void MaybeReloadTunables()
     const bool changed =
         (yuy2 != o.orientYUY2) || (rgb != o.orientRGB) || (dump != o.dump) ||
         (guide != o.guide) || (lw != o.layoutW) || (lh != o.layoutH) ||
+        (mode != o.layoutMode) || (cells != o.blurCells) || (shade != o.blurShade) ||
         (strcmp(hosts, o.hosts) != 0);
 
     o.orientYUY2 = yuy2;
@@ -774,11 +900,15 @@ static void MaybeReloadTunables()
     o.guide      = guide;
     o.layoutW    = lw;
     o.layoutH    = lh;
+    o.layoutMode = mode;
+    o.blurCells  = cells;
+    o.blurShade  = shade;
     _snprintf_s(o.hosts, sizeof(o.hosts), _TRUNCATE, "%s", hosts);
 
     if (changed)
-        FLog("options: reloaded -> yuy2=%s rgb=%s dump=%d guide=%d layout=%dx%d hosts='%s'",
-             OrientName(yuy2), OrientName(rgb), dump ? 1 : 0, guide ? 1 : 0, lw, lh, hosts);
+        FLog("options: reloaded -> yuy2=%s rgb=%s dump=%d guide=%d layout=%dx%d mode=%s blur=%d dim=%d%% hosts='%s'",
+             OrientName(yuy2), OrientName(rgb), dump ? 1 : 0, guide,
+             lw, lh, ModeName(mode), cells, shade, hosts);
 }
 
 //---------------------------------------------------------------------
@@ -910,76 +1040,180 @@ static void EmitFrame(const BYTE *src, BYTE *dst, ULONG width, ULONG height,
 }
 
 //---------------------------------------------------------------------
-// v10: scale the whole camera picture down into a rectangle in the middle
-// of the frame.
+// The box filler.
 //
 // Some hosts do not letterbox a 4:3 camera into their own window, they cut
 // the picture down to their window shape.  The image we hand over is
 // complete and upright (the log proves that), so the only way to get the
 // whole scene back into such a host is to put the scene inside the very
 // rectangle the host is going to cut out: whatever box it is configured for
-// ([layout] target=WxH) gets the scaled-down picture, everything outside it
-// stays black, and the host magnifies exactly that box.  Resolution is the
-// price -- the box is what survives.
+// ([layout] target=WxH) is what survives, and the host magnifies it.
 //
-// src/dst are both bottom-up BGR buffers of sw x sh and dw x dh.  Only the
-// rectangle is written, so the black surround can be prepared once.
+// v10/v11 fitted the scene into the box and left the remainder black.  A
+// 4:3 picture in a 2:3 box uses half the height, so half of the call window
+// was black.  v12 keeps all four ways of filling the box:
+//
+//   mode=fit      whole scene, centred in the box, black around it
+//   mode=blur     whole scene on top of a blurred, dimmed copy of the same
+//                 frame -- edge to edge, nothing cropped, nothing distorted
+//                 (default)
+//   mode=fill     scene cropped to the box shape and magnified to fill it --
+//                 no black, but the sides are gone and the face is magnified
+//   mode=stretch  whole scene squeezed into the box shape -- no black, no
+//                 crop, distorted
+//
+// Everything below works in *image* coordinates (top-down) and writes into
+// bottom-up BGR buffers, exactly like the rest of this file.
 //---------------------------------------------------------------------
-static void FitIntoRect(const BYTE *src, ULONG sw, ULONG sh,
-                        BYTE *dst, ULONG dw, ULONG dh,
-                        ULONG boxW, ULONG boxH)
+
+// rectangle-to-rectangle bilinear blit; shade<100 dims what is written
+static void BlitScaled(const BYTE *src, ULONG sw, ULONG sh,
+                       ULONG sx0, ULONG sy0, ULONG scw, ULONG sch,
+                       BYTE *dst, ULONG dw, ULONG dh,
+                       ULONG dx0, ULONG dy0, ULONG dcw, ULONG dch,
+                       int shade)
 {
     if (sw < 2 || sh < 2 || dw < 2 || dh < 2)
         return;
+    if (scw < 1) scw = 1;
+    if (sch < 1) sch = 1;
+    if (dcw < 1) dcw = 1;
+    if (dch < 1) dch = 1;
+    if ((unsigned long long)sx0 + scw > sw) sx0 = (scw >= sw) ? 0 : sw - scw;
+    if ((unsigned long long)sy0 + sch > sh) sy0 = (sch >= sh) ? 0 : sh - sch;
+    if (scw > sw) scw = sw;
+    if (sch > sh) sch = sh;
+    if (dx0 >= dw || dy0 >= dh) return;
+    if ((unsigned long long)dx0 + dcw > dw) dcw = dw - dx0;
+    if ((unsigned long long)dy0 + dch > dh) dch = dh - dy0;
 
-    // the picture keeps its own aspect ratio inside the box
+    const int sh8 = (shade < 0) ? 0 : (shade > 100 ? 100 : shade);
+    const ULONG sstride = sw * 3;
+    const ULONG dstride = dw * 3;
+    const long  maxsx = (long)sw - 2;                 // bilinear needs a neighbour
+    const long  maxsy = (long)sh - 2;
+
+    for (ULONG dy = 0; dy < dch; ++dy)
+    {
+        const ULONG syF = (ULONG)(((unsigned long long)dy * sch * 65536ULL) / dch);
+        long sy = (long)sy0 + (long)(syF >> 16);
+        if (sy > maxsy) sy = maxsy;
+        if (sy < 0)     sy = 0;
+        const ULONG fy = (syF >> 8) & 0xFF;
+
+        const BYTE *r0 = src + (size_t)(sh - 1 - (ULONG)sy) * sstride;
+        const BYTE *r1 = src + (size_t)(sh - 2 - (ULONG)sy) * sstride;
+        BYTE *drow = dst + (size_t)(dh - 1 - (dy0 + dy)) * dstride + (size_t)dx0 * 3;
+
+        for (ULONG dx = 0; dx < dcw; ++dx)
+        {
+            const ULONG sxF = (ULONG)(((unsigned long long)dx * scw * 65536ULL) / dcw);
+            long sx = (long)sx0 + (long)(sxF >> 16);
+            if (sx > maxsx) sx = maxsx;
+            if (sx < 0)     sx = 0;
+            const ULONG fx = (sxF >> 8) & 0xFF;
+
+            const BYTE *p00 = r0 + (size_t)sx * 3;
+            const BYTE *p01 = r1 + (size_t)sx * 3;
+            BYTE *d = drow + (size_t)dx * 3;
+            for (int c = 0; c < 3; ++c)
+            {
+                const ULONG top = (ULONG)p00[c] * (256 - fx) + (ULONG)p00[c + 3] * fx;
+                const ULONG bot = (ULONG)p01[c] * (256 - fx) + (ULONG)p01[c + 3] * fx;
+                ULONG v = (top * (256 - fy) + bot * fy) >> 16;
+                if (sh8 < 100)
+                    v = (v * (ULONG)sh8) / 100;
+                d[c] = (BYTE)v;
+            }
+        }
+    }
+}
+
+// the centred source rectangle whose shape matches the box (used to fill it
+// without black bands: the picture is cropped, not distorted)
+static void CoverSrcRect(ULONG sw, ULONG sh, ULONG boxW, ULONG boxH,
+                         ULONG *px, ULONG *py, ULONG *pw, ULONG *ph)
+{
+    ULONG w = sw, h = sh;
+    if ((unsigned long long)sw * boxH > (unsigned long long)sh * boxW)
+        w = (ULONG)(((unsigned long long)sh * boxW) / boxH);   // crop the sides
+    else
+        h = (ULONG)(((unsigned long long)sw * boxH) / boxW);   // crop top/bottom
+    if (w < 2) w = 2;
+    if (h < 2) h = 2;
+    if (w > sw) w = sw;
+    if (h > sh) h = sh;
+    *px = (sw - w) / 2;
+    *py = (sh - h) / 2;
+    *pw = w;
+    *ph = h;
+}
+
+// build the frame a shape-cropping host will magnify
+static void ComposeBox(const BYTE *src, ULONG sw, ULONG sh,
+                       BYTE *dst, ULONG dw, ULONG dh,
+                       ULONG boxW, ULONG boxH, int mode,
+                       BYTE *blurBuf, ULONG blurBytes, int cells, int shade)
+{
+    if (sw < 2 || sh < 2 || dw < 2 || dh < 2)
+        return;
+    if (boxW < 2 || boxH < 2)
+        return;
+    if (boxW > dw) boxW = dw;
+    if (boxH > dh) boxH = dh;
+    const ULONG bx = (dw - boxW) / 2;
+    const ULONG by = (dh - boxH) / 2;
+
+    if (mode == LAYOUT_BLUR && blurBuf != NULL)
+    {
+        // a tiny copy of the frame (one sample every `cells` pixels) ...
+        const int cell = (cells < 4) ? 4 : (cells > 64 ? 64 : cells);
+        ULONG gw = dw / (ULONG)cell;
+        ULONG gh = dh / (ULONG)cell;
+        if (gw < 2) gw = 2;
+        if (gh < 2) gh = 2;
+        while (gw > 2 && gh > 2 && (unsigned long long)gw * gh * 3 > blurBytes)
+        {
+            gw = (gw + 1) / 2;
+            gh = (gh + 1) / 2;
+        }
+        if ((unsigned long long)gw * gh * 3 <= blurBytes)
+        {
+            BlitScaled(src, sw, sh, 0, 0, sw, sh, blurBuf, gw, gh, 0, 0, gw, gh, 100);
+            // ... stretched back over the whole frame and dimmed: a soft
+            // backdrop for the sharp picture that goes on top
+            BlitScaled(blurBuf, gw, gh, 0, 0, gw, gh, dst, dw, dh, 0, 0, dw, dh, shade);
+        }
+    }
+
+    if (mode == LAYOUT_STRETCH)
+    {
+        BlitScaled(src, sw, sh, 0, 0, sw, sh, dst, dw, dh, bx, by, boxW, boxH, 100);
+        return;
+    }
+
+    if (mode == LAYOUT_FILL)
+    {
+        ULONG cx, cy, cw, ch;
+        CoverSrcRect(sw, sh, boxW, boxH, &cx, &cy, &cw, &ch);
+        BlitScaled(src, sw, sh, cx, cy, cw, ch, dst, dw, dh, bx, by, boxW, boxH, 100);
+        return;
+    }
+
+    // fit (and the sharp layer of blur): the scene keeps its shape inside
+    // the box, centred; whatever is left stays as it was (black, or the
+    // blurred backdrop in blur mode)
     ULONG rw = boxW, rh = boxH;
-    if (rw * sh > rh * sw) rw = (rh * sw) / sh;      // too wide: fit the height
-    else                   rh = (rw * sh) / sw;
+    if ((unsigned long long)rw * sh > (unsigned long long)rh * sw)
+        rw = (ULONG)(((unsigned long long)rh * sw) / sh);
+    else
+        rh = (ULONG)(((unsigned long long)rw * sh) / sw);
     if (rw < 2) rw = 2;
     if (rh < 2) rh = 2;
     if (rw > dw) rw = dw;
     if (rh > dh) rh = dh;
-
-    const ULONG rx    = (dw - rw) / 2;
-    const ULONG ryTop = (dh - rh) / 2;               // top-down coordinates
-    const ULONG sstride = sw * 3;
-    const ULONG dstride = dw * 3;
-
-    for (ULONG dy = 0; dy < rh; ++dy)
-    {
-        // 16.16 source row, top-down within the picture
-        ULONG syF = (ULONG)(((unsigned long long)dy * sh * 65536ULL) / rh);
-        ULONG sy0 = syF >> 16;
-        if (sy0 >= sh - 1) sy0 = sh - 2;
-        const ULONG fy = (syF >> 8) & 0xFF;
-
-        // buffer rows grow upwards, so image row sy0 is at sh-1-sy0
-        const BYTE *r0 = src + (size_t)(sh - 1 - sy0) * sstride;
-        const BYTE *r1 = src + (size_t)(sh - 2 - sy0) * sstride;
-        BYTE *drow = dst + (size_t)(dh - 1 - (ryTop + dy)) * dstride + (size_t)rx * 3;
-
-        for (ULONG dx = 0; dx < rw; ++dx)
-        {
-            ULONG sxF = (ULONG)(((unsigned long long)dx * sw * 65536ULL) / rw);
-            ULONG sx0 = sxF >> 16;
-            if (sx0 >= sw - 1) sx0 = sw - 2;
-            const ULONG fx = (sxF >> 8) & 0xFF;
-
-            const BYTE *p00 = r0 + (size_t)sx0 * 3;
-            const BYTE *p10 = p00 + 3;
-            const BYTE *p01 = r1 + (size_t)sx0 * 3;
-            const BYTE *p11 = p01 + 3;
-            BYTE *d = drow + (size_t)dx * 3;
-
-            for (int c = 0; c < 3; ++c)
-            {
-                const ULONG top = (ULONG)p00[c] * (256 - fx) + (ULONG)p10[c] * fx;
-                const ULONG bot = (ULONG)p01[c] * (256 - fx) + (ULONG)p11[c] * fx;
-                d[c] = (BYTE)((top * (256 - fy) + bot * fy) >> 16);
-            }
-        }
-    }
+    BlitScaled(src, sw, sh, 0, 0, sw, sh, dst, dw, dh,
+               (dw - rw) / 2, (dh - rh) / 2, rw, rh, 100);
 }
 
 //---------------------------------------------------------------------
@@ -1026,31 +1260,73 @@ static void GuideBox(BYTE *buf, ULONG dw, ULONG dh, int x, int y, int w, int h,
     }
 }
 
-static void DrawGuide(BYTE *buf, ULONG dw, ULONG dh, int boxW, int boxH)
+static void DrawGuide(BYTE *buf, ULONG dw, ULONG dh, int boxW, int boxH, int level)
 {
-    // yellow: the whole frame, i.e. everything the camera handed over
-    GuideBox(buf, dw, dh, 0, 0, (int)dw, (int)dh, 255, 255, 0, 2);
-
-    int rw = 0, rh = 0;
-    if (boxW > 0 && boxH > 0)
+    if (level & 1)
     {
-        rw = boxW;
-        rh = boxH;
-        if (rw * (int)dh > rh * (int)dw) rw = (rh * (int)dw) / (int)dh;
-        else                             rh = (rw * (int)dh) / (int)dw;
-        const int rx = ((int)dw - rw) / 2;
-        const int ry = ((int)dh - rh) / 2;
-        // red: the layout box, the part that is supposed to survive the crop
-        GuideBox(buf, dw, dh, rx, ry, rw, rh, 255, 0, 0, 2);
+        // yellow: the whole frame, i.e. everything the camera handed over
+        GuideBox(buf, dw, dh, 0, 0, (int)dw, (int)dh, 255, 255, 0, 2);
+
+        if (boxW > 0 && boxH > 0)
+        {
+            // green: the layout target, the rectangle the host is expected
+            // to cut out (always full height when boxH == 480)
+            int tw = boxW, th = boxH;
+            if (tw > (int)dw) tw = (int)dw;
+            if (th > (int)dh) th = (int)dh;
+            const int tx = ((int)dw - tw) / 2;
+            const int ty = ((int)dh - th) / 2;
+            GuideBox(buf, dw, dh, tx, ty, tw, th, 0, 255, 0, 2);
+
+            // red: the part of the box the *picture* actually fills, which
+            // is what tells a fit from a blur/fill frame in a screenshot
+            int rw = boxW, rh = boxH;
+            if (rw * (int)dh > rh * (int)dw) rw = (rh * (int)dw) / (int)dh;
+            else                             rh = (rw * (int)dh) / (int)dw;
+            const int rx = ((int)dw - rw) / 2;
+            const int ry = ((int)dh - rh) / 2;
+            GuideBox(buf, dw, dh, rx, ry, rw, rh, 255, 0, 0, 2);
+        }
+
+        // white cross dead centre, so a screenshot can be measured
+        const int cx  = (int)dw / 2;
+        const int cy  = (int)dh / 2;
+        const int arm = 24;
+        GuideRow(buf, dw, dh, cy, cx - arm, cx + arm, 255, 255, 255, 1);
+        for (int i = -arm; i <= arm; ++i)
+            GuideRow(buf, dw, dh, cy + i, cx, cx, 255, 255, 255, 1);
     }
 
-    // white cross dead centre, so a screenshot can be measured
-    const int cx  = (int)dw / 2;
-    const int cy  = (int)dh / 2;
-    const int arm = 24;
-    GuideRow(buf, dw, dh, cy, cx - arm, cx + arm, 255, 255, 255, 1);
-    for (int i = -arm; i <= arm; ++i)
-        GuideRow(buf, dw, dh, cy + i, cx, cx, 255, 255, 255, 1);
+    if (level & 2)
+    {
+        // v12 ruler: thin lines every 40 px, thick colour-coded ones at
+        // 160 / 320 / 480 columns and 120 / 360 rows.  How many of them
+        // survive in the host's window measures its crop to the pixel, and
+        // the spacing of the thin ones shows whether it also scales the
+        // picture unevenly.  Colours are unique per landmark so they can be
+        // found automatically in a screenshot.
+        // vertical landmarks, full height, one colour each:
+        // 0 red, 160 magenta, 320 blue, 480 cyan
+        for (int x = 0; x < (int)dw; x += 160)
+        {
+            BYTE r = 255, g = 0, b = 0;
+            if (x == 160) { r = 255; g = 0; b = 255; }
+            if (x == 320) { r = 0;   g = 0; b = 255; }
+            if (x == 480) { r = 0;   g = 255; b = 255; }
+            for (int t = 0; t < 3; ++t)
+                GuideRow(buf, dw, dh, 0, x + t, x + t, r, g, b, (int)dh);
+        }
+        // horizontal landmarks every 120 px, full width, green
+        for (int y = 0; y < (int)dh; y += 120)
+            GuideRow(buf, dw, dh, y, 0, (int)dw - 1, 0, 255, 0, 3);
+        // thin grey grid every 40 px in both directions
+        for (int x = 40; x < (int)dw; x += 40)
+            if (x % 160 != 0)
+                GuideRow(buf, dw, dh, 0, x, x, 90, 90, 90, (int)dh);
+        for (int y = 40; y < (int)dh; y += 40)
+            if (y % 120 != 0)
+                GuideRow(buf, dw, dh, y, 0, (int)dw - 1, 90, 90, 90, 1);
+    }
 }
 
 //---------------------------------------------------------------------
@@ -1151,7 +1427,8 @@ private:
     PBYTE            m_pScratch;      // RGB24 DIB scratch buffer
     ULONG            m_scratchBytes;
     PBYTE            m_pFull;         // 640x480 BGR scratch (letterbox path)
-    PBYTE            m_pFit;          // v10: [layout] target= box, black outside
+    PBYTE            m_pFit;          // v10: [layout] target= box composite
+    PBYTE            m_pBlur;         // v12: tiny frame copy behind the picture
     ULONG            m_dumpCount;     // frames written to the debug dump (max 2)
     volatile PVOID   m_hBringUp;      // background bring-up thread
     volatile LONG    m_bringUpState;  // 0 idle, 1 running, 2 ok, 3 failed
@@ -1167,6 +1444,17 @@ private:
     volatile LONG    m_camGoneSeen;   // camera left the bus (switched off)
     volatile LONG    m_needReset;     // teardown pending (done in TryStart)
     char             m_monPath[512];  // cached 1394 device path
+
+    // v12 probes.  The camera streams perfectly from the standalone CMU
+    // diagnostic while the filter gets no frame at all, so the one thing that
+    // has to be measured is *where the streaming thread stops*: FillBuffer
+    // entry count tells us whether DirectShow still calls us, and the timing
+    // around AcquireImageEx tells us whether we are inside the driver.
+    volatile LONG    m_fbCalls;        // FillBuffer entries since Active
+    volatile LONG    m_acqCalls;       // AcquireImageEx calls since Active
+    volatile LONG    m_lastAcqEnterMs; // tick when the current acquire began
+    volatile LONG    m_acqBlockedMs;   // duration of the last AcquireImageEx
+    volatile LONG    m_acqStartMs;     // tick when acquisition was started
 };
 
 //---------------------------------------------------------------------
@@ -1250,6 +1538,7 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_scratchBytes(0)
     , m_pFull(NULL)
     , m_pFit(NULL)
+    , m_pBlur(NULL)
     , m_dumpCount(0)
     , m_hBringUp(NULL)
     , m_bringUpState(0)
@@ -1261,6 +1550,11 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_busResetSeen(0)
     , m_camGoneSeen(0)
     , m_needReset(0)
+    , m_fbCalls(0)
+    , m_acqCalls(0)
+    , m_lastAcqEnterMs(0)
+    , m_acqBlockedMs(0)
+    , m_acqStartMs(0)
 {
     m_monPath[0] = 0;
 }
@@ -1278,6 +1572,11 @@ CiSightStream::~CiSightStream()
     {
         delete[] m_pFull;
         m_pFull = NULL;
+    }
+    if (m_pBlur)
+    {
+        delete[] m_pBlur;
+        m_pBlur = NULL;
     }
     if (m_pFit)
     {
@@ -1345,11 +1644,27 @@ DWORD WINAPI CiSightStream::BusMonThunk(LPVOID p)
     bool   haveGen = false;
     bool   wasPresent = false;
     int    openFails = 0;
+    int    hb = 0;                                  // v12 probe heartbeat counter
 
     for (;;)
     {
         if (WaitForSingleObject(self->m_evMonStop, 200) != WAIT_TIMEOUT)
             break;                                  // asked to stop
+
+        // v12 probe: a heartbeat that keeps ticking even when the streaming
+        // thread is stuck inside the driver.  If "fbCalls" stops growing here
+        // while the graph is running, DirectShow no longer calls us; if it
+        // grows but "frames" stays at 0 and "acqBlockedMs" is large, the
+        // driver never completes the overlapped frame.
+        if (++hb >= 10)                             // 10 x 200 ms = 2 s
+        {
+            hb = 0;
+            FLog("probe: fbCalls=%ld frames=%lu acquiring=%d cam=%p init=%d acqCalls=%ld acqBlockedMs=%ld",
+                 (long)self->m_fbCalls, self->m_frameCount,
+                 self->m_bAcquiring ? 1 : 0, (void *)self->m_pCam,
+                 self->m_bInit ? 1 : 0, (long)self->m_acqCalls,
+                 (long)self->m_acqBlockedMs);
+        }
 
         if (dev == INVALID_HANDLE_VALUE)
         {
@@ -1503,6 +1818,7 @@ void CiSightStream::DropStreamForRecovery(const char *why)
     m_bInit = false;
     m_consecFail = 0;
     m_bringUpTries = 0;
+    InterlockedExchange(&m_acqStartMs, 0);
     // give the camera time to boot before we talk to it again, otherwise the
     // first attempt is wasted on a node that is not listening yet
     m_retryNotBefore = TickMs() + (DWORD)Opts().bootDelayMs;
@@ -1617,11 +1933,13 @@ bool CiSightStream::TryStart()
         return false;
     }
 
-    FLog("TryStart: acquisition started (%ux%u @ %d, attempt %d)",
-         m_width, m_height, m_rateIndex, m_bringUpTries + 1);
+    FLog("TryStart: acquisition started (%ux%u @ %d, attempt %d, IsAcquiring=%d, maxSpeed=%d)",
+         m_width, m_height, m_rateIndex, m_bringUpTries + 1,
+         m_pCam->IsAcquiring() ? 1 : 0, m_pCam->GetMaxSpeed());
     m_bAcquiring = true;
     m_consecFail = 0;
     m_bringUpTries = 0;
+    InterlockedExchange(&m_acqStartMs, (LONG)TickMs());
     return true;
 }
 
@@ -1659,6 +1977,7 @@ void CiSightStream::ReleaseCamera()
     InterlockedExchange(&m_busResetSeen, 0);
     InterlockedExchange(&m_camGoneSeen, 0);
     InterlockedExchange(&m_needReset, 0);
+    InterlockedExchange(&m_acqStartMs, 0);
 }
 
 // Must end up with Format 0 / Mode 2 (640x480 YUV422). The iSight also
@@ -1754,6 +2073,10 @@ HRESULT CiSightStream::Active()
     m_bFirstFrame = true;
     m_frameCount = 0;
     m_rtNext = 0;
+    InterlockedExchange(&m_fbCalls, 0);
+    InterlockedExchange(&m_acqCalls, 0);
+    InterlockedExchange(&m_acqBlockedMs, 0);
+    InterlockedExchange(&m_acqStartMs, 0);
     HRESULT hr = CSourceStream::Active();
     if (FAILED(hr))
     {
@@ -1800,6 +2123,15 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
 {
     CheckPointer(pSample, E_POINTER);
 
+    // v12 probe: prove that DirectShow still calls us, and with which state.
+    {
+        LONG fb = InterlockedIncrement(&m_fbCalls);
+        if (fb <= 6 || (fb % 25) == 0)
+            FLog("probe: FillBuffer entry #%ld (acquiring=%d cam=%p init=%d frames=%lu state=%ld)",
+                 fb, m_bAcquiring ? 1 : 0, (void *)m_pCam, m_bInit ? 1 : 0,
+                 m_frameCount, (long)InterlockedCompareExchange(&m_bringUpState, 0, 0));
+    }
+
     // v11: pick up edits to iSightCam.ini (orientation, layout, guide) so the
     // picture can be reshaped while the call is up.  Cheap: the ini is only
     // stat()ed twice a second.
@@ -1822,6 +2154,23 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
         DropStreamForRecovery("bus reset / camera power cycle");
 
     bool got = false;
+
+    // v13 self-heal.  The stream is marked running but no frame has arrived
+    // for four seconds: whatever the driver is doing, that stream is not
+    // coming back on its own (measured: the camera streams fine from the
+    // standalone CMU tool at the same moment the filter gets nothing).
+    // Invalidate the stream instead of waiting -- TryStart() then drops the
+    // stale handle under the camera lock and brings the camera up again.
+    if (m_bAcquiring && m_frameCount == 0)
+    {
+        LONG started = InterlockedCompareExchange(&m_acqStartMs, 0, 0);
+        if (started != 0 && (LONG)(TickMs() - (DWORD)started) > 4000)
+        {
+            FLog("recovery: no frame in 4 s while acquiring -> dropping the stream");
+            DropStreamForRecovery("no frame after a successful start");
+        }
+    }
+
     if (!m_bAcquiring)
     {
         // Camera not live yet: keep the graph fed with black frames and keep
@@ -1848,7 +2197,16 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
     {
         CAutoLock lock(&m_csCamera);
         int dropped = 0;
+        DWORD ta = TickMs();
+        InterlockedExchange(&m_lastAcqEnterMs, (LONG)ta);
         int rc = m_pCam->AcquireImageEx(TRUE, &dropped);
+        DWORD dt = TickMs() - ta;
+        InterlockedExchange(&m_acqBlockedMs, (LONG)dt);
+        LONG nc = InterlockedIncrement(&m_acqCalls);
+        if (nc <= 25 || (dt > 1500 && (nc % 20) == 0))
+            FLog("probe: AcquireImageEx #%ld -> %d in %lums (w=%lu h=%lu acquiring=%d frames=%lu)",
+                 nc, rc, (unsigned long)dt, m_width, m_height,
+                 m_bAcquiring ? 1 : 0, m_frameCount);
 
         if (rc == CAM_SUCCESS)
         {
@@ -1886,31 +2244,37 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
                     }
                 }
 
-                // v10/v11: if this host cuts the picture down to its own
+                // v10-v12: if this host cuts the picture down to its own
                 // window shape, hand it a frame whose content already sits
                 // inside that shape (see the [layout] notes at the top of
-                // this file).  The box applies per host, and the fit buffer
-                // is cleared every frame so live edits leave no leftovers.
+                // this file).  The box applies per host, and the composite
+                // buffer is cleared every frame so live edits leave no
+                // leftovers.
                 int lw = 0, lh = 0;
                 LayoutTarget(&lw, &lh);
+                const ISightOptions &opt = Opts();
                 if (lw > 0 && lh > 0)
                 {
                     if (m_pFit == NULL)
                         m_pFit = new BYTE[ISIGHT_DIB_BYTES];
+                    if (m_pBlur == NULL)
+                        m_pBlur = new BYTE[kBlurScratchBytes];
                     if (m_pFit)
                     {
                         ZeroMemory(m_pFit, ISIGHT_DIB_BYTES);   // black surround
-                        FitIntoRect(src, ISIGHT_WIDTH, ISIGHT_HEIGHT,
-                                    m_pFit, ISIGHT_WIDTH, ISIGHT_HEIGHT,
-                                    (ULONG)lw, (ULONG)lh);
+                        ComposeBox(src, ISIGHT_WIDTH, ISIGHT_HEIGHT,
+                                   m_pFit, ISIGHT_WIDTH, ISIGHT_HEIGHT,
+                                   (ULONG)lw, (ULONG)lh, opt.layoutMode,
+                                   m_pBlur, kBlurScratchBytes,
+                                   opt.blurCells, opt.blurShade);
                         src = m_pFit;
                     }
                 }
 
-                // v11: the marker goes on last, so it is visible both in the
-                // host's window and in the dumped frame.
-                if (Opts().guide)
-                    DrawGuide((PBYTE)src, ISIGHT_WIDTH, ISIGHT_HEIGHT, lw, lh);
+                // v11/v12: the marker goes on last, so it is visible both in
+                // the host's window and in the dumped frame.
+                if (opt.guide)
+                    DrawGuide((PBYTE)src, ISIGHT_WIDTH, ISIGHT_HEIGHT, lw, lh, opt.guide);
 
                 int orient = OrientForSubType(si.subtype);
                 EmitFrame(src, pBuf, ISIGHT_WIDTH, ISIGHT_HEIGHT, orient, si);
