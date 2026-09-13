@@ -140,6 +140,31 @@ jobs:
              strmiids.lib ole32.lib oleaut32.lib uuid.lib user32.lib ^
              /Fe:isight-graphtest.exe
 
+          cl /nologo /O2 /W3 /EHsc /GR /FS /Zc:twoPhase- /MD ^
+             /D_CRT_SECURE_NO_WARNINGS /DMY1394CAMERA_EXPORTS ^
+             /Icmu\1394camera ^
+             diags\audio.cpp ^
+             cmu\1394camera\1394Camera.cpp ^
+             cmu\1394camera\1394CamAcq.cpp ^
+             cmu\1394camera\1394CamCap.cpp ^
+             cmu\1394camera\1394CamRGB.cpp ^
+             cmu\1394camera\1394CamReg.cpp ^
+             cmu\1394camera\1394CamMem.cpp ^
+             cmu\1394camera\1394CamPIO.cpp ^
+             cmu\1394camera\1394CamSIO.cpp ^
+             cmu\1394camera\1394CamFMR.cpp ^
+             cmu\1394camera\1394CameraControl.cpp ^
+             cmu\1394camera\1394CameraControlSize.cpp ^
+             cmu\1394camera\1394CameraControlStrobe.cpp ^
+             cmu\1394camera\1394CameraControlTrigger.cpp ^
+             cmu\1394camera\ControlWrappers.cpp ^
+             cmu\1394camera\1394main.c ^
+             cmu\1394camera\isochapi.c ^
+             cmu\1394camera\tables.c ^
+             cmu\1394camera\debug.c ^
+             setupapi.lib advapi32.lib user32.lib comctl32.lib ^
+             /Fe:isight-audio.exe
+
       - name: Setup MSVC (x86)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -161,5 +186,6 @@ jobs:
           path: |
             isight-diag.exe
             isight-raw.exe
+            isight-audio.exe
             isight-graphtest.exe
             isight-graphtest32.exe
