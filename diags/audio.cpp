@@ -107,6 +107,10 @@
 #define VID_SAME          (-1)      // the channel we are listening on
 #define VID_OTHER         (-2)      // a different channel (Apple: never the same)
 
+// v9: how many acquisition buffers to attach in CMU style.  C1394Camera asks
+// for 8 and that is the number that receives 90/90 frames on this machine.
+#define MAX_ACQ           8
+
 //---------------------------------------------------------------------
 // the DCAM video unit (0xFFFFF0F00000), used here as a *known good
 // transmitter* so the receive path can be validated without the CMU
@@ -545,6 +549,13 @@ static int SpeedIndex(ULONG flag)
 static int g_lastChannel = -1;
 static int g_lastCompletions = -1;
 
+// v9: use C1394Camera::StartImageAcquisitionEx()'s exact buffer parameters
+// (8 acquisition buffers of one full 640x480 YUV 4:1:1 frame, 960 bytes per
+// packet, nNumberOfBuffers = subBuffers + 1).  Defaults to on because that
+// is the only configuration known to receive on this machine; "plain" on the
+// command line switches back to v8's ad-hoc numbers for an A/B comparison.
+static BOOL g_cmu = TRUE;
+
 //---------------------------------------------------------------------
 // IRM helpers
 //---------------------------------------------------------------------
@@ -694,6 +705,14 @@ static void ScanRaw(const char *fn)
 // reported OK" is not the same as "the camera accepted it" - every
 // silent failure we have hit so far looked like a successful write.
 //---------------------------------------------------------------------
+// decode the transmit channel out of a DCAM 0x60C quadlet: 1394a packs
+// it in bits 31-28, 1394b (bit 15 set) in bits 13-8
+static ULONG ChannelOf60C(ULONG v)
+{
+    if (v & 0x00008000) return (v >> 8) & 0x3F;
+    return (v >> 28) & 0x0F;
+}
+
 static void VideoEngineOn(const char *dev, ULONG flag, int vidCh, ULONG ourCh,
                           ULONG *pOldCh, ULONG *pOldEn, BOOL *pSaved)
 {
@@ -706,7 +725,15 @@ static void VideoEngineOn(const char *dev, ULONG flag, int vidCh, ULONG ourCh,
     ULONG vc;
     if (vidCh >= 0)              vc = (ULONG)vidCh;               // explicit
     else if (vidCh == VID_SAME)  vc = ourCh;                      // what we listen on
-    else                         vc = (ourCh == 0) ? 1u : 0u;     // VID_OTHER
+    else
+    {
+        // VID_OTHER: prefer the channel the camera was already using for
+        // video (channel 2 on this unit); only if that collides with our
+        // receive channel fall back to a different one.  Audio and video
+        // must never share an isochronous channel.
+        ULONG prev = ChannelOf60C(oldCh);
+        vc = (prev != ourCh) ? prev : ((ourCh == 0) ? 1u : 0u);
+    }
 
     ULONG v = oldCh, si = (ULONG)SpeedIndex(flag);
     if (oldCh & 0x00008000) v = (v & 0xFFFF8000u) | ((vc & 0x3F) << 8) | si;
@@ -749,9 +776,15 @@ static void CameraAudioOn(const char *dev, ULONG cfgBase, ULONG ch, ULONG flag,
             (rb == txv) ? "(the write took)" : "(THE WRITE DID NOT TAKE!)");
 }
 
+static void FreeAcq(PACQUISITION_BUFFER *acq, int n)
+{
+    for (int i = 0; i < n; ++i)
+        if (acq[i]) { dc1394FreeAcquisitionBuffer(acq[i]); acq[i] = NULL; }
+}
+
 static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dumpRaw,
                      ULONG cfgBase, int restoreCh, BOOL enableAudio, BOOL vidEnable,
-                     int vidCh, BOOL vidFirst)
+                     int vidCh, BOOL vidFirst, BOOL cmuStyle)
 {
     ULONG flag = 0;
     if (GetMaxIsochSpeed((PSTR)dev, &flag) != ERROR_SUCCESS || flag == 0) flag = SPEED_FLAGS_400;
@@ -770,36 +803,71 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     t1394_GetHostDmaCapabilities(dev, NULL, &dmaMax);
     LOG("  host max DMA buffer = %I64u bytes", dmaMax.QuadPart);
 
-    PACQUISITION_BUFFER buf = dc1394BuildAcquisitonBuffer(bpf * 32,
-                                                          (ULONG)dmaMax.QuadPart, bpf, 0);
-    if (!buf) { LOG("  BuildAcquisitionBuffer FAILED"); return 2; }
-    LOG("  frame buffer: %u sub-buffers, first %u bytes", buf->nSubBuffers, buf->subBuffers[0].ulSize);
+    // ---- buffers -----------------------------------------------------
+    // v9: the parameter set is now switchable.  In 'cmuStyle' every number
+    // is the one C1394Camera::StartImageAcquisitionEx() would use for
+    // Format 0 / Mode 2 / 15 fps - 8 acquisition buffers of one full frame
+    // (640x480 YUV 4:1:1 = 460800 bytes), a 960-byte packet budget and
+    // nNumberOfBuffers = subBuffers + 1 - because that is the only
+    // configuration on this machine that is *known* to receive (90/90
+    // frames in isight-diag).  v8 used one 131072-byte buffer and told the
+    // driver to expect 8, and received nothing at all; that difference is
+    // what this variant exists to test.
+    ULONG frameSize = bpf * 32;
+    ULONG pktSize   = bpf;      // = nMaxBytesPerFrame; the caller knows the
+                                // real packet budget (4096 for the video self
+                                // test, 1916 for audio - Apple's largest
+                                // audio packet).  Never shrink it to CMU's
+                                // 960: that is a *video* number and would
+                                // truncate every audio packet.
+    int   nAcq      = 1;
+    if (cmuStyle)
+    {
+        frameSize = 640UL * 480UL * 3UL / 2UL;   // one 640x480 YUV 4:1:1 frame
+        nAcq      = MAX_ACQ;
+    }
+
+    PACQUISITION_BUFFER acq[MAX_ACQ];
+    ZeroMemory(acq, sizeof(acq));
+    for (int i = 0; i < nAcq; ++i)
+    {
+        acq[i] = dc1394BuildAcquisitonBuffer(frameSize, (ULONG)dmaMax.QuadPart, pktSize, (ULONG)i);
+        if (!acq[i]) { LOG("  BuildAcquisitionBuffer(%d) FAILED", i); return 2; }
+    }
+    ULONG nSub = 0;
+    for (int i = 0; i < nAcq; ++i) nSub += acq[i]->nSubBuffers;
+    LOG("  buffers: %d acquisition buffer(s) of %u bytes covering %u sub-buffer(s), %u bytes/packet"
+        "  (cmuStyle=%s, CMU would use 8 x 460800 @ 960)",
+        nAcq, frameSize, nSub, pktSize, cmuStyle ? "ON" : "off");
 
     ISOCH_STREAM_PARAMS sp;
     ZeroMemory(&sp, sizeof(sp));
     sp.fulSpeed          = flag;
-    sp.nMaxBytesPerFrame = bpf;
+    sp.nMaxBytesPerFrame = pktSize;
     sp.nChannel          = (chIn < 0) ? (ULONG)-1 : (ULONG)chIn;
-    sp.nMaxBufferSize    = buf->subBuffers[0].ulSize;
-    sp.nNumberOfBuffers  = 8;
+    sp.nMaxBufferSize    = acq[0]->subBuffers[0].ulSize;
+    // exactly what C1394Camera::InitResources() computes:
+    //   nNumberOfBuffers = (acquisitionBuffers * subBuffers) + 1
+    sp.nNumberOfBuffers  = nSub + 1;
 
     LOG("  SetupStream(in): channel=%s, %u bytes/frame, %u buffers @ %u",
         chIn < 0 ? "auto(-1)" : "explicit", sp.nMaxBytesPerFrame, sp.nNumberOfBuffers, sp.nMaxBufferSize);
     DWORD r = t1394IsochSetupStream((PSTR)dev, &sp);
     LOG("  SetupStream -> %lu  (channel 0x%X, speed 0x%X, bpf %u, %u buffers)",
         r, sp.nChannel, sp.fulSpeed, sp.nMaxBytesPerFrame, sp.nNumberOfBuffers);
-    if (r != ERROR_SUCCESS) { dc1394FreeAcquisitionBuffer(buf); return 3; }
+    if (r != ERROR_SUCCESS) { FreeAcq(acq, nAcq); return 3; }
     if (sp.nChannel == 0xFFFFFFFFu || sp.nChannel > 63)
     {
         if (chIn >= 0)
         {
-            // Explicit channel, and this reply is CMU's "subscribe" outcome: the
-            // driver set the stream up on the channel we asked for but did not
-            // *allocate* one, so it reports "none".  C1394Camera::InitResources()
-            // does exactly the same for ACQ_SUBSCRIBE_ONLY - it fills nChannel
-            // from the camera's own 0x60C register and never checks the reply.
-            LOG("  the driver allocated no channel (0x%X) but we asked for %d ->", sp.nChannel, chIn);
-            LOG("  treating this as a subscribe on channel %d (ACQ_SUBSCRIBE_ONLY behaviour)", chIn);
+            // Explicit channel, and this reply *might* be CMU's "subscribe"
+            // outcome.  v7 asserted it was; v8's auto-allocated run made that
+            // look doubtful, because the driver filled in a real channel (0)
+            // when it was allowed to allocate.  So we no longer *believe* the
+            // subscribe reading - we accept it and let the byte count decide.
+            LOG("  the driver returned no channel (0x%X) for the explicit request %d ->",
+                sp.nChannel, chIn);
+            LOG("  assuming a subscribe on channel %d - the byte count will tell", chIn);
             sp.nChannel = (ULONG)chIn;
         }
         else
@@ -807,7 +875,7 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
             LOG("  *** the driver did NOT allocate an isochronous channel (0x%X) - cannot receive",
                 sp.nChannel);
             t1394IsochTearDownStream((PSTR)dev);
-            dc1394FreeAcquisitionBuffer(buf);
+            FreeAcq(acq, nAcq);
             return 7;
         }
     }
@@ -829,10 +897,6 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
         IrmDump(dev);
     }
 
-    // (v8) The camera is programmed further down, *after* IsochListen.  v6
-    // and v7 wrote the camera's channel register here, before the stream
-    // even existed; SetupStream is what learns the channel, so anything
-    // written before it can only be a guess.
     ULONG vOldCh = 0, vOldEn = 0;
     BOOL  vSaved = FALSE;
 
@@ -841,23 +905,46 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     {
         LOG("  OpenDevice(overlapped) FAILED (%lu)", GetLastError());
         t1394IsochTearDownStream((PSTR)dev);
-        dc1394FreeAcquisitionBuffer(buf);
+        FreeAcq(acq, nAcq);
         return 4;
     }
 
-    r = dc1394AttachAcquisitionBuffer(hdev, buf);
-    LOG("  AttachAcquisitionBuffer -> %lu", r);
-    if (r != ERROR_SUCCESS)
+    int attached = 0;
+    for (int i = 0; i < nAcq; ++i)
     {
-        CloseHandle(hdev); t1394IsochTearDownStream((PSTR)dev); dc1394FreeAcquisitionBuffer(buf);
-        return 5;
+        r = dc1394AttachAcquisitionBuffer(hdev, acq[i]);
+        if (r != ERROR_SUCCESS)
+        {
+            LOG("  AttachAcquisitionBuffer(%d) -> %lu  FAILED", i, r);
+            CloseHandle(hdev); t1394IsochTearDownStream((PSTR)dev); FreeAcq(acq, nAcq);
+            return 5;
+        }
+        attached++;
     }
+    LOG("  AttachAcquisitionBuffer x%d -> 0", attached);
+
+    // CMU waits 50 ms here and then insists that every attached buffer still
+    // report ERROR_IO_INCOMPLETE: a buffer that is already "ready" before
+    // IsochListen means the attach did not take, and CMU treats that as a
+    // hard failure.  We only report it - but we report it, because v8 had no
+    // way of telling "attached" from "silently dropped".
+    Sleep(50);
+    int pending = 0, ready = 0, errs = 0;
+    for (int i = 0; i < nAcq; ++i)
+        for (unsigned int b = 0; b < acq[i]->nSubBuffers; ++b)
+        {
+            DWORD got = 0;
+            if (GetOverlappedResult(hdev, &acq[i]->subBuffers[b].overLapped, &got, FALSE)) ready++;
+            else if (GetLastError() == ERROR_IO_INCOMPLETE) pending++;
+            else errs++;
+        }
+    LOG("  buffer validation: %d pending (good), %d ready-too-early (bad), %d error(s)", pending, ready, errs);
 
     r = t1394IsochListen((PSTR)dev);
     LOG("  IsochListen -> %lu", r);
     if (r != ERROR_SUCCESS)
     {
-        CloseHandle(hdev); t1394IsochTearDownStream((PSTR)dev); dc1394FreeAcquisitionBuffer(buf);
+        CloseHandle(hdev); t1394IsochTearDownStream((PSTR)dev); FreeAcq(acq, nAcq);
         return 6;
     }
 
@@ -885,36 +972,50 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
 
     while ((NowMs() - t0) < (double)seconds * 1000.0)
     {
-        HANDLE evs[MAX_SUB_BUFFERS];
-        for (unsigned int i = 0; i < buf->nSubBuffers; ++i) evs[i] = buf->subBuffers[i].overLapped.hEvent;
+        HANDLE evs[MAX_ACQ * MAX_SUB_BUFFERS];
+        int    owner[MAX_ACQ * MAX_SUB_BUFFERS];
+        unsigned int sub[MAX_ACQ * MAX_SUB_BUFFERS];
+        unsigned int nev = 0, i;
 
-        DWORD w = WaitForMultipleObjects(buf->nSubBuffers, evs, FALSE, 200);
+        for (i = 0; i < (unsigned int)nAcq; ++i)
+            for (unsigned int b = 0; b < acq[i]->nSubBuffers; ++b)
+            {
+                evs[nev]   = acq[i]->subBuffers[b].overLapped.hEvent;
+                owner[nev] = (int)i;
+                sub[nev]   = b;
+                nev++;
+            }
+        (void)i;
+
+        DWORD w = WaitForMultipleObjects(nev, evs, FALSE, 200);
         if (w == WAIT_TIMEOUT || w == WAIT_FAILED) continue;
 
-        unsigned int idx = w - WAIT_OBJECT_0;
-        if (idx >= buf->nSubBuffers) continue;
+        unsigned int slot = w - WAIT_OBJECT_0;
+        if (slot >= nev) continue;
 
+        int ai = owner[slot];
+        unsigned int bi = sub[slot];
         DWORD bytes = 0;
-        if (GetOverlappedResult(hdev, &buf->subBuffers[idx].overLapped, &bytes, FALSE))
+        if (GetOverlappedResult(hdev, &acq[ai]->subBuffers[bi].overLapped, &bytes, FALSE))
         {
             completions++;
             if (bytes)
             {
-                LOG("  t=%6.0f ms  sub-buffer %u completed: %lu bytes", NowMs() - t0, idx, bytes);
-                if (raw) { fwrite(buf->subBuffers[idx].pData, 1, bytes, raw); fflush(raw); }
+                LOG("  t=%6.0f ms  buffer %d.%u completed: %lu bytes", NowMs() - t0, ai, bi, bytes);
+                if (raw) { fwrite(acq[ai]->subBuffers[bi].pData, 1, bytes, raw); fflush(raw); }
                 total += bytes;
             }
         }
-        else LOG("  sub-buffer %u overlapped error %lu", idx, GetLastError());
+        else LOG("  buffer %d.%u overlapped error %lu", ai, bi, GetLastError());
 
-        ResetEvent(evs[idx]);
-        buf->subBuffers[idx].overLapped.Offset     = 0;
-        buf->subBuffers[idx].overLapped.OffsetHigh = 0;
+        ResetEvent(evs[slot]);
+        acq[ai]->subBuffers[bi].overLapped.Offset     = 0;
+        acq[ai]->subBuffers[bi].overLapped.OffsetHigh = 0;
         ISOCH_BUFFER_PARAMS bp;
-        bp.ulFlags = (idx == 0) ? ISOCH_BUFFER_PRIMARY : ISOCH_BUFFER_SECONDARY;
-        t1394IsochAttachBuffer(hdev, buf->subBuffers[idx].pData,
-                               buf->subBuffers[idx].ulSize, &bp,
-                               &buf->subBuffers[idx].overLapped);
+        bp.ulFlags = (bi == 0) ? ISOCH_BUFFER_PRIMARY : ISOCH_BUFFER_SECONDARY;
+        t1394IsochAttachBuffer(hdev, acq[ai]->subBuffers[bi].pData,
+                               acq[ai]->subBuffers[bi].ulSize, &bp,
+                               &acq[ai]->subBuffers[bi].overLapped);
     }
 
     if (raw) fclose(raw);
@@ -926,7 +1027,7 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     t1394IsochStop((PSTR)dev);
     t1394IsochTearDownStream((PSTR)dev);
     CloseHandle(hdev);
-    dc1394FreeAcquisitionBuffer(buf);
+    FreeAcq(acq, nAcq);
     LOG("  stream stopped");
 
     if (vidEnable)
@@ -991,7 +1092,7 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOO
     if (!configTx)
     {
         rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
-                       0, -1, FALSE, FALSE, -1, FALSE);
+                       0, -1, FALSE, FALSE, -1, FALSE, g_cmu);
     }
     else
     {
@@ -1001,7 +1102,7 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOO
             LOG("  ---------- variant %s ----------", variants[v].what);
             rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
                            base, curCh, variants[v].audio, variants[v].video, -1,
-                           variants[v].vidFirst);
+                           variants[v].vidFirst, g_cmu);
             if (g_lastCompletions > 0)
             {
                 LOG("  *** variant %d produced data - stopping the escalation ***", v + 1);
@@ -1035,13 +1136,20 @@ static int DoVidListen(const char *dev, int ch, int seconds, ULONG bpf)
         ch < 0 ? "an auto-allocated" : "explicit", seconds, bpf);
     LOG("   video unit before: rate=0x%08X mode=0x%08X format=0x%08X 0x60C=0x%08X 0x614=0x%08X",
         oldRate, oldMode, oldFmt, oldCh, oldEn);
+    // C1394Camera writes these as value<<29, so the low three bits of the
+    // shift are the setting.  0/2/3 is Format 0 Mode 2 at 15 fps - exactly
+    // what isight-diag.exe selects, i.e. the configuration that delivers
+    // 90/90 frames.  If these numbers ever differ, the "known-good
+    // transmitter" premise is broken and the test below means nothing.
+    LOG("   decoded: format %u / mode %u / rate %u   (0/2/3 = 640x480 YUV 4:1:1 @15fps)",
+        oldFmt >> 29, oldMode >> 29, oldRate >> 29);
     if (oldEn & 0x80000000u)
         LOG("   WARNING: the video engine is already enabled (0x614) - something else is streaming");
 
     // DoReceive does the whole sequence: SetupStream, buffers, Listen and then -
     // because vidEnable is set - the video 0x60C and 0x614 = 0x80000000 writes,
     // with both registers restored afterwards.
-    int rc = DoReceive(dev, ch, seconds, bpf, TRUE, 0, -1, FALSE, TRUE, VID_SAME, FALSE);
+    int rc = DoReceive(dev, ch, seconds, bpf, TRUE, 0, -1, FALSE, TRUE, VID_SAME, FALSE, g_cmu);
 
     ULONG en = 0;
     RD(dev, VIDEO_ABS_BASE + V_ISO_ENABLE, &en, NULL);
@@ -1085,6 +1193,20 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
+    LOG("(v9 - the receive path, reproduced from the one that works.  v8 let the");
+    LOG("      driver ALLOCATE the channel, pointed the camera's video engine at");
+    LOG("      it, saw 0x614 read back 0x80000000 ('streaming') - and still got");
+    LOG("      ZERO bytes.  Since isight-diag.exe receives 90/90 frames from the");
+    LOG("      same camera through the same driver, the difference has to be in");
+    LOG("      how we set the stream up, not in the camera.  So v9 throws away");
+    LOG("      v8's ad-hoc numbers and uses C1394Camera's exactly: 8 acquisition");
+    LOG("      buffers of one full 640x480 YUV 4:1:1 frame (460800 bytes) built");
+    LOG("      with a 960-byte packet budget, nNumberOfBuffers = subBuffers + 1,");
+    LOG("      attach all 8, wait 50 ms and validate that every buffer is still");
+    LOG("      ERROR_IO_INCOMPLETE (CMU treats 'already ready' as a hard error),");
+    LOG("      and only then IsochListen.  'plain' on the command line gives");
+    LOG("      v8's numbers back for an A/B; 'auto' for cap's channel argument is");
+    LOG("      no longer eaten by atoi() and turned into channel 0.)");
     LOG("(v8 - the receive path, checked properly.  v7's vidlisten asked for");
     LOG("      an EXPLICIT channel, the driver answered 0xFFFFFFFF and we");
     LOG("      treated that as 'listening on the channel you named' - then got");
@@ -1123,9 +1245,16 @@ int main(int argc, char **argv)
     LOG("mode: %s", mode);
 
     for (int i = 1; i < argc; ++i)
-        if (!_stricmp(argv[i], "irm")) g_irm = TRUE;
+    {
+        if (!_stricmp(argv[i], "irm"))   g_irm = TRUE;
+        if (!_stricmp(argv[i], "cmu"))   g_cmu = TRUE;
+        if (!_stricmp(argv[i], "plain")) g_cmu = FALSE;
+    }
     if (g_irm) LOG("IRM mode: on - the channel/bandwidth claim will be attempted (and will fail)");
     else       LOG("IRM mode: off (pass 'irm' as an extra argument to attempt the claim)");
+    LOG("buffer mode: %s (pass 'plain' for v8's ad-hoc numbers, 'cmu' for C1394Camera's)",
+        g_cmu ? "CMU-style - 8 x full-frame buffers, 960 B/packet, subBuffers+1"
+              : "plain - one small buffer");
 
     HDEVINFO hDev = t1394CmdrGetDeviceList();
     if (hDev == INVALID_HANDLE_VALUE) { LOG("t1394CmdrGetDeviceList FAILED"); return 1; }
@@ -1168,9 +1297,12 @@ int main(int argc, char **argv)
     {
         int secs = 3, fch = -1;
         BOOL cfg = TRUE;
-        if (from == 0) { LOG("usage: isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig]"); return 1; }
+        if (from == 0) { LOG("usage: isight-audio.exe cap <absBaseHex> [seconds] [channel|auto] [noconfig]"); return 1; }
         if (argc > 3) secs = atoi(argv[3]);
-        if (argc > 4) fch  = atoi(argv[4]);
+        // "auto" must not go through atoi() - that turns it into channel 0,
+        // which is an explicit channel, and the two are completely different
+        // experiments (allocation vs subscribe).
+        if (argc > 4) fch  = _stricmp(argv[4], "auto") ? atoi(argv[4]) : -1;
         if (argc > 5 && !_stricmp(argv[5], "noconfig")) cfg = FALSE;
         DoCapture(path, from, secs, fch, cfg);
     }
@@ -1185,7 +1317,7 @@ int main(int argc, char **argv)
         LOG("");
         LOG("== listen only: channel %s, %d s, %u bytes/frame max ==",
             ch < 0 ? "auto" : "explicit", secs, bpf);
-        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE, FALSE, -1, FALSE);
+        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE, FALSE, -1, FALSE, g_cmu);
         LOG("listen exit code %d", rc);
     }
     else if (!_stricmp(mode, "vidlisten"))
