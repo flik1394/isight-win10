@@ -1,5 +1,16 @@
 //=====================================================================
-// audio.cpp - Apple iSight audio (microphone) bring-up probe   v2
+// audio.cpp - Apple iSight audio (microphone) bring-up probe   v11
+//
+// CURRENT STATE (v11): the microphone is LIVE on Windows.  v9's variant 3
+// received 1050 "sght" packets / 210000 frames in 4.38 s - real 48 kHz
+// 16-bit stereo big-endian samples, non-silent (peak 1002, rms 208) - but
+// only ~43% of them, because the video engine was on the same isochronous
+// channel and the camera could only alternate one packet per cycle.  v10
+// tried to separate the two channels and received nothing at all, so v11
+// runs single, explicit configurations ('one' mode) to find out whether the
+// audio unit obeys its 0x300 channel field or simply transmits on the video
+// unit's channel - and, if the latter, how much video bandwidth can be
+// given back to the microphone.
 //
 // The iSight's microphone is NOT an AV/C audio subunit and is not
 // AM824/IEC 61883-6, so neither avcaudio.sys nor the in-box 61883 stack
@@ -560,6 +571,37 @@ static BOOL g_cmu = TRUE;
 // the microphone's clock source.  -1 leaves the camera's setting alone.
 static int g_vidRate = -1;
 
+// v11: which isochronous channel we *tell the audio unit* to transmit on.
+// -2 means "whatever channel the driver gave us for receiving", which is
+// what v9 did and what produced audio.  Set explicitly with ach=N.  The
+// question it answers: the v10 run that told the audio unit channel 0 and
+// the video engine channel 1 received NOTHING at all - so either the audio
+// unit honours 0x300 (and something else killed it), or the iSight sends
+// audio on the *video* unit's channel and 0x300's channel field is a
+// decoration.  Telling audio channel 1 while video stays on our receive
+// channel separates the two.
+static int g_audCh = -2;
+
+// v11: optional DCAM video format / mode overrides (packed as value << 29).
+// The camera sends audio in the isochronous cycles that video leaves free,
+// so a smaller video mode should leave more room for the microphone.
+static int g_vidFmt  = -1;
+static int g_vidMode = -1;
+
+// v11: single-configuration mode.  v9/v10 both *escalated* through variants
+// and stopped at the first one that produced bytes - which conflated the
+// settings (v9's winner was "audio ch0 + video ch0 because -1 meant
+// VID_SAME"), and v10 then changed two things at once and broke it.  Passing
+// any of ach= / vidch= / vid= / aud= / fmt= / mode= / vrate= (or "one") to
+// 'cap' sets g_one and runs exactly ONE capture with those settings, so a
+// result can be attributed to one hypothesis instead of to a mixture.
+static int  g_vidCh = -3;    // -3 = follow the variant table; else VID_SAME /
+                             // VID_OTHER / an explicit channel number
+static int  g_vidOn = -1;    // -1 = follow the variant table, 0 = video off
+static int  g_audOn = -1;    // -1 = program the audio unit and enable it,
+                             //  0 = do not touch the audio unit at all
+static BOOL g_one   = FALSE;
+
 //---------------------------------------------------------------------
 // IRM helpers
 //---------------------------------------------------------------------
@@ -718,7 +760,8 @@ static ULONG ChannelOf60C(ULONG v)
 }
 
 static void VideoEngineOn(const char *dev, ULONG flag, int vidCh, ULONG ourCh,
-                          ULONG *pOldCh, ULONG *pOldEn, BOOL *pSaved, int forceRate)
+                          ULONG *pOldCh, ULONG *pOldEn, BOOL *pSaved, int forceRate,
+                          int forceFmt, int forceMode)
 {
     ULONG oldCh = 0, oldEn = 0;
     *pSaved = RD(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, &oldCh, NULL) &&
@@ -747,10 +790,29 @@ static void VideoEngineOn(const char *dev, ULONG flag, int vidCh, ULONG ourCh,
         v, vc, ourCh, oldCh);
     WR(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, v, "V_ISO_CHANNEL");
 
-    // Optional frame-rate override.  DCAM packs its FMR registers as
-    // value << 29, and the camera sends audio in the cycles the video
-    // leaves free - so a slower video frame rate means more free cycles,
-    // which is the one knob that should directly improve audio continuity.
+    // Optional DCAM format / mode / frame-rate overrides.  DCAM packs all
+    // three as value << 29, and the camera sends audio in the cycles the
+    // video leaves free - so a slower frame rate or a smaller format is the
+    // one knob that should directly improve audio continuity.  Order is
+    // format -> mode -> rate, which is the only order IIDC allows: a mode is
+    // only legal within the currently selected format.  Every override is
+    // written *before* 0x614 is enabled, and each one is logged with its
+    // read-back, because on this camera "the write reported OK" has been
+    // wrong twice already.
+    if (forceFmt >= 0)
+    {
+        ULONG before = 0;
+        RD(dev, VIDEO_ABS_BASE + V_VIDEO_FORMAT, &before, NULL);
+        LOG("  -> video 0x608 (format) = %d, was %u", forceFmt, before >> 29);
+        WR(dev, VIDEO_ABS_BASE + V_VIDEO_FORMAT, (ULONG)forceFmt << 29, "V_VIDEO_FORMAT");
+    }
+    if (forceMode >= 0)
+    {
+        ULONG before = 0;
+        RD(dev, VIDEO_ABS_BASE + V_VIDEO_MODE, &before, NULL);
+        LOG("  -> video 0x604 (mode) = %d, was %u", forceMode, before >> 29);
+        WR(dev, VIDEO_ABS_BASE + V_VIDEO_MODE, (ULONG)forceMode << 29, "V_VIDEO_MODE");
+    }
     if (forceRate >= 0)
     {
         ULONG before = 0;
@@ -976,14 +1038,26 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     // video engine: with the video engine stopped there may be no clock at
     // all, so "video up, then audio" is a genuinely different experiment
     // from "audio up, then video".
+    // v11: the channel we TELL the audio unit to transmit on.  Unless ach=N
+    // says otherwise this stays "whatever channel we are receiving on",
+    // which is exactly what v9 did and what produced the first audio - but
+    // that is also why v9 could not tell whether 0x300 is obeyed or whether
+    // the iSight simply transmits audio on the *video* unit's channel.  A
+    // different ach answers that: if audio still lands on the video channel
+    // while 0x300 names ours (or vice versa), 0x300's channel field is a
+    // decoration and bandwidth, not routing, is the only lever we have.
+    ULONG audCh = (g_audCh >= 0) ? (ULONG)g_audCh : sp.nChannel;
+
     LOG("  -- programming the camera (video %s) --",
         vidFirst ? "FIRST, audio second" : "last, audio first");
     if (vidEnable && vidFirst)
-        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved, vidRate);
+        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved,
+                      vidRate, g_vidFmt, g_vidMode);
     if (cfgBase)
-        CameraAudioOn(dev, cfgBase, sp.nChannel, flag, enableAudio);
+        CameraAudioOn(dev, cfgBase, audCh, flag, enableAudio);
     if (vidEnable && !vidFirst)
-        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved, vidRate);
+        VideoEngineOn(dev, flag, vidCh, sp.nChannel, &vOldCh, &vOldEn, &vSaved,
+                      vidRate, g_vidFmt, g_vidMode);
 
     FILE *raw = fopen("isight-audio-raw.bin", "wb");
     double t0 = NowMs();
@@ -1095,33 +1169,70 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOO
         if (tx == 0 || curCh > 63) { curCh = -1; LOG("  -> that channel is invalid, treating as none"); }
     }
 
-    // v10.  The v9 run of variant 3 finally produced audio - 1050 "sght"
-    // packets, a real YUV picture alongside them - but with 74 dropouts
-    // over 4.38 s: only ~43% of the microphone's frames.  The reason is
-    // visible in the dump: the video engine was put on OUR OWN receive
-    // channel, so the camera could only alternate one packet per cycle and
-    // half the audio went missing.  v9 passed -1 for the video channel,
-    // and -1 is VID_SAME, not VID_OTHER - the flag that was meant.
-    // Apple's guide is explicit that audio and video use *different*
-    // isochronous channels, so variant 3 now does exactly that.
-    // Variant 4 keeps the video-first ordering, and variant 5 slows the
-    // video frame rate down: the camera sends audio in the cycles video
-    // leaves free, so fewer video frames means more room for the mic.
-    struct { const char *what; BOOL audio, video, vidFirst; int vidCh; int vrate; }
+    // v11.  v9's variant 3 finally produced audio in Windows - 1050 "sght"
+    // packets, 210000 frames, a real YUV picture alongside them - and v10
+    // tried to clean it up by moving the video engine to ANOTHER isochronous
+    // channel, which killed everything: five variants, twelve seconds each,
+    // zero bytes.  So v10's premise was wrong in at least one direction, and
+    // two explanations remain, which no amount of re-reading the guide can
+    // separate:
+    //   (A) the audio unit OBEYS 0x300.  Then v9 worked because the channel
+    //       we named and the video channel happened to be the same number,
+    //       and naming a *different* one puts audio alone on a channel with
+    //       no video on it: clean audio, zero video contention.
+    //   (B) the audio unit IGNORES 0x300 and always transmits on the video
+    //       unit's channel (Apple's guide does say the iSight derives its
+    //       audio clock from the video engine).  Then routing is out of our
+    //       hands and the only lever left is bandwidth - slower video frame
+    //       rate, smaller video format/mode - because audio rides the cycles
+    //       the video leaves free.
+    // v11 keeps the escalation, but only as a regression path: three variants
+    // ending where v9 ended, with the video engine on OUR channel, because
+    // v10 proved that moving the video channel is fatal rather than helpful.
+    // The real work is "one" mode below.
+    struct { const char *what; BOOL audio, video, vidFirst; int vidCh; }
     variants[] = {
-        { "1/5  audio only: SAMPLE_RATE + ISO_TX_CONFIG, no enable",
-          FALSE, FALSE, FALSE, 0,         -1 },
-        { "2/5  + AUDIO_ENABLE, video engine still off",
-          TRUE,  FALSE, FALSE, 0,         -1 },
-        { "3/5  + AUDIO_ENABLE, video engine on ANOTHER channel",
-          TRUE,  TRUE,  FALSE, VID_OTHER, -1 },
-        { "4/5  video engine FIRST (another channel), then audio",
-          TRUE,  TRUE,  TRUE,  VID_OTHER, -1 },
-        { "5/5  as 4/5 but video frame rate lowered to 3.75 fps",
-          TRUE,  TRUE,  TRUE,  VID_OTHER,  1 },
+        { "1/3  audio only: SAMPLE_RATE + ISO_TX_CONFIG, no enable",
+          FALSE, FALSE, FALSE, VID_SAME },
+        { "2/3  + AUDIO_ENABLE, video engine still off",
+          TRUE,  FALSE, FALSE, VID_SAME },
+        { "3/3  + AUDIO_ENABLE, video engine on OUR channel (v9's winner)",
+          TRUE,  TRUE,  FALSE, VID_SAME },
     };
 
+    // ---- v11: single configuration ----------------------------------
+    // Any of ach= / vidch= / vid= / aud= / fmt= / mode= / vrate= (or the bare
+    // word "one") switches cap out of the escalation and into exactly one
+    // capture with the settings given.  This is what tells (A) and (B) apart,
+    // because each run then belongs to one hypothesis:
+    //   cap 0xF0020000 12 1 one vidch=0 ach=1
+    //       -> (A): audio told channel 1, video left on its factory channel
+    //          0, and we listen on 1.  If audio arrives, 0x300 is obeyed and
+    //          we can have the microphone with no video mixed in.
+    //   cap 0xF0020000 12 one vrate=1
+    //       -> (B): v9's exact setup but the video frame rate at 3.75 fps, so
+    //          the video occupies far fewer cycles per second and the mic has
+    //          more room.  If this raises the audio share past 43%, (B) holds.
     int rc = 0;
+    if (g_one)
+    {
+        BOOL audOn = (g_audOn != 0);
+        BOOL vidOn = (g_vidOn >= 0) ? (BOOL)g_vidOn : TRUE;
+        int  vCh   = (g_vidCh != -3) ? g_vidCh : VID_SAME;
+        LOG("");
+        LOG("  ---------- single configuration (v11): one run, one hypothesis ----------");
+        LOG("  audio: %s (ach=%d, -2 = the channel we receive on)",
+            audOn ? "programmed + enabled" : "NOT TOUCHED AT ALL", g_audCh);
+        LOG("  video: %s, told channel %d  (-1 = ours, -2 = another, >=0 = explicit)",
+            vidOn ? "enabled" : "off", vCh);
+        LOG("  DCAM overrides: rate=%d format=%d mode=%d  (-1 = leave the camera alone)",
+            g_vidRate, g_vidFmt, g_vidMode);
+        rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
+                       audOn ? base : 0, curCh, audOn, vidOn, vCh, FALSE, g_cmu, g_vidRate);
+        LOG("cap exit code %d", rc);
+        return rc;
+    }
+
     if (!configTx)
     {
         rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
@@ -1129,17 +1240,17 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOO
     }
     else
     {
-        for (int v = 0; v < 5; ++v)
+        for (int v = 0; v < 3; ++v)
         {
             LOG("");
             LOG("  ---------- variant %s ----------", variants[v].what);
             rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
                            base, curCh, variants[v].audio, variants[v].video,
-                           variants[v].vidCh, variants[v].vidFirst, g_cmu,
-                           variants[v].vrate >= 0 ? variants[v].vrate : g_vidRate);
+                           variants[v].vidCh, variants[v].vidFirst, g_cmu, g_vidRate);
             if (g_lastCompletions > 0)
             {
                 LOG("  *** variant %d produced data - stopping the escalation ***", v + 1);
+                LOG("  *** to try to improve on it:  cap 0x%08X %d one vrate=1", base, seconds);
                 break;
             }
         }
@@ -1228,6 +1339,24 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
+    LOG("(v11 - v10 REVERSED A RESULT.  v10 moved the video engine to another");
+    LOG("      isochronous channel (Apple's guide says audio and video use");
+    LOG("      different ones) and every variant then received ZERO bytes, so");
+    LOG("      that premise is wrong in at least one direction.  v11 stops");
+    LOG("      changing two things at once: 'cap' gained 'one' mode - pass any");
+    LOG("      of ach=/vidch=/vid=/aud=/fmt=/mode=/vrate= and exactly ONE");
+    LOG("      configuration runs, so a result belongs to one hypothesis:");
+    LOG("        cap 0xF0020000 12 1 one vidch=0 ach=1   -> is 0x300 obeyed?");
+    LOG("            (audio told channel 1, video left on its factory channel");
+    LOG("             0, we listen on 1: audio alone if the audio unit routes)");
+    LOG("        cap 0xF0020000 12 one vrate=1           -> or is it bandwidth?");
+    LOG("            (v9's exact setup, video frame rate down to 3.75 fps so");
+    LOG("             the mic gets more of the cycle)");
+    LOG("      The escalation is now only a regression path: three variants that");
+    LOG("      end where v9 ended, video on OUR channel, because v10 showed");
+    LOG("      that moving the video channel kills the stream outright.  Video");
+    LOG("      format/mode overrides were added too (0x608/0x604 as value<<29),");
+    LOG("      written format -> mode -> rate, the only order IIDC allows.)");
     LOG("(v10 - THE MICROPHONE IS LIVE.  v9's variant 3 finally received audio:");
     LOG("      1050 'sght' packets, 210000 frames, alongside a real YUV picture -");
     LOG("      but with 74 dropouts, i.e. only ~43% of the microphone's frames.");
@@ -1297,14 +1426,41 @@ int main(int argc, char **argv)
         if (!_stricmp(argv[i], "irm"))   g_irm = TRUE;
         if (!_stricmp(argv[i], "cmu"))   g_cmu = TRUE;
         if (!_stricmp(argv[i], "plain")) g_cmu = FALSE;
-        if (!_strnicmp(argv[i], "vrate=", 6)) g_vidRate = atoi(argv[i] + 6);
+        // v11 - every one of these switches 'cap' out of the escalation and
+        // into a single, hand-specified configuration, so one run maps to
+        // exactly one hypothesis instead of to a mixture of the three
+        // variants the escalation walks through.
+        if (!_strnicmp(argv[i], "vrate=", 6)) { g_vidRate = atoi(argv[i] + 6); g_one = TRUE; }
+        if (!_strnicmp(argv[i], "ach=",   4)) { g_audCh   = atoi(argv[i] + 4); g_one = TRUE; }
+        if (!_strnicmp(argv[i], "fmt=",   4)) { g_vidFmt  = atoi(argv[i] + 4); g_one = TRUE; }
+        if (!_strnicmp(argv[i], "mode=",  5)) { g_vidMode = atoi(argv[i] + 5); g_one = TRUE; }
+        if (!_strnicmp(argv[i], "vid=",   4)) { g_vidOn   = atoi(argv[i] + 4); g_one = TRUE; }
+        if (!_strnicmp(argv[i], "aud=",   4)) { g_audOn   = atoi(argv[i] + 4); g_one = TRUE; }
+        if (!_strnicmp(argv[i], "vidch=", 6))
+        {
+            const char *w = argv[i] + 6;
+            if      (!_stricmp(w, "same"))  g_vidCh = VID_SAME;
+            else if (!_stricmp(w, "other")) g_vidCh = VID_OTHER;
+            else                            g_vidCh = atoi(w);
+            g_one = TRUE;
+        }
+        if (!_stricmp(argv[i], "one"))          { g_one = TRUE; }
     }
     if (g_irm) LOG("IRM mode: on - the channel/bandwidth claim will be attempted (and will fail)");
     else       LOG("IRM mode: off (pass 'irm' as an extra argument to attempt the claim)");
     LOG("buffer mode: %s (pass 'plain' for v8's ad-hoc numbers, 'cmu' for C1394Camera's)",
         g_cmu ? "CMU-style - 8 x full-frame buffers, 960 B/packet, subBuffers+1"
               : "plain - one small buffer");
-    if (g_vidRate >= 0)
+    if (g_one && !_stricmp(mode, "cap"))
+    {
+        LOG("cap mode: SINGLE configuration (v11) - one run, no escalation");
+        LOG("  ach=%d (-2 = our receive channel)  vid=%d (-1 = as the variant table)"
+            "  vidch=%d (-3 = as the table, -1 = ours, -2 = another)", g_audCh, g_vidOn, g_vidCh);
+        LOG("  aud=%d (-1 = program+enable, 0 = leave the audio unit alone)"
+            "  DCAM rate=%d fmt=%d mode=%d (-1 = leave alone)",
+            g_audOn, g_vidRate, g_vidFmt, g_vidMode);
+    }
+    else if (g_vidRate >= 0)
         LOG("video frame rate override: rate %d (DCAM index, 0=1.875 .. 5=60 fps)", g_vidRate);
 
     HDEVINFO hDev = t1394CmdrGetDeviceList();
@@ -1347,14 +1503,29 @@ int main(int argc, char **argv)
     else if (!_stricmp(mode, "cap"))
     {
         int secs = 3, fch = -1;
-        BOOL cfg = TRUE;
-        if (from == 0) { LOG("usage: isight-audio.exe cap <absBaseHex> [seconds] [channel|auto] [noconfig]"); return 1; }
-        if (argc > 3) secs = atoi(argv[3]);
-        // "auto" must not go through atoi() - that turns it into channel 0,
-        // which is an explicit channel, and the two are completely different
-        // experiments (allocation vs subscribe).
-        if (argc > 4) fch  = _stricmp(argv[4], "auto") ? atoi(argv[4]) : -1;
-        if (argc > 5 && !_stricmp(argv[5], "noconfig")) cfg = FALSE;
+        BOOL cfg = TRUE, sawCh = FALSE;
+        if (from == 0)
+        {
+            LOG("usage: isight-audio.exe cap <absBaseHex> [seconds] [channel|auto] [noconfig]"
+                " [one] [ach=N] [vidch=same|other|N] [vid=0|1] [aud=0|1] [vrate=N] [fmt=N] [mode=N]");
+            return 1;
+        }
+        // v11: the positionals are *scanned*, not indexed.  With "cap <base>
+        // 12 one vidch=0" the old code read argv[4]="one", ran it through
+        // atoi() and got 0 - i.e. silently "explicit channel 0", a completely
+        // different experiment from the auto allocation that was meant.  And
+        // "auto" must still never meet atoi(), for the same reason.
+        for (int i = 3; i < argc; ++i)
+        {
+            const char *a = argv[i];
+            if (!_stricmp(a, "auto"))     { fch = -1;    sawCh = TRUE; continue; }
+            if (!_stricmp(a, "noconfig")) { cfg = FALSE;               continue; }
+            if (strchr(a, '='))                                        continue;
+            if (!_stricmp(a, "one") || !_stricmp(a, "cmu") ||
+                !_stricmp(a, "plain") || !_stricmp(a, "irm"))          continue;
+            if (i == 3)                   secs = atoi(a);
+            else if (!sawCh)              { fch = atoi(a); sawCh = TRUE; }
+        }
         DoCapture(path, from, secs, fch, cfg);
     }
     else if (!_stricmp(mode, "listen"))
@@ -1448,13 +1619,19 @@ int main(int argc, char **argv)
         LOG("       isight-audio.exe irm [lock|unlock <channel>]");
         LOG("       isight-audio.exe listen <chan|auto> [seconds] [bytesPerFrame]");
         LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig]");
+        LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel] one");
+        LOG("                              [ach=N] [vidch=same|other|N] [vid=0|1]");
+        LOG("                              [aud=0|1] [vrate=N] [fmt=N] [mode=N]");
         LOG("       isight-audio.exe vidlisten <chan|auto> [seconds] [bytesPerFrame]");
         LOG("       isight-audio.exe scan <fromHex> <toHex> <stepHex> [timeoutMs]");
         LOG("       isight-audio.exe sweep <fromHex> <count> [timeoutMs]  (relative)");
         LOG("");
-        LOG("cap escalates through four variants: audio only, +AUDIO_ENABLE,");
-        LOG("+AUDIO_ENABLE with the video engine on another channel, then finally");
-        LOG("video engine FIRST and audio second (the camera-clock hypothesis).");
+        LOG("cap escalates through three variants - audio only, +AUDIO_ENABLE, and");
+        LOG("+AUDIO_ENABLE with the video engine on OUR channel (the configuration");
+        LOG("that first produced audio on Windows) - and stops at the first that");
+        LOG("yields bytes.  Add 'one' plus any key=value to run a single explicit");
+        LOG("configuration instead: that is how you tell 'does the audio unit obey");
+        LOG("0x300?' from 'is the video simply eating the microphone's cycles?'.");
         LOG("vidlisten 'auto' lets the driver allocate the channel, like the");
         LOG("working CMU path does; an explicit number is a subscribe, which the");
         LOG("driver may not support at all - compare the two before believing.");
