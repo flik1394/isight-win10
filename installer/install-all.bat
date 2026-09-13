@@ -4,29 +4,34 @@ rem 本文件以 GBK(936) 编码打包，先锁定控制台代码页，避免中
 chcp 936 >nul 2>&1
 rem ============================================================
 rem  install-all.bat  -  注册 Apple iSight (FireWire) DirectShow 摄像头
-rem  v11：必须右键"以管理员身份运行"
+rem  v13：必须右键"以管理员身份运行"
 rem
-rem  这一版让"画面形状"的调整变得可用、可见：
+rem  这一版针对"换了 TI 卡（走 800 口 + 800转400 线）后整机不出画面"：
+rem  实测裸驱动层完全正常（isight-diag.exe 同一分钟能连收 90 帧、0 超时），
+rem  但滤镜启动取流后一帧都拿不到，日志里也没有任何错误 —— 于是：
+rem    1. 加了探针：每 2 秒打印一次 FillBuffer 调用次数 / 相机状态 /
+rem       取帧调用耗时。这样日志能直接指出取帧线程停在哪一步。
+rem    2. 自愈：取流已启动但 4 秒仍无帧时，主动丢弃流并重新上电重连
+rem       （与总线复位走同一条恢复路径），不再干等一个永远不来的超时。
+rem    3. 上一版（v12）的 [layout] mode=fit/blur/fill/stretch 与 guide=1/2/3
+rem       标尺一并带入（target=0 时完全不生效）。
+rem
+rem  上一版（v11）让"画面形状"的调整变得可用、可见：
 rem    1. [layout] hosts=Weixin.exe,WeChat.exe —— 这块"缩进矩形"只对
 rem       名单里的程序生效，QQ 等宿主仍是完整的 640x480 原帧。
 rem    2. [layout] guide=1 —— 直接把标尺画进画面：整帧黄框、矩形红框、
-rem       正中白十字。微信窗口里哪些线看得见，就知道它裁掉了多少，
-rem       于是 target 一次就能对准。
-rem    3. orientation / layout / guide 现在会在通话进行中自动重读
-rem       iSightCam.ini（最多半秒一次），改文件即时生效，不用重开微信。
+rem       正中白十字。微信窗口里哪些线看得见，就知道它裁掉了多少。
+rem    3. orientation / layout / guide 会在通话进行中自动重读 ini。
 rem
-rem  上一版（v10）做了 [layout] target=WxH（把整幅画面缩进宿主实际
-rem  显示的那块矩形、四周填黑，宿主裁到的就是这块矩形，场景就回来了）、
-rem  [format] types= 子类型排序、yuy2=4 朝向模式，并补上 rcSource/rcTarget。
-rem  v9 修"通话中拧掉再拧开相机后所有程序黑屏"（总线监视 + 自动重连）；
-rem  v8 修微信画面颠倒与安装脚本中文乱码。
+rem  更早：v10 [layout] target=WxH + [format] types=；v9 总线复位自动重连；
+rem  v8 修微信画面颠倒与中文乱码。
 rem
 rem  沿用两条保护（曾经把 64 位组件静默漏装过）：
 rem    * 拒绝在 32 位 cmd 里运行
 rem    * 目标文件被占用时先改名再复制，复制后按版本标记自检
 rem ============================================================
 
-set "TAG=ISIGHTFILTER-BUILD-V11-20260912-LAYOUT-LIVE"
+set "TAG=ISIGHTFILTER-BUILD-V13-20260913-ACQPROBE"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
@@ -161,10 +166,10 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V11" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V13" "%~1" >nul 2>&1
 if errorlevel 1 (
-    echo     [FAIL] %~1 里没有 v11 标记 —— 这个文件还是旧版！
+    echo     [FAIL] %~1 里没有 v13 标记 —— 这个文件还是旧版！
     exit /b 1
 )
-for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v11 标记
+for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v13 标记
 exit /b 0
