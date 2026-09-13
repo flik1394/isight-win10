@@ -49,6 +49,24 @@
 //       "sght" packet stream into isight-audio-raw.bin.
 //   isight-audio.exe sweep   [fromHex] [count]     (legacy, now timed)
 //       read a range of RELATIVE quadlets, timed + logged one by one.
+//   isight-audio.exe poke    <absOffsetHex> <valueHex>
+//   isight-audio.exe listen  <chan|auto> [seconds] [bytesPerFrame]
+//       isochronous receive only - writes NOTHING to the camera.
+//
+// WHERE THE AUDIO UNIT ACTUALLY IS (measured, 2026-09-13):
+//   the config ROM carries per-unit "CSR_OFFSET" entries whose key byte is
+//   0x40 (IEEE 1212 / linux/firewire.h: #define CSR_OFFSET 0x40).  For the
+//   Apple audio unit (spec 0x000A27, version 0x000010) that entry reads
+//   40008000, i.e. 0x8000, and linux/sound/firewire/isight.c computes
+//
+//       audio_base = CSR_REGISTER_BASE + value * 4
+//                  = 0xFFFFF0000000 + 0x20000 = 0xFFFFF0020000
+//
+//   which the CMU driver addresses as the absolute offset 0xF0020000.
+//   All eleven audio registers answer there, with a gain range of
+//   -30 dB .. +12 dB (raw 1..43) and 48 kHz already selected.
+//   (Beware: key byte 0x81 is CSR_DESCRIPTOR|CSR_LEAF - the textual
+//   descriptor "iSight" - NOT a CSR offset.  That mistake costs an hour.)
 //
 // Everything is printed to stdout and to isight-audio.txt next to the exe.
 //=====================================================================
@@ -445,77 +463,75 @@ static int DoScan(const char *dev, ULONG from, ULONG to, ULONG step)
 
 //---------------------------------------------------------------------
 // capture
+//
+// The CMU driver wants nChannel == -1 on input to mean "allocate one for
+// me" (that is what C1394Camera::InitResources passes); the driver then
+// writes the chosen channel back into the structure.  Handing it channel 0
+// instead makes it return -1, i.e. no stream at all - which is exactly what
+// the first attempt did.
+//
+// The camera's own transmit channel lives in ISO_TX_CONFIG and is a
+// (channel | speed_index << 16) pair - the speed there is the 0=S100 ..
+// 3=S800 *index*, not the SPEED_FLAGS_* bitmask, so it has to be converted
+// with SpeedFlagToIndex().
 //---------------------------------------------------------------------
-static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh)
+static int SpeedIndex(ULONG flag)
 {
-    LOG("");
-    LOG("== capture: audio base = 0x%08X, %d s, channel %s ==",
-        base, seconds, forcedCh >= 0 ? "forced" : "auto");
-    DoRegs(dev, base);
+    LONG i = SpeedFlagToIndex(flag);
+    if (i < 0 || i > 3) i = 2;                 // S400
+    return (int)i;
+}
 
-    ULONG speed = 0;
-    if (GetMaxIsochSpeed((PSTR)dev, &speed) != ERROR_SUCCESS || speed == 0)
-    {
-        LOG("  GetMaxIsochSpeed -> %lu; assuming 400 Mbps (3)", speed);
-        speed = 3;
-    }
-    LOG("  max isoch speed = %u", speed);
+static int g_lastChannel = -1;
+
+static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dumpRaw)
+{
+    ULONG flag = 0;
+    if (GetMaxIsochSpeed((PSTR)dev, &flag) != ERROR_SUCCESS || flag == 0) flag = SPEED_FLAGS_400;
+    LOG("  max isoch speed flag = 0x%X -> speed index %d (%d Mbps)",
+        flag, SpeedIndex(flag), 100 << SpeedIndex(flag));
 
     ISOCH_QUERY_RESOURCES qr;
     ZeroMemory(&qr, sizeof(qr));
-    ULONG ch = 63;
     if (t1394IsochQueryResources((PSTR)dev, &qr) == ERROR_SUCCESS)
-    {
-        LOG("  channels available = %08X%08X, bytes/frame available = %u",
-            qr.ChannelsAvailable.HighPart, qr.ChannelsAvailable.LowPart, qr.BytesPerFrameAvailable);
-        for (int c = 0; c < 64; ++c)
-        {
-            ULONG bit = (c < 32) ? (1u << c) : 0u;
-            ULONG hi  = (c >= 32) ? (1u << (c - 32)) : 0u;
-            if ((qr.ChannelsAvailable.LowPart & bit) || (qr.ChannelsAvailable.HighPart & hi)) { ch = (ULONG)c; break; }
-        }
-    }
+        LOG("  resources: fulSpeed=0x%X  bytes/frame available=%u  channels=%08X%08X",
+            qr.fulSpeed, qr.BytesPerFrameAvailable,
+            qr.ChannelsAvailable.HighPart, qr.ChannelsAvailable.LowPart);
     else LOG("  IsochQueryResources failed (%lu)", GetLastError());
-    if (forcedCh >= 0) ch = (ULONG)forcedCh;
-    LOG("  using isochronous channel %u", ch);
-
-    WR(dev, base + A_SAMPLE_RATE, A_RATE_48000, "SAMPLE_RATE");
-    WR(dev, base + A_ISO_TX_CONFIG, ch | (speed << 16), "ISO_TX_CONFIG");
-    ULONG v = 0;
-    if (RD(dev, base + A_SAMPLE_RATE, &v, NULL))   LOG("  readback sample rate   = %08X", v);
-    if (RD(dev, base + A_ISO_TX_CONFIG, &v, NULL)) LOG("  readback iso tx config = %08X", v);
 
     ULARGE_INTEGER dmaMax; dmaMax.QuadPart = 0;
     t1394_GetHostDmaCapabilities(dev, NULL, &dmaMax);
     LOG("  host max DMA buffer = %I64u bytes", dmaMax.QuadPart);
 
-    const ULONG bytesPerFrame = A_PAYLOAD_BYTES;
-    const ULONG frameBytes    = bytesPerFrame * 512;
-    PACQUISITION_BUFFER buf = dc1394BuildAcquisitonBuffer(frameBytes,
-                                                          (ULONG)dmaMax.QuadPart,
-                                                          bytesPerFrame, 0);
+    PACQUISITION_BUFFER buf = dc1394BuildAcquisitonBuffer(bpf * 32,
+                                                          (ULONG)dmaMax.QuadPart, bpf, 0);
     if (!buf) { LOG("  BuildAcquisitionBuffer FAILED"); return 2; }
     LOG("  frame buffer: %u sub-buffers, first %u bytes", buf->nSubBuffers, buf->subBuffers[0].ulSize);
 
     ISOCH_STREAM_PARAMS sp;
     ZeroMemory(&sp, sizeof(sp));
-    sp.fulSpeed          = speed;
-    sp.nMaxBytesPerFrame = bytesPerFrame;
-    sp.nChannel          = ch;
+    sp.fulSpeed          = flag;
+    sp.nMaxBytesPerFrame = bpf;
+    sp.nChannel          = (chIn < 0) ? (ULONG)-1 : (ULONG)chIn;
     sp.nMaxBufferSize    = buf->subBuffers[0].ulSize;
-    sp.nNumberOfBuffers  = 4 * buf->nSubBuffers + 1;
+    sp.nNumberOfBuffers  = 8;
 
+    LOG("  SetupStream(in): channel=%s, %u bytes/frame, %u buffers @ %u",
+        chIn < 0 ? "auto(-1)" : "explicit", sp.nMaxBytesPerFrame, sp.nNumberOfBuffers, sp.nMaxBufferSize);
     DWORD r = t1394IsochSetupStream((PSTR)dev, &sp);
-    LOG("  SetupStream -> %lu  (channel %u, %u bytes/frame, %u buffers @ %u)",
-        r, sp.nChannel, sp.nMaxBytesPerFrame, sp.nNumberOfBuffers, sp.nMaxBufferSize);
+    LOG("  SetupStream -> %lu  (channel 0x%X, speed 0x%X, bpf %u, %u buffers)",
+        r, sp.nChannel, sp.fulSpeed, sp.nMaxBytesPerFrame, sp.nNumberOfBuffers);
     if (r != ERROR_SUCCESS) { dc1394FreeAcquisitionBuffer(buf); return 3; }
-
-    if (sp.nChannel != ch)
+    if (sp.nChannel == 0xFFFFFFFFu || sp.nChannel > 63)
     {
-        ch = sp.nChannel;
-        LOG("  driver chose channel %u - telling the camera", ch);
-        WR(dev, base + A_ISO_TX_CONFIG, ch | (speed << 16), "ISO_TX_CONFIG");
+        LOG("  *** the driver did NOT allocate an isochronous channel (0x%X) - cannot receive",
+            sp.nChannel);
+        t1394IsochTearDownStream((PSTR)dev);
+        dc1394FreeAcquisitionBuffer(buf);
+        return 7;
     }
+    g_lastChannel = (int)sp.nChannel;
+    LOG("  receiving on channel %u", sp.nChannel);
 
     HANDLE hdev = OpenDevice(dev, TRUE);
     if (hdev == INVALID_HANDLE_VALUE)
@@ -585,12 +601,54 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh)
     LOG("  capture done: %d completions, %lu bytes -> isight-audio-raw.bin", completions, total);
 
     t1394IsochStop((PSTR)dev);
-    WR(dev, base + A_AUDIO_ENABLE, 0, "AUDIO_ENABLE");
     t1394IsochTearDownStream((PSTR)dev);
     CloseHandle(hdev);
     dc1394FreeAcquisitionBuffer(buf);
-    LOG("  stream stopped, audio enable cleared");
+    LOG("  stream stopped (no camera register was modified)");
+    (void)dumpRaw;
     return 0;
+}
+
+// capture: program the camera, then receive
+static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOOL configTx)
+{
+    LOG("");
+    LOG("== capture: audio base = 0x%08X, %d s, channel %s, camera config %s ==",
+        base, seconds, forcedCh >= 0 ? "forced" : "auto",
+        configTx ? "ON" : "OFF (listen only)");
+    DoRegs(dev, base);
+
+    ULONG tx = 0;
+    int curCh = -1, curSpd = -1;
+    if (RD(dev, base + A_ISO_TX_CONFIG, &tx, NULL))
+    {
+        curCh  = (int)(tx & 0xFFFF);
+        curSpd = (int)((tx >> 16) & 0xFFFF);
+        LOG("  camera currently transmits: channel %d, speed index %d (ISO_TX_CONFIG = 0x%08X)",
+            curCh, curSpd, tx);
+        if (tx == 0 || curCh > 63) { curCh = -1; LOG("  -> that channel is invalid, treating as none"); }
+    }
+
+    if (configTx)
+    {
+        WR(dev, base + A_SAMPLE_RATE, A_RATE_48000, "SAMPLE_RATE");
+    }
+    else LOG("  (not writing SAMPLE_RATE / ISO_TX_CONFIG)");
+
+    ULONG bpf = A_PAYLOAD_BYTES;
+    int rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, bpf, TRUE);
+
+    if (configTx && rc == 0 && g_lastChannel >= 0 && g_lastChannel != curCh)
+    {
+        ULONG flag = SPEED_FLAGS_400;
+        GetMaxIsochSpeed((PSTR)dev, &flag);
+        ULONG v = (ULONG)g_lastChannel | ((ULONG)SpeedIndex(flag) << 16);
+        LOG("  driver gave us channel %d, camera had %d -> re-pointing the camera",
+            g_lastChannel, curCh);
+        WR(dev, base + A_ISO_TX_CONFIG, v, "ISO_TX_CONFIG");
+    }
+    LOG("cap exit code %d", rc);
+    return rc;
 }
 
 //---------------------------------------------------------------------
@@ -625,7 +683,8 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
-    LOG("(v2 - config ROM first, every access individually timed)");
+    LOG("(v3 - audio unit base 0xFFFFF0020000 via CSR_OFFSET 0x8000; listen/poke modes;");
+    LOG("      SetupStream now asks the driver to allocate a channel with nChannel = -1)");
 
     const char *mode = (argc > 1) ? argv[1] : "rom";
     LOG("mode: %s", mode);
@@ -670,18 +729,46 @@ int main(int argc, char **argv)
     else if (!_stricmp(mode, "cap"))
     {
         int secs = 3, fch = -1;
-        if (from == 0) { LOG("usage: isight-audio.exe cap <absBaseHex> [seconds] [channel]"); return 1; }
+        BOOL cfg = TRUE;
+        if (from == 0) { LOG("usage: isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig]"); return 1; }
         if (argc > 3) secs = atoi(argv[3]);
         if (argc > 4) fch  = atoi(argv[4]);
-        int rc = DoCapture(path, from, secs, fch);
-        LOG("cap exit code %d", rc);
+        if (argc > 5 && !_stricmp(argv[5], "noconfig")) cfg = FALSE;
+        DoCapture(path, from, secs, fch, cfg);
+    }
+    else if (!_stricmp(mode, "listen"))
+    {
+        // pure isochronous receive: touches no camera register at all
+        int secs = 3, ch = -1;
+        ULONG bpf = A_PAYLOAD_BYTES;
+        if (argc > 2 && _stricmp(argv[2], "auto")) ch = atoi(argv[2]);
+        if (argc > 3) secs = atoi(argv[3]);
+        if (argc > 4) bpf  = (ULONG)strtoul(argv[4], NULL, 0);
+        LOG("");
+        LOG("== listen only: channel %s, %d s, %u bytes/frame max ==",
+            ch < 0 ? "auto" : "explicit", secs, bpf);
+        int rc = DoReceive(path, ch, secs, bpf, TRUE);
+        LOG("listen exit code %d", rc);
+    }
+    else if (!_stricmp(mode, "poke"))
+    {
+        ULONG val = 0;
+        if (argc < 4) { LOG("usage: isight-audio.exe poke <absOffsetHex> <valueHex>"); return 1; }
+        val = (ULONG)strtoul(argv[3], NULL, 0);
+        LOG("");
+        LOG("== poke 0x%08X <- 0x%08X ==", from, val);
+        WR(path, from, val, "poke");
+        ULONG rb = 0;
+        if (RD(path, from, &rb, NULL)) LOG("  readback = 0x%08X", rb);
     }
     else
     {
         LOG("usage: isight-audio.exe rom [quadlets]");
         LOG("       isight-audio.exe regs <absBaseHex>");
+        LOG("       isight-audio.exe poke <absOffsetHex> <valueHex>");
+        LOG("       isight-audio.exe listen <chan|auto> [seconds] [bytesPerFrame]");
+        LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig]");
         LOG("       isight-audio.exe scan <fromHex> <toHex> <stepHex> [timeoutMs]");
-        LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel]");
         LOG("       isight-audio.exe sweep <fromHex> <count> [timeoutMs]  (relative)");
     }
 
