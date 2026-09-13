@@ -107,8 +107,15 @@
 // the DCAM video unit (0xFFFFF0F00000), used here as a *known good
 // transmitter* so the receive path can be validated without the CMU
 // video code (which would occupy the device's single isoch stream).
+//
+// NOTE on addressing: the video unit must be reached with *relative*
+// offsets.  CMU's driver keeps the camera's CSR offset (0xF00000, i.e.
+// the IIDC base 0xFFFFF0F00000) in its device extension and adds it to
+// any offset that does not start with 0xF, so plain 0x60C is what
+// C1394Camera itself uses - reading 0xF0F00600 on the other hand fails,
+// because the absolute form encodes 0x0FFFF0000000 + (offset & 0x0FFFFFFF).
 //---------------------------------------------------------------------
-#define VIDEO_ABS_BASE    0xF0F00000UL
+#define VIDEO_ABS_BASE    0UL       // relative offsets - see note above
 #define V_FRAME_RATE      0x600
 #define V_VIDEO_MODE      0x604
 #define V_VIDEO_FORMAT    0x608
@@ -971,6 +978,11 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
+    LOG("(v7 - v6 plus one addressing fix: the DCAM video registers are only");
+    LOG("      reachable with *relative* offsets (the CMU driver adds the camera's");
+    LOG("      CSR offset 0xF00000 = the IIDC base), whereas the audio unit needs");
+    LOG("      the absolute form 0xF0020000.  v6's vidlisten/vregs used the absolute");
+    LOG("      form for video and every access silently failed.)");
     LOG("(v6 - two reference implementations read, both agree with our register set:");
     LOG("      Linux sound/firewire/isight.c and FreeBSD's new fwisound.c.  Their");
     LOG("      sequences are SAMPLE_RATE -> ISO_TX_CONFIG -> AUDIO_ENABLE, and the");
@@ -1065,7 +1077,7 @@ int main(int argc, char **argv)
     else if (!_stricmp(mode, "vregs"))
     {
         LOG("");
-        LOG("== video unit (absolute 0x%08X) DCAM registers ==", VIDEO_ABS_BASE);
+        LOG("== video unit DCAM registers (relative offsets, driver adds 0xF00000) ==");
         const struct { ULONG off; const char *n; } vr[] = {
             { V_FRAME_RATE,   "FRAME_RATE"   },
             { V_VIDEO_MODE,   "VIDEO_MODE"   },
@@ -1080,6 +1092,8 @@ int main(int argc, char **argv)
             ULONG v = 0;
             if (RD(path, VIDEO_ABS_BASE + vr[i].off, &v, NULL))
                 LOG("  %04X  %-14s = 0x%08X", vr[i].off, vr[i].n, v);
+            else
+                LOG("  %04X  %-14s = <no answer>", vr[i].off, vr[i].n);
         }
     }
     else if (!_stricmp(mode, "irm"))
