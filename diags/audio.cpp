@@ -133,6 +133,14 @@
 // reserve the channel and the bandwidth *before* pointing a device at
 // it.  iSight's firmware may simply refuse to start its audio engine on
 // a channel that nobody has claimed.
+//
+// MEASURED on 2026-09-13: reading these four offsets works and returns
+// the pristine bus state (BANDWIDTH_AVAILABLE = 4915, CHANNELS_AVAILABLE
+// LO = FFFFFFFF, HI = FFFFFFFE), but every WRITE is refused by the driver
+// and the register reads back unchanged.  CMU can only address the camera
+// node, and the isochronous resource manager is the host controller, so
+// a genuine allocation cannot be done from here - it needs code that can
+// send a lock/write transaction to the LOCAL node (i.e. a driver).
 //---------------------------------------------------------------------
 #define IRM_BW_AVAIL      0xF0000220UL          // -> 0xFFFFF0000220
 #define IRM_CH_HI         0xF0000224UL          // channels 32..63
@@ -842,11 +850,19 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
-    LOG("(v4 - audio unit at 0xF0020000; SetupStream allocates the channel, THEN the");
-    LOG("      camera is pointed at it, THEN we listen - the old order never worked)");
+    LOG("(v5 - audio unit at 0xF0020000; correct SetupStream -> camera -> listen order,");
+    LOG("      plus the IRM experiment.  FINDING: the IRM CSRs at 0xF0000220/0224/0228");
+    LOG("      READ fine (bandwidth 4915 units, all 32 channels free) but every WRITE");
+    LOG("      is refused and reads back unchanged - CMU can only address the camera");
+    LOG("      node, so a real bus allocation needs code that talks to the LOCAL IRM.)");
 
     const char *mode = (argc > 1) ? argv[1] : "rom";
     LOG("mode: %s", mode);
+
+    for (int i = 1; i < argc; ++i)
+        if (!_stricmp(argv[i], "irm")) g_irm = TRUE;
+    if (g_irm) LOG("IRM mode: on - the channel/bandwidth claim will be attempted (and will fail)");
+    else       LOG("IRM mode: off (pass 'irm' as an extra argument to attempt the claim)");
 
     HDEVINFO hDev = t1394CmdrGetDeviceList();
     if (hDev == INVALID_HANDLE_VALUE) { LOG("t1394CmdrGetDeviceList FAILED"); return 1; }
