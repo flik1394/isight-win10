@@ -229,6 +229,11 @@ static const GUID CLSID_ISightFireWireCam =
 // is refused) has burned this project more than once.
 #define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V14-20260913-BUFFERLOOP"
 
+// Public release number.  The build tag above changes on every internal
+// iteration (and install-all.bat greps for its "V14" prefix); this one is
+// what a user sees and what the GitHub release is named after.
+#define ISIGHT_RELEASE   "1.0.0"
+
 //---------------------------------------------------------------------
 // AMPROPSETID_Pin -- the pin category property set.
 //
