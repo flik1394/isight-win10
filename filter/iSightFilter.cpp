@@ -175,6 +175,27 @@
 //     (fresh handle, fresh node address) instead of waiting for a timeout
 //     that never comes.  See the [recovery] notes -- this is the same path a
 //     bus reset takes, so it cannot make a working camera worse.
+//
+// v14 additions -- the probe answered, and it was not the camera:
+//   * the v13 probe walked straight into the real failure: with the stock
+//     NullRenderer the filter's FillBuffer entry count freezes at 1, zero
+//     frames are delivered, and the renderer reports EC_COMPLETE while the
+//     graph is still Running.  Reading the base classes (Win7Samples
+//     baseclasses/source.cpp) explains it: CSourceStream::DoBufferProcessing
+//     Loop() returns -- and the worker thread parks on its request queue for
+//     good -- as soon as Deliver() returns anything other than S_OK.  The
+//     camera is then never asked for another frame.  The host sees a
+//     connected camera that never produces a picture, with no error, and the
+//     only cure is for the host to throw the graph away and build it again.
+//     That is exactly what QQ.exe left in the log on the previous build
+//     (connected twice, 0 frames).
+//   * so we take the loop over: a rejected delivery is retried (up to ~1.2 s)
+//     instead of being fatal, GetDeliveryBuffer failures are logged, and the
+//     loop's entry/exit is logged, which separates "the host stopped calling
+//     us" from "we are stuck in the driver" without guesswork.
+//   * the bus-monitor heartbeat now also reports loopRuns and shouts
+//     "STREAM PARKED" when the FillBuffer counter stops moving, so a dead
+//     graph is identifiable from a log alone.
 //=====================================================================
 
 #include <windows.h>
@@ -206,7 +227,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V13-20260913-ACQPROBE"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V14-20260913-BUFFERLOOP"
 
 //---------------------------------------------------------------------
 // AMPROPSETID_Pin -- the pin category property set.
@@ -1382,6 +1403,16 @@ public:
     HRESULT Active();
     HRESULT Inactive();
 
+    // v14: the stock buffer loop gives up for good the moment Deliver()
+    // reports anything other than S_OK -- it returns from
+    // DoBufferProcessingLoop() and the worker thread parks on its request
+    // queue, so FillBuffer() is never called again and the graph stays
+    // "connected" with a frozen picture until the host tears it down.  A
+    // host that starts the graph while its renderer is still transitioning
+    // gets exactly that.  We take the loop over so a rejected sample is
+    // retried instead of being fatal.
+    HRESULT DoBufferProcessingLoop();
+
     // IAMStreamConfig
     STDMETHODIMP SetFormat(AM_MEDIA_TYPE *pmt);
     STDMETHODIMP GetFormat(AM_MEDIA_TYPE **ppmt);
@@ -1454,6 +1485,8 @@ private:
     volatile LONG    m_acqCalls;       // AcquireImageEx calls since Active
     volatile LONG    m_lastAcqEnterMs; // tick when the current acquire began
     volatile LONG    m_acqBlockedMs;   // duration of the last AcquireImageEx
+    LONG             m_rejectStreak;   // v14: consecutive rejected deliveries
+    LONG             m_loopRuns;       // v14: buffer-loop entries (thread alive)
     volatile LONG    m_acqStartMs;     // tick when acquisition was started
 };
 
@@ -1554,6 +1587,8 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_acqCalls(0)
     , m_lastAcqEnterMs(0)
     , m_acqBlockedMs(0)
+    , m_rejectStreak(0)
+    , m_loopRuns(0)
     , m_acqStartMs(0)
 {
     m_monPath[0] = 0;
@@ -1645,6 +1680,8 @@ DWORD WINAPI CiSightStream::BusMonThunk(LPVOID p)
     bool   wasPresent = false;
     int    openFails = 0;
     int    hb = 0;                                  // v12 probe heartbeat counter
+    LONG   lastFb = -1;                             // v14: FillBuffer entry count
+    int    stuck  = 0;                              // v14: consecutive frozen ticks
 
     for (;;)
     {
@@ -1659,11 +1696,30 @@ DWORD WINAPI CiSightStream::BusMonThunk(LPVOID p)
         if (++hb >= 10)                             // 10 x 200 ms = 2 s
         {
             hb = 0;
-            FLog("probe: fbCalls=%ld frames=%lu acquiring=%d cam=%p init=%d acqCalls=%ld acqBlockedMs=%ld",
+            FLog("probe: fbCalls=%ld frames=%lu acquiring=%d cam=%p init=%d acqCalls=%ld acqBlockedMs=%ld loopRuns=%ld",
                  (long)self->m_fbCalls, self->m_frameCount,
                  self->m_bAcquiring ? 1 : 0, (void *)self->m_pCam,
                  self->m_bInit ? 1 : 0, (long)self->m_acqCalls,
-                 (long)self->m_acqBlockedMs);
+                 (long)self->m_acqBlockedMs, (long)self->m_loopRuns);
+
+            // v14: the killer signature.  The streaming thread only stops
+            // calling FillBuffer when the buffer loop has returned -- which
+            // is what the stock loop does as soon as Deliver() fails.  Say
+            // so out loud, because from the host side this looks like a
+            // connected but dead camera, with no error anywhere.
+            const LONG fbNow = (LONG)self->m_fbCalls;
+            if (fbNow != lastFb)
+            {
+                lastFb = fbNow;
+                stuck  = 0;
+            }
+            else if (++stuck == 4 || (stuck % 15) == 0)
+            {
+                FLog("probe: STREAM PARKED -- FillBuffer frozen at #%ld for %ds "
+                     "(loopRuns=%ld frames=%lu acquiring=%d)",
+                     (long)fbNow, stuck * 2, (long)self->m_loopRuns,
+                     self->m_frameCount, self->m_bAcquiring ? 1 : 0);
+            }
         }
 
         if (dev == INVALID_HANDLE_VALUE)
@@ -2076,6 +2132,7 @@ HRESULT CiSightStream::Active()
     InterlockedExchange(&m_fbCalls, 0);
     InterlockedExchange(&m_acqCalls, 0);
     InterlockedExchange(&m_acqBlockedMs, 0);
+    m_rejectStreak = 0;
     InterlockedExchange(&m_acqStartMs, 0);
     HRESULT hr = CSourceStream::Active();
     if (FAILED(hr))
@@ -2118,6 +2175,114 @@ HRESULT CiSightStream::Inactive()
 // fast enough to pick the camera up as soon as it has booted, slow enough
 // not to hammer a camera that is switched off.
 static const DWORD kBringUpRetryMs = 1000;
+
+//---------------------------------------------------------------------
+// v14: our own copy of the base class buffer loop.
+//
+// The stock CSourceStream::DoBufferProcessingLoop() (Win7Samples base
+// classes) stops for good in two situations that must not be fatal:
+//
+//   * Deliver() returned anything but S_OK -- a renderer that is still
+//     transitioning, or one that is momentarily rejecting samples, ends
+//     the loop.  The worker thread then parks on its request queue and
+//     FillBuffer() is never called again: the graph looks connected, the
+//     host shows a frozen (or black) picture, and only the host can
+//     recover by tearing the graph down and building it again.
+//   * FillBuffer() returned S_FALSE -- same effect, plus EndOfStream.
+//
+// Measured on this machine: a graph built against the stock NullRenderer
+// stops after exactly one sample (FillBuffer entry count freezes at 1,
+// zero frames, the renderer reports EC_COMPLETE while the graph is still
+// Running) -- the same "connected but 0 frames" signature that QQ.exe
+// left in the log on the previous build.
+//
+// So: log everything, and treat a rejected delivery as transient.  After
+// kMaxRejects consecutive rejections we let the stock behaviour through,
+// because at that point the downstream really is gone.
+//---------------------------------------------------------------------
+#define ISIGHT_MAX_REJECTS 120          // ~1.2 s of retries, 10 ms apart
+
+HRESULT CiSightStream::DoBufferProcessingLoop(void)
+{
+    Command com;
+
+    InterlockedIncrement(&m_loopRuns);
+    FLog("stream: buffer loop #%ld enter (fbCalls=%ld frames=%lu)",
+         (long)m_loopRuns, (long)m_fbCalls, m_frameCount);
+
+    OnThreadStartPlay();
+
+    do {
+        while (!CheckRequest(&com))
+        {
+            IMediaSample *pSample = NULL;
+
+            HRESULT hr = GetDeliveryBuffer(&pSample, NULL, NULL, 0);
+            if (FAILED(hr))
+            {
+                // the stock loop spins here as well: the allocator may be
+                // decommitted or still busy, either way it is not fatal
+                if (m_rejectStreak <= 3)
+                    FLog("stream: GetDeliveryBuffer -> 0x%08X (waiting)", (unsigned)hr);
+                Sleep(1);
+                continue;
+            }
+
+            hr = FillBuffer(pSample);
+
+            if (hr == S_OK)
+            {
+                hr = Deliver(pSample);
+                pSample->Release();
+
+                if (hr != S_OK)
+                {
+                    ++m_rejectStreak;
+                    if (m_rejectStreak <= 3 || (m_rejectStreak % 25) == 0)
+                        FLog("stream: downstream rejected sample -> 0x%08X (streak %ld) -- retrying",
+                             (unsigned)hr, m_rejectStreak);
+
+                    if (m_rejectStreak > ISIGHT_MAX_REJECTS)
+                    {
+                        FLog("stream: %ld rejected samples in a row -> ending the stream (0x%08X)",
+                             m_rejectStreak, (unsigned)hr);
+                        return S_OK;            // same as the stock loop
+                    }
+                    Sleep(10);                  // do not spin on a busy renderer
+                    continue;
+                }
+                m_rejectStreak = 0;
+            }
+            else if (hr == S_FALSE)
+            {
+                pSample->Release();
+                FLog("stream: FillBuffer asked to stop (S_FALSE) -> EndOfStream");
+                DeliverEndOfStream();
+                return S_OK;
+            }
+            else
+            {
+                pSample->Release();
+                FLog("stream: FillBuffer failed 0x%08X -> EndOfStream + EC_ERRORABORT", (unsigned)hr);
+                DeliverEndOfStream();
+                m_pFilter->NotifyEvent(EC_ERRORABORT, hr, 0);
+                return hr;
+            }
+        }
+
+        if (com == CMD_RUN || com == CMD_PAUSE)
+            Reply(NOERROR);
+        else if (com != CMD_STOP)
+        {
+            Reply((DWORD) E_UNEXPECTED);
+            FLog("stream: unexpected command %d", (int)com);
+        }
+    } while (com != CMD_STOP);
+
+    FLog("stream: buffer loop #%ld exit (CMD_STOP, fbCalls=%ld frames=%lu)",
+         (long)m_loopRuns, (long)m_fbCalls, m_frameCount);
+    return S_FALSE;
+}
 
 HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
 {
