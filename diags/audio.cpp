@@ -588,6 +588,19 @@ static int g_audCh = -2;
 static int g_vidFmt  = -1;
 static int g_vidMode = -1;
 
+// v12: override for nMaxBytesPerFrame - the per-isoch-packet budget we hand
+// the driver (and the stride of the DMA ring it builds).  -1 keeps the
+// caller's value (1916 for audio = Apple's largest audio packet).
+//
+// Why this exists: raw_forensics on the v11 dumps shows consecutive "sght"
+// signatures exactly 960 bytes apart, i.e. the camera's *audio* isochronous
+// packet is 960 bytes - the very number C1394Camera uses for video.  We have
+// been handing the driver 1916, which is almost exactly 2x that, and we lose
+// almost exactly 50% of the audio.  1916/960 ~= 2 is too neat to ignore, so
+// pkt=960 (and a couple of neighbours) is a one-number A/B test of whether
+// the DMA stride is what is eating every other packet.
+static int g_pkt = -1;
+
 // v11: single-configuration mode.  v9/v10 both *escalated* through variants
 // and stopped at the first one that produced bytes - which conflated the
 // settings (v9's winner was "audio ch0 + video ch0 because -1 meant
@@ -896,12 +909,8 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     // driver to expect 8, and received nothing at all; that difference is
     // what this variant exists to test.
     ULONG frameSize = bpf * 32;
-    ULONG pktSize   = bpf;      // = nMaxBytesPerFrame; the caller knows the
-                                // real packet budget (4096 for the video self
-                                // test, 1916 for audio - Apple's largest
-                                // audio packet).  Never shrink it to CMU's
-                                // 960: that is a *video* number and would
-                                // truncate every audio packet.
+    // v12: pkt=N overrides the per-packet budget (see g_pkt above).
+    ULONG pktSize   = (g_pkt >= 0) ? (ULONG)g_pkt : bpf;
     int   nAcq      = 1;
     if (cmuStyle)
     {
@@ -981,6 +990,19 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
 
     ULONG vOldCh = 0, vOldEn = 0;
     BOOL  vSaved = FALSE;
+
+    // v12: snapshot the DCAM format / mode / frame rate so the overrides can
+    // be put back.  (See the restore block at the end of this function: v10
+    // left the camera at 3.75 fps and that leaked into later experiments.)
+    ULONG dcamSaved[3] = { 0, 0, 0 };       // 0 = rate (0x600), 1 = mode (0x604), 2 = format (0x608)
+    BOOL  dcamOk        = FALSE;
+    BOOL  overrodeFmt   = (g_vidFmt  >= 0);
+    BOOL  overrodeMode  = (g_vidMode >= 0);
+    BOOL  overrodeRate  = (vidRate   >= 0);
+    if (vidEnable)
+        dcamOk = RD(dev, VIDEO_ABS_BASE + V_FRAME_RATE,   &dcamSaved[0], NULL) &&
+                 RD(dev, VIDEO_ABS_BASE + V_VIDEO_MODE,   &dcamSaved[1], NULL) &&
+                 RD(dev, VIDEO_ABS_BASE + V_VIDEO_FORMAT, &dcamSaved[2], NULL);
 
     HANDLE hdev = OpenDevice(dev, TRUE);
     if (hdev == INVALID_HANDLE_VALUE)
@@ -1129,6 +1151,20 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
         WR(dev, VIDEO_ABS_BASE + V_ISO_ENABLE, 0, "V_ISO_ENABLE(stop)");
         if (vSaved)
             WR(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, vOldCh, "V_ISO_CHANNEL(restore)");
+        // v12: put the DCAM format / mode / frame rate back as well.  v10's
+        // last variant forced the frame rate to 3.75 fps and nothing restored
+        // it - the camera was still at rate 1 the next morning (vregs read
+        // 0x600 = 0x20000000), which silently redefined what "the baseline"
+        // means for every experiment that followed.  Only restore what this
+        // run actually changed, and say so.
+        if (dcamOk && (overrodeFmt || overrodeMode || overrodeRate))
+        {
+            LOG("  restoring the camera's DCAM settings: rate=0x%08X mode=0x%08X format=0x%08X",
+                dcamSaved[0], dcamSaved[1], dcamSaved[2]);
+            WR(dev, VIDEO_ABS_BASE + V_VIDEO_FORMAT, dcamSaved[2], "restore VIDEO_FORMAT");
+            WR(dev, VIDEO_ABS_BASE + V_VIDEO_MODE,   dcamSaved[1], "restore VIDEO_MODE");
+            WR(dev, VIDEO_ABS_BASE + V_FRAME_RATE,   dcamSaved[0], "restore FRAME_RATE");
+        }
     }
     if (cfgBase && enableAudio)
         WR(dev, cfgBase + A_AUDIO_ENABLE, 0, "AUDIO_ENABLE");
@@ -1434,6 +1470,8 @@ int main(int argc, char **argv)
         if (!_strnicmp(argv[i], "ach=",   4)) { g_audCh   = atoi(argv[i] + 4); g_one = TRUE; }
         if (!_strnicmp(argv[i], "fmt=",   4)) { g_vidFmt  = atoi(argv[i] + 4); g_one = TRUE; }
         if (!_strnicmp(argv[i], "mode=",  5)) { g_vidMode = atoi(argv[i] + 5); g_one = TRUE; }
+        // v12: nMaxBytesPerFrame override - see g_pkt.
+        if (!_strnicmp(argv[i], "pkt=",   4)) { g_pkt     = atoi(argv[i] + 4); g_one = TRUE; }
         if (!_strnicmp(argv[i], "vid=",   4)) { g_vidOn   = atoi(argv[i] + 4); g_one = TRUE; }
         if (!_strnicmp(argv[i], "aud=",   4)) { g_audOn   = atoi(argv[i] + 4); g_one = TRUE; }
         if (!_strnicmp(argv[i], "vidch=", 6))
@@ -1459,6 +1497,9 @@ int main(int argc, char **argv)
         LOG("  aud=%d (-1 = program+enable, 0 = leave the audio unit alone)"
             "  DCAM rate=%d fmt=%d mode=%d (-1 = leave alone)",
             g_audOn, g_vidRate, g_vidFmt, g_vidMode);
+        if (g_pkt >= 0)
+            LOG("  pkt=%d bytes/frame (overrides the 1916 default; the camera's audio"
+                " isoch packets are 960 bytes apart in the dump)", g_pkt);
     }
     else if (g_vidRate >= 0)
         LOG("video frame rate override: rate %d (DCAM index, 0=1.875 .. 5=60 fps)", g_vidRate);
