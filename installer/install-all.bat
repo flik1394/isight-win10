@@ -4,34 +4,32 @@ rem 本文件以 GBK(936) 编码打包，先锁定控制台代码页，避免中
 chcp 936 >nul 2>&1
 rem ============================================================
 rem  install-all.bat  -  注册 Apple iSight (FireWire) DirectShow 摄像头
-rem  v13：必须右键"以管理员身份运行"
+rem  v14：必须右键"以管理员身份运行"
 rem
-rem  这一版针对"换了 TI 卡（走 800 口 + 800转400 线）后整机不出画面"：
-rem  实测裸驱动层完全正常（isight-diag.exe 同一分钟能连收 90 帧、0 超时），
-rem  但滤镜启动取流后一帧都拿不到，日志里也没有任何错误 —— 于是：
-rem    1. 加了探针：每 2 秒打印一次 FillBuffer 调用次数 / 相机状态 /
-rem       取帧调用耗时。这样日志能直接指出取帧线程停在哪一步。
-rem    2. 自愈：取流已启动但 4 秒仍无帧时，主动丢弃流并重新上电重连
-rem       （与总线复位走同一条恢复路径），不再干等一个永远不来的超时。
-rem    3. 上一版（v12）的 [layout] mode=fit/blur/fill/stretch 与 guide=1/2/3
-rem       标尺一并带入（target=0 时完全不生效）。
+rem  这一版修的是"连上了却永远不出画面"（QQ/微信都会遇到，日志里表现为
+rem  FillBuffer 调用次数冻住不动、零帧、程序不报任何错）：
+rem    1. 根因已定位到 Microsoft DirectShow 基类本身：
+rem       CSourceStream::DoBufferProcessingLoop() 只要 Deliver() 返回的不是
+rem       S_OK（宿主的渲染器还在切换状态、或一时拒收一个样本），它就
+rem       return 出去，取流线程随即永久停在命令队列上 —— 此后再也不调用
+rem       FillBuffer，画面永远是黑的，宿主只能自己重建整条链路。
+rem    2. 本版直接接管这个循环：被拒收的样本按 10ms 间隔重试（最多约
+rem       1.2 秒），而不是当场判死；持续被拒才按原行为退出。
+rem    3. 顺带把循环的进入/退出、GetDeliveryBuffer 失败、被拒样本都写进
+rem       日志；总线监视线程还会在 FillBuffer 计数停住时直接喊
+rem       "STREAM PARKED"，死画面从此可以在日志里一眼认出来。
 rem
-rem  上一版（v11）让"画面形状"的调整变得可用、可见：
-rem    1. [layout] hosts=Weixin.exe,WeChat.exe —— 这块"缩进矩形"只对
-rem       名单里的程序生效，QQ 等宿主仍是完整的 640x480 原帧。
-rem    2. [layout] guide=1 —— 直接把标尺画进画面：整帧黄框、矩形红框、
-rem       正中白十字。微信窗口里哪些线看得见，就知道它裁掉了多少。
-rem    3. orientation / layout / guide 会在通话进行中自动重读 ini。
-rem
-rem  更早：v10 [layout] target=WxH + [format] types=；v9 总线复位自动重连；
-rem  v8 修微信画面颠倒与中文乱码。
+rem  上一版（v13）加了取帧探针与"4 秒无帧自愈"；v12 的 [layout] mode=
+rem  （fit/blur/fill/stretch）与 guide 标尺一并带入（target=0 时完全不生效）。
+rem  更早：v11 [layout] hosts=/guide=、v10 target=WxH + [format] types=、
+rem  v9 总线复位自动重连、v8 修微信画面颠倒与中文乱码。
 rem
 rem  沿用两条保护（曾经把 64 位组件静默漏装过）：
 rem    * 拒绝在 32 位 cmd 里运行
 rem    * 目标文件被占用时先改名再复制，复制后按版本标记自检
 rem ============================================================
 
-set "TAG=ISIGHTFILTER-BUILD-V13-20260913-ACQPROBE"
+set "TAG=ISIGHTFILTER-BUILD-V14-20260913-BUFFERLOOP"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
@@ -166,10 +164,10 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V13" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V14" "%~1" >nul 2>&1
 if errorlevel 1 (
-    echo     [FAIL] %~1 里没有 v13 标记 —— 这个文件还是旧版！
+    echo     [FAIL] %~1 里没有 v14 标记 —— 这个文件还是旧版！
     exit /b 1
 )
-for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v13 标记
+for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v14 标记
 exit /b 0
