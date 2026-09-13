@@ -2927,7 +2927,7 @@ public:
         if (pUnkOuter != NULL && !IsEqualIID(riid, IID_IUnknown))
             return CLASS_E_NOAGGREGATION;
 
-        FLog("=== %s ===", ISIGHT_BUILD_TAG);
+        FLog("=== iSightCam %s / %s ===", ISIGHT_RELEASE, ISIGHT_BUILD_TAG);
         FLog("CreateInstance: riid=%s requested by %s", GuidName(riid), HostExeName());
 
         HRESULT hr = S_OK;
