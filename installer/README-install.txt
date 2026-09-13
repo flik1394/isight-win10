@@ -1,4 +1,4 @@
-iSightCam 安装说明（Apple iSight FireWire 摄像头 → Windows 标准摄像头）
+iSightCam 1.0.0 安装说明（Apple iSight FireWire 摄像头 → Windows 标准摄像头）
 ==========================================================================
 
 包内文件：
