@@ -483,8 +483,10 @@ static int SpeedIndex(ULONG flag)
 }
 
 static int g_lastChannel = -1;
+static int g_lastCompletions = -1;
 
-static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dumpRaw)
+static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dumpRaw,
+                     ULONG cfgBase, int restoreCh, BOOL enableAudio)
 {
     ULONG flag = 0;
     if (GetMaxIsochSpeed((PSTR)dev, &flag) != ERROR_SUCCESS || flag == 0) flag = SPEED_FLAGS_400;
@@ -532,6 +534,20 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     }
     g_lastChannel = (int)sp.nChannel;
     LOG("  receiving on channel %u", sp.nChannel);
+
+    // NOW tell the camera which channel we are listening on.  Doing this
+    // before SetupStream is useless: we only learn the allocated channel
+    // from the driver's reply, and C1394Camera::InitResources() has the
+    // same ordering (setup stream, then write the channel to the camera).
+    if (cfgBase)
+    {
+        WR(dev, cfgBase + A_SAMPLE_RATE, A_RATE_48000, "SAMPLE_RATE");
+        ULONG txv = sp.nChannel | ((ULONG)SpeedIndex(flag) << 16);
+        LOG("  -> camera: channel %u, speed index %d", sp.nChannel, SpeedIndex(flag));
+        WR(dev, cfgBase + A_ISO_TX_CONFIG, txv, "ISO_TX_CONFIG");
+        if (enableAudio)
+            WR(dev, cfgBase + A_AUDIO_ENABLE, 0x80000000, "AUDIO_ENABLE");
+    }
 
     HANDLE hdev = OpenDevice(dev, TRUE);
     if (hdev == INVALID_HANDLE_VALUE)
@@ -598,18 +614,29 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     }
 
     if (raw) fclose(raw);
+    g_lastCompletions = completions;
     LOG("  capture done: %d completions, %lu bytes -> isight-audio-raw.bin", completions, total);
 
     t1394IsochStop((PSTR)dev);
     t1394IsochTearDownStream((PSTR)dev);
     CloseHandle(hdev);
     dc1394FreeAcquisitionBuffer(buf);
-    LOG("  stream stopped (no camera register was modified)");
+    LOG("  stream stopped");
+
+    if (cfgBase && enableAudio)
+        WR(dev, cfgBase + A_AUDIO_ENABLE, 0, "AUDIO_ENABLE");
+    if (cfgBase && restoreCh >= 0)
+    {
+        ULONG txv = (ULONG)restoreCh | ((ULONG)SpeedIndex(flag) << 16);
+        LOG("  restoring the camera's original transmit channel %d", restoreCh);
+        WR(dev, cfgBase + A_ISO_TX_CONFIG, txv, "ISO_TX_CONFIG");
+    }
     (void)dumpRaw;
     return 0;
 }
 
-// capture: program the camera, then receive
+// capture: program the camera, then receive.  NOTE the order - SetupStream
+// first (that is what allocates the channel), then the camera, then listen.
 static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOOL configTx)
 {
     LOG("");
@@ -619,33 +646,27 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOO
     DoRegs(dev, base);
 
     ULONG tx = 0;
-    int curCh = -1, curSpd = -1;
+    int curCh = -1;
     if (RD(dev, base + A_ISO_TX_CONFIG, &tx, NULL))
     {
-        curCh  = (int)(tx & 0xFFFF);
-        curSpd = (int)((tx >> 16) & 0xFFFF);
+        curCh = (int)(tx & 0xFFFF);
         LOG("  camera currently transmits: channel %d, speed index %d (ISO_TX_CONFIG = 0x%08X)",
-            curCh, curSpd, tx);
+            curCh, (int)((tx >> 16) & 0xFFFF), tx);
         if (tx == 0 || curCh > 63) { curCh = -1; LOG("  -> that channel is invalid, treating as none"); }
     }
 
-    if (configTx)
+    int rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
+                       configTx ? base : 0,
+                       configTx ? curCh : -1,
+                       FALSE);
+    if (rc == 0 && configTx && g_lastCompletions == 0)
     {
-        WR(dev, base + A_SAMPLE_RATE, A_RATE_48000, "SAMPLE_RATE");
-    }
-    else LOG("  (not writing SAMPLE_RATE / ISO_TX_CONFIG)");
-
-    ULONG bpf = A_PAYLOAD_BYTES;
-    int rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, bpf, TRUE);
-
-    if (configTx && rc == 0 && g_lastChannel >= 0 && g_lastChannel != curCh)
-    {
-        ULONG flag = SPEED_FLAGS_400;
-        GetMaxIsochSpeed((PSTR)dev, &flag);
-        ULONG v = (ULONG)g_lastChannel | ((ULONG)SpeedIndex(flag) << 16);
-        LOG("  driver gave us channel %d, camera had %d -> re-pointing the camera",
-            g_lastChannel, curCh);
-        WR(dev, base + A_ISO_TX_CONFIG, v, "ISO_TX_CONFIG");
+        LOG("");
+        LOG("  nothing arrived on the plain attempt.  Linux defines AUDIO_ENABLE =");
+        LOG("  0x80000000 but never writes it, and the register reads back 0, so try");
+        LOG("  turning the audio engine on explicitly and listening again ...");
+        rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
+                       base, curCh, TRUE);
     }
     LOG("cap exit code %d", rc);
     return rc;
@@ -683,8 +704,8 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
-    LOG("(v3 - audio unit base 0xFFFFF0020000 via CSR_OFFSET 0x8000; listen/poke modes;");
-    LOG("      SetupStream now asks the driver to allocate a channel with nChannel = -1)");
+    LOG("(v4 - audio unit at 0xF0020000; SetupStream allocates the channel, THEN the");
+    LOG("      camera is pointed at it, THEN we listen - the old order never worked)");
 
     const char *mode = (argc > 1) ? argv[1] : "rom";
     LOG("mode: %s", mode);
@@ -747,7 +768,7 @@ int main(int argc, char **argv)
         LOG("");
         LOG("== listen only: channel %s, %d s, %u bytes/frame max ==",
             ch < 0 ? "auto" : "explicit", secs, bpf);
-        int rc = DoReceive(path, ch, secs, bpf, TRUE);
+        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1);
         LOG("listen exit code %d", rc);
     }
     else if (!_stricmp(mode, "poke"))
