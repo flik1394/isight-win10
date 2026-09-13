@@ -29,6 +29,7 @@ rem    * 拒绝在 32 位 cmd 里运行
 rem    * 目标文件被占用时先改名再复制，复制后按版本标记自检
 rem ============================================================
 
+set "REL=1.0.0"
 set "TAG=ISIGHTFILTER-BUILD-V14-20260913-BUFFERLOOP"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
@@ -37,7 +38,7 @@ set "DST32=%SystemRoot%\SysWOW64\iSightCam.ax"
 
 echo ============================================================
 echo  Apple iSight (FireWire) DirectShow 滤镜 安装程序
-echo  目标版本标记: %TAG%
+echo  版本 iSightCam %REL%     目标版本标记: %TAG%
 echo ============================================================
 echo.
 
