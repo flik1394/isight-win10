@@ -103,6 +103,19 @@
 #define A_PAYLOAD_BYTES   (A_HEADER_BYTES + A_MAX_FRAMES * 4)   // 1916
 #define A_SIGNATURE       0x73676874u                           // "sght"
 
+//---------------------------------------------------------------------
+// the DCAM video unit (0xFFFFF0F00000), used here as a *known good
+// transmitter* so the receive path can be validated without the CMU
+// video code (which would occupy the device's single isoch stream).
+//---------------------------------------------------------------------
+#define VIDEO_ABS_BASE    0xF0F00000UL
+#define V_FRAME_RATE      0x600
+#define V_VIDEO_MODE      0x604
+#define V_VIDEO_FORMAT    0x608
+#define V_ISO_CHANNEL     0x60C     // channel/speed, packed per 1394a/b mode
+#define V_ISO_ENABLE      0x614     // 0x80000000 starts the video stream
+#define V_ISO_ENABLE_ON   0x80000000u
+
 // the CMU driver treats offsets whose top nibble is 0xF as absolute
 #define ABS_FLAG          0xF0000000UL
 #define ABS_IS(o)         (((o) & ABS_FLAG) == ABS_FLAG)
@@ -612,7 +625,8 @@ static void IrmReleaseBandwidth(const char *dev)
 }
 
 static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dumpRaw,
-                     ULONG cfgBase, int restoreCh, BOOL enableAudio)
+                     ULONG cfgBase, int restoreCh, BOOL enableAudio, BOOL vidEnable,
+                     int vidCh)
 {
     ULONG flag = 0;
     if (GetMaxIsochSpeed((PSTR)dev, &flag) != ERROR_SUCCESS || flag == 0) flag = SPEED_FLAGS_400;
@@ -652,12 +666,28 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     if (r != ERROR_SUCCESS) { dc1394FreeAcquisitionBuffer(buf); return 3; }
     if (sp.nChannel == 0xFFFFFFFFu || sp.nChannel > 63)
     {
-        LOG("  *** the driver did NOT allocate an isochronous channel (0x%X) - cannot receive",
-            sp.nChannel);
-        t1394IsochTearDownStream((PSTR)dev);
-        dc1394FreeAcquisitionBuffer(buf);
-        return 7;
+        if (chIn >= 0)
+        {
+            // Explicit channel, and this reply is CMU's "subscribe" outcome: the
+            // driver set the stream up on the channel we asked for but did not
+            // *allocate* one, so it reports "none".  C1394Camera::InitResources()
+            // does exactly the same for ACQ_SUBSCRIBE_ONLY - it fills nChannel
+            // from the camera's own 0x60C register and never checks the reply.
+            LOG("  the driver allocated no channel (0x%X) but we asked for %d ->", sp.nChannel, chIn);
+            LOG("  treating this as a subscribe on channel %d (ACQ_SUBSCRIBE_ONLY behaviour)", chIn);
+            sp.nChannel = (ULONG)chIn;
+        }
+        else
+        {
+            LOG("  *** the driver did NOT allocate an isochronous channel (0x%X) - cannot receive",
+                sp.nChannel);
+            t1394IsochTearDownStream((PSTR)dev);
+            dc1394FreeAcquisitionBuffer(buf);
+            return 7;
+        }
     }
+    else if (chIn >= 0 && (int)sp.nChannel != chIn)
+        LOG("  NOTE: asked for channel %d, the driver answered %u", chIn, sp.nChannel);
     g_lastChannel = (int)sp.nChannel;
     LOG("  receiving on channel %u", sp.nChannel);
 
@@ -686,6 +716,30 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
         WR(dev, cfgBase + A_ISO_TX_CONFIG, txv, "ISO_TX_CONFIG");
         if (enableAudio)
             WR(dev, cfgBase + A_AUDIO_ENABLE, 0x80000000, "AUDIO_ENABLE");
+    }
+
+    // Apple's programming guide: "an audio packet will never be sent in the same
+    // isochronous cycle as a video packet" - the audio engine fills the gaps
+    // between video packets.  So bring the video engine up on the *same*
+    // channel and see whether audio starts flowing only then.
+    ULONG vOldCh = 0, vOldEn = 0;
+    BOOL  vSaved = FALSE;
+    if (vidEnable)
+    {
+        if (RD(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, &vOldCh, NULL) &&
+            RD(dev, VIDEO_ABS_BASE + V_ISO_ENABLE,  &vOldEn, NULL))
+            vSaved = TRUE;
+        // Apple: video and audio are sent on *different* isochronous channels,
+        // so never point the video engine at the audio channel.
+        ULONG vc = (vidCh >= 0) ? (ULONG)vidCh
+                                : ((sp.nChannel == 0) ? 1u : 0u);
+        ULONG v = vOldCh, si = (ULONG)SpeedIndex(flag);
+        if (vOldCh & 0x00008000) v = (v & 0xFFFF8000u) | ((vc & 0x3F) << 8) | si;
+        else                     v = (v & 0x0000FFFFu) | (vc << 28) | (si << 24);
+        LOG("  -> video 0x60C = 0x%08X (video channel %lu, audio channel %u) was 0x%08X",
+            v, vc, sp.nChannel, vOldCh);
+        WR(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, v, "V_ISO_CHANNEL");
+        WR(dev, VIDEO_ABS_BASE + V_ISO_ENABLE,  V_ISO_ENABLE_ON, "V_ISO_ENABLE");
     }
 
     HANDLE hdev = OpenDevice(dev, TRUE);
@@ -762,6 +816,12 @@ static int DoReceive(const char *dev, int chIn, int seconds, ULONG bpf, BOOL dum
     dc1394FreeAcquisitionBuffer(buf);
     LOG("  stream stopped");
 
+    if (vidEnable)
+    {
+        WR(dev, VIDEO_ABS_BASE + V_ISO_ENABLE, 0, "V_ISO_ENABLE(stop)");
+        if (vSaved)
+            WR(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, vOldCh, "V_ISO_CHANNEL(restore)");
+    }
     if (cfgBase && enableAudio)
         WR(dev, cfgBase + A_AUDIO_ENABLE, 0, "AUDIO_ENABLE");
     if (cfgBase && restoreCh >= 0)
@@ -801,20 +861,81 @@ static int DoCapture(const char *dev, ULONG base, int seconds, int forcedCh, BOO
         if (tx == 0 || curCh > 63) { curCh = -1; LOG("  -> that channel is invalid, treating as none"); }
     }
 
-    int rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
-                       configTx ? base : 0,
-                       configTx ? curCh : -1,
-                       FALSE);
-    if (rc == 0 && configTx && g_lastCompletions == 0)
+    struct { const char *what; BOOL audio, video; } variants[] = {
+        { "1/3  plain: SAMPLE_RATE + ISO_TX_CONFIG only",                   FALSE, FALSE },
+        { "2/3  + AUDIO_ENABLE = 0x80000000 (what Linux/FreeBSD write)",    TRUE,  FALSE },
+        { "3/3  + audio enable AND the video engine on the same channel",    TRUE,  TRUE  },
+    };
+
+    int rc = 0;
+    if (!configTx)
     {
-        LOG("");
-        LOG("  nothing arrived on the plain attempt.  Linux defines AUDIO_ENABLE =");
-        LOG("  0x80000000 but never writes it, and the register reads back 0, so try");
-        LOG("  turning the audio engine on explicitly and listening again ...");
         rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
-                       base, curCh, TRUE);
+                       0, -1, FALSE, FALSE, -1);
+    }
+    else
+    {
+        for (int v = 0; v < 3; ++v)
+        {
+            LOG("");
+            LOG("  ---------- variant %s ----------", variants[v].what);
+            rc = DoReceive(dev, forcedCh >= 0 ? forcedCh : -1, seconds, A_PAYLOAD_BYTES, TRUE,
+                           base, curCh, variants[v].audio, variants[v].video, -1);
+            if (g_lastCompletions > 0)
+            {
+                LOG("  *** variant %d produced data - stopping the escalation ***", v + 1);
+                break;
+            }
+        }
     }
     LOG("cap exit code %d", rc);
+    return rc;
+}
+
+//---------------------------------------------------------------------
+// validate the receive path with a known-good transmitter: the camera's
+// own DCAM video engine, started by hand on a channel of our choosing.
+// If this yields nothing, then "the camera stays silent" is not a
+// conclusion we are allowed to draw - our listener would be at fault.
+//---------------------------------------------------------------------
+static int DoVidListen(const char *dev, int ch, int seconds, ULONG bpf)
+{
+    if (ch < 0 || ch > 63) { LOG("vidlisten needs an explicit channel 0..63"); return 1; }
+
+    ULONG flag = 0;
+    if (GetMaxIsochSpeed((PSTR)dev, &flag) != ERROR_SUCCESS || flag == 0) flag = SPEED_FLAGS_400;
+    ULONG si = (ULONG)SpeedIndex(flag);
+
+    ULONG oldRate = 0, oldMode = 0, oldFmt = 0, oldCh = 0, oldEn = 0;
+    BOOL okCh = RD(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, &oldCh, NULL);
+    RD(dev, VIDEO_ABS_BASE + V_FRAME_RATE,  &oldRate, NULL);
+    RD(dev, VIDEO_ABS_BASE + V_VIDEO_MODE,  &oldMode, NULL);
+    RD(dev, VIDEO_ABS_BASE + V_VIDEO_FORMAT, &oldFmt, NULL);
+    RD(dev, VIDEO_ABS_BASE + V_ISO_ENABLE,  &oldEn, NULL);
+
+    LOG("");
+    LOG("== receive-path self test: video engine -> channel %d, %d s, %u bytes/frame max ==",
+        ch, seconds, bpf);
+    LOG("   video unit before: rate=0x%08X mode=0x%08X format=0x%08X isoch=0x%08X enable=0x%08X",
+        oldRate, oldMode, oldFmt, oldCh, oldEn);
+
+    ULONG v = oldCh;
+    if (oldCh & 0x00008000) v = (v & 0xFFFF8000u) | (((ULONG)ch & 0x3F) << 8) | si;
+    else                    v = (v & 0x0000FFFFu) | ((ULONG)ch << 28) | (si << 24);
+    LOG("   video 0x60C <- 0x%08X (channel %d), then 0x614 <- 0x80000000", v, ch);
+    WR(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, v, "V_ISO_CHANNEL");
+    WR(dev, VIDEO_ABS_BASE + V_ISO_ENABLE,  V_ISO_ENABLE_ON, "V_ISO_ENABLE");
+
+    int rc = DoReceive(dev, ch, seconds, bpf, TRUE, 0, -1, FALSE, FALSE, -1);
+
+    WR(dev, VIDEO_ABS_BASE + V_ISO_ENABLE, 0, "V_ISO_ENABLE(stop)");
+    if (okCh) WR(dev, VIDEO_ABS_BASE + V_ISO_CHANNEL, oldCh, "V_ISO_CHANNEL(restore)");
+    if (g_lastCompletions > 0)
+        LOG("   ===> the receive path WORKS: %d completions, the video stream was captured",
+            g_lastCompletions);
+    else
+        LOG("   ===> the receive path produced NOTHING even for a stream that is known to work");
+    LOG("vidlisten exit code %d", rc);
     return rc;
 }
 
@@ -850,11 +971,17 @@ int main(int argc, char **argv)
 {
     g_log = fopen("isight-audio.txt", "w");
     LOG("=== iSight audio probe %s ===", __TIMESTAMP__);
-    LOG("(v5 - audio unit at 0xF0020000; correct SetupStream -> camera -> listen order,");
-    LOG("      plus the IRM experiment.  FINDING: the IRM CSRs at 0xF0000220/0224/0228");
-    LOG("      READ fine (bandwidth 4915 units, all 32 channels free) but every WRITE");
-    LOG("      is refused and reads back unchanged - CMU can only address the camera");
-    LOG("      node, so a real bus allocation needs code that talks to the LOCAL IRM.)");
+    LOG("(v6 - two reference implementations read, both agree with our register set:");
+    LOG("      Linux sound/firewire/isight.c and FreeBSD's new fwisound.c.  Their");
+    LOG("      sequences are SAMPLE_RATE -> ISO_TX_CONFIG -> AUDIO_ENABLE, and the");
+    LOG("      FreeBSD driver reserves NOTHING in the IRM, so the IRM hypothesis is");
+    LOG("      dead.  v6 therefore (a) accepts CMU's 'subscribe' reply (explicit");
+    LOG("      channel: success + 0xFFFFFFFF means 'no allocation, listening on the");
+    LOG("      channel you named'), (b) adds vidlisten, a receive-path self test");
+    LOG("      using the camera's own video engine, and (c) escalates cap through");
+    LOG("      the three 'why is the camera silent' variants, the last of which");
+    LOG("      runs the video engine on the same channel because Apple's guide says");
+    LOG("      audio packets are only sent in the gaps between video packets.)");
 
     const char *mode = (argc > 1) ? argv[1] : "rom";
     LOG("mode: %s", mode);
@@ -922,8 +1049,38 @@ int main(int argc, char **argv)
         LOG("");
         LOG("== listen only: channel %s, %d s, %u bytes/frame max ==",
             ch < 0 ? "auto" : "explicit", secs, bpf);
-        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE);
+        int rc = DoReceive(path, ch, secs, bpf, TRUE, 0, -1, FALSE, FALSE, -1);
         LOG("listen exit code %d", rc);
+    }
+    else if (!_stricmp(mode, "vidlisten"))
+    {
+        // self test: start the camera's video engine on <chan> and receive it
+        int ch = 1, secs = 3;
+        ULONG bpf = 4096;
+        if (argc > 2) ch = atoi(argv[2]);
+        if (argc > 3) secs = atoi(argv[3]);
+        if (argc > 4) bpf = (ULONG)strtoul(argv[4], NULL, 0);
+        DoVidListen(path, ch, secs, bpf);
+    }
+    else if (!_stricmp(mode, "vregs"))
+    {
+        LOG("");
+        LOG("== video unit (absolute 0x%08X) DCAM registers ==", VIDEO_ABS_BASE);
+        const struct { ULONG off; const char *n; } vr[] = {
+            { V_FRAME_RATE,   "FRAME_RATE"   },
+            { V_VIDEO_MODE,   "VIDEO_MODE"   },
+            { V_VIDEO_FORMAT, "VIDEO_FORMAT" },
+            { V_ISO_CHANNEL,  "ISO_CHANNEL"  },
+            { 0x610,          "0x610"        },
+            { V_ISO_ENABLE,   "ISO_ENABLE"   },
+            { 0x618,          "0x618"        },
+        };
+        for (int i = 0; i < 7; ++i)
+        {
+            ULONG v = 0;
+            if (RD(path, VIDEO_ABS_BASE + vr[i].off, &v, NULL))
+                LOG("  %04X  %-14s = 0x%08X", vr[i].off, vr[i].n, v);
+        }
     }
     else if (!_stricmp(mode, "irm"))
     {
@@ -960,18 +1117,18 @@ int main(int argc, char **argv)
     else
     {
         LOG("usage: isight-audio.exe rom [quadlets]");
-        LOG("       isight-audio.exe regs <absBaseHex>");
+        LOG("       isight-audio.exe regs <absBaseHex>          (audio unit registers)");
+        LOG("       isight-audio.exe vregs                      (video unit DCAM registers)");
         LOG("       isight-audio.exe poke <absOffsetHex> <valueHex>");
         LOG("       isight-audio.exe irm [lock|unlock <channel>]");
-        LOG("       isight-audio.exe listen <chan|auto> [seconds] [bytesPerFrame] [irm]");
-        LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig] [irm]");
+        LOG("       isight-audio.exe listen <chan|auto> [seconds] [bytesPerFrame]");
+        LOG("       isight-audio.exe cap <absBaseHex> [seconds] [channel] [noconfig]");
+        LOG("       isight-audio.exe vidlisten <channel> [seconds] [bytesPerFrame]");
         LOG("       isight-audio.exe scan <fromHex> <toHex> <stepHex> [timeoutMs]");
         LOG("       isight-audio.exe sweep <fromHex> <count> [timeoutMs]  (relative)");
         LOG("");
-        LOG("The word 'irm' anywhere on the command line makes the tool claim the");
-        LOG("isochronous channel and bandwidth before it points the camera at them.");
-        LOG("       isight-audio.exe scan <fromHex> <toHex> <stepHex> [timeoutMs]");
-        LOG("       isight-audio.exe sweep <fromHex> <count> [timeoutMs]  (relative)");
+        LOG("cap escalates through three variants: plain, +AUDIO_ENABLE, and");
+        LOG("+AUDIO_ENABLE with the video engine running on the same channel.");
     }
 
     LOG("=== done === (abandoned register threads: %d)", g_leakedThreads);
