@@ -15,6 +15,15 @@
 //        /LIBPATH:<WDK km x64 lib> portcls.lib ks.lib drmk.lib ntoskrnl.lib
 //        hal.lib wmilib.lib wdmsec.lib /OUT:isightmic.sys isightmic.obj
 
+// INITGUID must come before any header that uses DEFINE_GUID.  PortCls
+// declares its interface IIDs (IID_IMiniportWaveCyclic, IID_IMiniport,
+// IID_IServiceSink, ...) with DEFINE_GUID, which without INITGUID is a bare
+// `extern const GUID` and links nowhere -- there is no library that defines
+// them for a miniport that does not import them through a class factory.
+// With INITGUID they are emitted here as DECLSPEC_SELECTANY definitions, so
+// QueryInterface has something to compare against.
+#define INITGUID
+
 #include <ntddk.h>
 #include <wdmsec.h>
 #include <portcls.h>
