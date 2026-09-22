@@ -68,7 +68,8 @@ static void RingInit(PRING r) {
 
 // Drop the oldest audio rather than block the feeder: this is a microphone,
 // and a late sample is worth less than the next one.
-static void RingPush(PRING r, const PUCHAR src, ULONG n) {
+// (src is a *mutable* pointer: we skip forward over the data we have to drop.)
+static void RingPush(PRING r, PUCHAR src, ULONG n) {
     if (r->Buffer == NULL || n == 0) return;
     KIRQL irql;
     KeAcquireSpinLock(&r->Lock, &irql);
@@ -138,26 +139,27 @@ public:
     STDMETHODIMP_(NTSTATUS) GetPosition(OUT PULONG Position);
     STDMETHODIMP_(NTSTATUS) NormalizePhysicalPosition(IN OUT PLONGLONG PhysicalPosition);
     STDMETHODIMP_(NTSTATUS) SetFormat(IN PKSDATAFORMAT DataFormat);
-    STDMETHODIMP_(NTSTATUS) SetNotificationFreq(IN ULONG Interval, OUT PULONG FrameSize);
+    // Note: returns ULONG (the previous interval), not NTSTATUS.
+    STDMETHODIMP_(ULONG)    SetNotificationFreq(IN ULONG Interval, OUT PULONG FrameSize);
     STDMETHODIMP_(NTSTATUS) SetState(IN KSSTATE State);
     STDMETHODIMP_(void)     Silence(IN PVOID Buffer, IN ULONG ByteCount);
 
-    NTSTATUS Init(IN PCMiniportWaveCyclic Miniport,
-                  IN PPORTWAVECYCLICSTREAM PortStream,
-                  IN ULONG Pin,
+    // Private helper.  No port-side stream interface is handed to a WaveCyclic
+    // miniport here (the port reaches the stream through the service group), so
+    // this only records what the caller told us.
+    NTSTATUS Init(IN ULONG Pin,
                   IN BOOLEAN Capture,
                   IN PKSDATAFORMAT DataFormat);
 
     void Service();
 
-    PCMiniportWaveCyclic   m_Miniport;
     PPORTWAVECYCLIC        m_Port;
-    PPORTWAVECYCLICSTREAM  m_PortStream;
     PSERVICEGROUP          m_ServiceGroup;
     PDMACHANNEL            m_DmaChannel;
     PVOID                  m_Buffer;
     ULONG                  m_BufferSize;
     ULONG                  m_Position;
+    ULONG                  m_NotificationInterval;
     KSSTATE                m_State;
     KTIMER                 m_Timer;
     KDPC                   m_Dpc;
@@ -169,14 +171,13 @@ protected:
 
 CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {
     UNREFERENCED_PARAMETER(outer);
-    m_Miniport = NULL;
     m_Port = NULL;
-    m_PortStream = NULL;
     m_ServiceGroup = NULL;
     m_DmaChannel = NULL;
     m_Buffer = NULL;
     m_BufferSize = 0;
     m_Position = 0;
+    m_NotificationInterval = 0;
     m_State = KSSTATE_STOP;
     m_TimerOn = FALSE;
     m_RefCount = 1;
@@ -192,7 +193,6 @@ CMiniportWaveCyclicStream::~CMiniportWaveCyclicStream() {
         m_DmaChannel = NULL;
     }
     if (m_ServiceGroup) { m_ServiceGroup->Release(); m_ServiceGroup = NULL; }
-    if (m_PortStream)   { m_PortStream->Release();   m_PortStream = NULL; }
 }
 
 STDMETHODIMP CMiniportWaveCyclicStream::QueryInterface(REFIID iid, PVOID* ppv) {
@@ -248,12 +248,15 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(IN PKSDATAFORMAT Da
     return STATUS_SUCCESS;
 }
 
-STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetNotificationFreq(IN ULONG Interval,
-                                                                       OUT PULONG FrameSize) {
-    UNREFERENCED_PARAMETER(Interval);
+// Returns the *previous* notification interval -- that is what this method is
+// specified to report, not a status code.
+STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::SetNotificationFreq(IN ULONG Interval,
+                                                                   OUT PULONG FrameSize) {
+    ULONG previous = m_NotificationInterval;
+    m_NotificationInterval = Interval;
     // We service on a fixed 10 ms timer; report the matching frame count.
     if (FrameSize) *FrameSize = ISIGHTMIC_SAMPLERATE / 100;
-    return STATUS_SUCCESS;
+    return previous;
 }
 
 STDMETHODIMP_(void) CMiniportWaveCyclicStream::Silence(IN PVOID Buffer, IN ULONG ByteCount) {
@@ -276,17 +279,14 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetState(IN KSSTATE State) {
     return STATUS_SUCCESS;
 }
 
-NTSTATUS CMiniportWaveCyclicStream::Init(IN PCMiniportWaveCyclic Miniport,
-                                         IN PPORTWAVECYCLICSTREAM PortStream,
-                                         IN ULONG Pin,
+NTSTATUS CMiniportWaveCyclicStream::Init(IN ULONG Pin,
                                          IN BOOLEAN Capture,
                                          IN PKSDATAFORMAT DataFormat) {
     UNREFERENCED_PARAMETER(Pin);
     UNREFERENCED_PARAMETER(Capture);
     UNREFERENCED_PARAMETER(DataFormat);
-    m_Miniport = Miniport;
-    m_PortStream = PortStream;
-    if (PortStream) PortStream->AddRef();
+    // The cyclic buffer is sized in SetFormat, once the port has picked the
+    // format it actually wants to run.
     return STATUS_SUCCESS;
 }
 
@@ -345,7 +345,9 @@ public:
     STDMETHODIMP_(ULONG) Release();
 
     // IMiniport
-    STDMETHODIMP_(NTSTATUS) GetDescription(OUT PPCFILTER_DESCRIPTOR Description);
+    // IMiniport -- note the extra '*': IMiniport::GetDescription takes a
+    // PPCFILTER_DESCRIPTOR * (a pointer to the caller's out-pointer).
+    STDMETHODIMP_(NTSTATUS) GetDescription(OUT PPCFILTER_DESCRIPTOR *Description);
     STDMETHODIMP_(NTSTATUS) DataRangeIntersection(IN ULONG PinId,
                                                   IN PKSDATARANGE DataRange,
                                                   IN PKSDATARANGE MatchingDataRange,
@@ -513,7 +515,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
     }
     if (!NT_SUCCESS(st)) { s->Release(); return st; }
 
-    st = s->Init(this, NULL, Pin, TRUE, DataFormat);
+    st = s->Init(Pin, TRUE, DataFormat);
     if (!NT_SUCCESS(st)) { s->Release(); return st; }
 
     // Service group: PortCls calls the stream back through it when we notify.
@@ -535,7 +537,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
     return STATUS_SUCCESS;
 }
 
-STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::GetDescription(OUT PPCFILTER_DESCRIPTOR Description) {
+STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::GetDescription(OUT PPCFILTER_DESCRIPTOR *Description) {
     if (!Description) return STATUS_INVALID_PARAMETER;
     *Description = &WaveFilterDescriptor;
     return STATUS_SUCCESS;
@@ -585,7 +587,9 @@ public:
     STDMETHODIMP_(ULONG) AddRef();
     STDMETHODIMP_(ULONG) Release();
 
-    STDMETHODIMP_(NTSTATUS) GetDescription(OUT PPCFILTER_DESCRIPTOR Description);
+    // IMiniport -- note the extra '*': IMiniport::GetDescription takes a
+    // PPCFILTER_DESCRIPTOR * (a pointer to the caller's out-pointer).
+    STDMETHODIMP_(NTSTATUS) GetDescription(OUT PPCFILTER_DESCRIPTOR *Description);
     STDMETHODIMP_(NTSTATUS) DataRangeIntersection(IN ULONG PinId,
                                                   IN PKSDATARANGE DataRange,
                                                   IN PKSDATARANGE MatchingDataRange,
@@ -719,7 +723,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportTopology::Init(IN PUNKNOWN UnknownAdapter,
     return STATUS_SUCCESS;
 }
 
-STDMETHODIMP_(NTSTATUS) CMiniportTopology::GetDescription(OUT PPCFILTER_DESCRIPTOR Description) {
+STDMETHODIMP_(NTSTATUS) CMiniportTopology::GetDescription(OUT PPCFILTER_DESCRIPTOR *Description) {
     if (!Description) return STATUS_INVALID_PARAMETER;
     *Description = &TopologyFilterDescriptor;
     return STATUS_SUCCESS;
