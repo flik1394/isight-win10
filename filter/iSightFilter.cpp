@@ -227,7 +227,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V14-20260913-BUFFERLOOP"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V15-20260922-HOSTGATE"
 
 // Public release number.  The build tag above changes on every internal
 // iteration (and install-all.bat greps for its "V14" prefix); this one is
@@ -547,6 +547,14 @@ struct ISightOptions
     int  layoutMode;                // [layout] mode= fit | blur | fill | stretch
     int  blurCells;                 // [layout] blur=  backdrop block, source pixels
     int  blurShade;                 // [layout] dim=   backdrop brightness, 100 = off
+    // v15 -- which processes this filter is willing to come up in at all.
+    // Some hosts crash while merely enumerating a capture filter they cannot
+    // drive (measured: QQ.exe died every time its audio settings page was
+    // opened with this filter registered).  Refusing to instantiate keeps the
+    // filter invisible to them without unregistering it, so the camera stays
+    // available to the hosts that do work.
+    char allow[256];                // [host] allow=...  empty = every host
+    char deny[256];                 // [host] deny=...   never instantiates here
 };
 
 enum LayoutMode
@@ -685,7 +693,25 @@ static void WriteDefaultIni(const char *path)
         ";blur=16\n"
         ";dim=70\n"
         ";hosts=Weixin.exe,WeChat.exe\n"
-        ";guide=0\n");
+        ";guide=0\n"
+        ";\n"
+        "; host: which processes this filter comes up in AT ALL.  Some hosts\n"
+        "; crash while merely enumerating a capture filter they cannot drive --\n"
+        "; QQ.exe died every time its audio settings page was opened while this\n"
+        "; filter was registered, and unregistering it was the only cure.  So\n"
+        "; instead of uninstalling the camera, refuse to instantiate it inside\n"
+        "; those processes: they see the device, ask for it, get a plain\n"
+        "; failure, and carry on.  No camera code runs in a denied process at\n"
+        "; all -- no CMU library, no 1394 handle, no worker threads.\n"
+        ";\n"
+        ";   deny   never instantiate in these processes (checked first)\n"
+        ";   allow  instantiate ONLY in these processes; empty = every host\n"
+        ";\n"
+        "; Process names, case-insensitive, comma separated.  Remove a name\n"
+        "; (or set deny=) to let that host use the camera again.\n"
+        "[host]\n"
+        "deny=QQ.exe,TIM.exe,QQExternal.exe,QQProtect.exe\n"
+        ";allow=Weixin.exe,WeChat.exe,obs64.exe\n");
     fclose(f);
 }
 
@@ -768,6 +794,14 @@ static const ISightOptions &Opts()
         if (s_o.blurShade < 10)  s_o.blurShade = 10;
         if (s_o.blurShade > 100) s_o.blurShade = 100;
 
+        // [host] allow= / deny=  (v15)  -- see the note on the option itself.
+        // deny wins over allow: it is the switch that gets a crashing host
+        // working again, so it must not be accidentally overridden.
+        GetPrivateProfileStringA("host", "allow", "", s_o.allow, sizeof(s_o.allow), ini);
+        GetPrivateProfileStringA("host", "deny",
+                                 "QQ.exe,TIM.exe,QQExternal.exe,QQProtect.exe",
+                                 s_o.deny, sizeof(s_o.deny), ini);
+
         FLog("options: yuy2=%s rgb=%s dump=%d busmon=%d bootdelay=%dms (ini=%s)",
              OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
              s_o.dump ? 1 : 0, s_o.busMon ? 1 : 0, s_o.bootDelayMs, ini);
@@ -817,13 +851,28 @@ static bool HostInList(const char *list)
     if (list == NULL || list[0] == '\0')
         return true;
 
-    char tmp[160] = "";
+    char tmp[256] = "";
     _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s", list);
     const char *me = HostExeName();
     for (char *p = strtok(tmp, ",; \t"); p != NULL; p = strtok(NULL, ",; \t"))
         if (ContainsNoCase(me, p))
             return true;
     return false;
+}
+
+// v15: may this process instantiate the filter at all?
+//
+// deny wins over allow.  It exists for hosts that crash on a capture filter
+// they cannot drive: refusing to instantiate is what keeps QQ's settings
+// page alive while the camera stays available to everything else.
+static bool HostAllowed()
+{
+    const ISightOptions &o = Opts();
+    if (o.deny[0] != '\0' && HostInList(o.deny))
+        return false;
+    if (o.allow[0] != '\0' && !HostInList(o.allow))
+        return false;
+    return true;
 }
 
 // the rectangle the layout applies to right now, or 0/0 when it is off
@@ -2929,6 +2978,16 @@ public:
     {
         CheckPointer(ppv, E_POINTER);
         *ppv = NULL;
+
+        // v15: a host that crashes on this filter never gets one.  Checked
+        // before anything else, so a denied host runs none of the camera
+        // code -- no CMU library, no 1394 handle, no worker threads.  It is
+        // what lets QQ open its audio settings again (measured: it died on
+        // every attempt while the filter was registered) without giving up
+        // the camera in the hosts that do work.
+        if (!HostAllowed())
+            return E_FAIL;
+
         if (pUnkOuter != NULL && !IsEqualIID(riid, IID_IUnknown))
             return CLASS_E_NOAGGREGATION;
 
