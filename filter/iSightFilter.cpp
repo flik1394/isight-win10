@@ -2985,8 +2985,11 @@ public:
         // what lets QQ open its audio settings again (measured: it died on
         // every attempt while the filter was registered) without giving up
         // the camera in the hosts that do work.
-        if (!HostAllowed())
+        if (!HostAllowed()) {
+            FLog("host gate: DENIED %s -- CreateInstance refused, no camera code runs",
+                 HostExeName());
             return E_FAIL;
+        }
 
         if (pUnkOuter != NULL && !IsEqualIID(riid, IID_IUnknown))
             return CLASS_E_NOAGGREGATION;
