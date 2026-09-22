@@ -122,9 +122,23 @@ jobs:
           Get-ChildItem "$kits\10\bin" -Directory -ErrorAction SilentlyContinue |
             Select-Object -ExpandProperty Name
 
+      # -------------------------------------------------------------------
+      # Test-signing.  One landmine here, hit twice already: importing the
+      # throwaway cert into the machine's Root store makes certutil /
+      # Import-Certificate pop a confirmation dialog that nobody answers, so
+      # the step sits there until the job times out.  The log of run
+      # 35746443369 ends exactly that way --
+      #     [4/6] trusting the cert for this runner only
+      #     ##[error]The operation was canceled.      (7 minutes later)
+      # So: create the cert, export the .cer, and let the *target* machine
+      # trust it (install-mic.bat does that, no dialog can block it there).
+      # Every sub-step also prints a marker first, so a stall is localisable.
+      # -------------------------------------------------------------------
       - name: Test-sign the driver and build its catalog
         shell: pwsh
         run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $ErrorActionPreference = 'Stop'
           # Progress markers: if this ever stalls again the log says where.
           Write-Host "[1/6] checking tools"
           if (-not $env:inf2cat_PATH) { throw "inf2cat.exe not found anywhere under Windows Kits" }
@@ -147,36 +161,32 @@ jobs:
                   -NotAfter (Get-Date).AddYears(10)
           Write-Host "  thumbprint = $($cert.Thumbprint)"
           Export-Certificate -Cert $cert -FilePath micpkg\iSightMicTest.cer | Out-Null
+          Get-Item micpkg\iSightMicTest.cer | Select-Object Name, Length
 
-          # signtool refuses to sign unless the certificate chains to a trusted
-          # root ("A certificate chain processed, but terminated in a root
-          # certificate which is not trusted"), and a self-signed cert is its own
-          # root.  certutil -addstore is non-interactive; Import-Certificate can
-          # block on the Root store, which hung an earlier run.
-          Write-Host "[4/6] trusting the cert for this runner only"
-          & certutil -user -f -addstore Root micpkg\iSightMicTest.cer | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Warning "certutil addstore Root returned $LASTEXITCODE" }
-          & certutil -user -f -addstore TrustedPublisher micpkg\iSightMicTest.cer | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Warning "certutil addstore TrustedPublisher returned $LASTEXITCODE" }
-
-          Write-Host "[5/6] building the catalog from the INF"
+          # Deliberately NOT trusted into Root here.  signtool *signs* fine with a
+          # self-signed cert (it printed "Successfully signed" for both files
+          # before this comment existed); only `signtool verify` demands a
+          # trusted chain, and that is a check for the target machine anyway.
+          Write-Host "[4/6] building the catalog from the INF"
           & $env:inf2cat_PATH /driver:micpkg /os:10_X64 /verbose
           if ($LASTEXITCODE -ne 0) { throw "inf2cat failed ($LASTEXITCODE)" }
 
-          Write-Host "[6/6] signing the driver and the catalog"
+          Write-Host "[5/6] signing the driver and the catalog"
           foreach ($f in 'micpkg\isightmic.sys', 'micpkg\isightmic.cat') {
-            & $env:signtool_PATH sign /v /fd SHA256 /sha1 $cert.Thumbprint `
-                                    /ac micpkg\iSightMicTest.cer $f
+            & $env:signtool_PATH sign /fd SHA256 /sha1 $cert.Thumbprint $f
             if ($LASTEXITCODE -ne 0) { throw "sign $f failed ($LASTEXITCODE)" }
           }
-          # Deliberately no `signtool verify /pa`: it needs a WHQL-style trusted
-          # chain and can block on revocation lookups, neither of which is
-          # meaningful for a throwaway test certificate.
+
+          Write-Host "[6/6] done"
+          # No `signtool verify` here on purpose: /pa requires the root to be
+          # trusted, which a throwaway test cert never is, so it would only ever
+          # report a failure that does not matter.
           Get-ChildItem micpkg | Select-Object Name, Length
 
       - name: Assemble package
         shell: pwsh
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           New-Item -ItemType Directory -Force -Path pkg | Out-Null
           Copy-Item micpkg\* pkg\ -Force
           Copy-Item isight-micsvc.exe, isight-micdev.exe, sample.wav pkg\ -Force
@@ -190,9 +200,36 @@ jobs:
             [IO.File]::WriteAllText("pkg\$f", $text, $gbk)
           }
           Get-ChildItem pkg | Select-Object Name, Length
+          # Hashes so we can prove later which build the target machine got.
+          Get-ChildItem pkg -File | ForEach-Object {
+            "{0,10}  {1}  {2}" -f $_.Length,
+              (Get-FileHash $_.FullName -Algorithm SHA256).Hash.Substring(0, 16), $_.Name
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: isight-vmic
           path: pkg/
+
+      # A signing problem must not cost us the binaries: the compile/link half
+      # of this job is the expensive, hard-won part, and the signing half is
+      # just toolchain plumbing.  If signing fails, still ship what we built so
+      # the driver can be signed and installed by another route.
+      - name: Upload the unsigned binaries as a fallback
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isight-vmic-unsigned
+          path: |
+            isightmic.sys
+            isight-micsvc.exe
+            isight-micdev.exe
+            sample.wav
+            drivers/isightmic/isightmic.inf
+            drivers/isightmic/isightmic.h
+            drivers/install-mic.bat
+            drivers/uninstall-mic.bat
+            drivers/README-mic.txt
+            micpkg/iSightMicTest.cer
+          if-no-files-found: warn
