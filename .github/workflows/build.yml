@@ -60,8 +60,8 @@ jobs:
             Write-Host ("packaged {0} as GBK, {1} bytes" -f $f, (Get-Item "package\$f").Length)
           }
           $chk = [IO.File]::ReadAllText("package\install-all.bat", $gbk)
-          if ($chk -notmatch "ISIGHTFILTER-BUILD-V18") { throw "install-all.bat does not carry the V18 tag" }
-          Write-Host "[OK] install-all.bat reads back as GBK and carries the V18 tag"
+          if ($chk -notmatch "ISIGHTFILTER-BUILD-V19") { throw "install-all.bat does not carry the V19 tag" }
+          Write-Host "[OK] install-all.bat reads back as GBK and carries the V19 tag"
           $src = "https://github.com/Andrew-Dyachenko/apple-firewire-isight-on-windows/raw/main/CMU%201394%20Digital%20Camera%20Driver%206.4.6%20(signed)%20(September%2026%2C%202011).exe"
           Invoke-WebRequest -Uri $src -OutFile "package/1394camera646.exe"
           Get-ChildItem package
@@ -128,8 +128,11 @@ jobs:
             - 完整的取流日志：`%LOCALAPPDATA%\iSightCam.log`
 
             ### 已知限制
-            - **无麦克风**（iSight 麦克风走独立的 FireWire 音频通道，Windows 驱动栈不支持），
-              请先用其它麦克风；音频链路正在研究。
+            - **麦克风需要额外装一次虚拟麦克风驱动**（`drivers/install-mic.bat`，
+              含测试签名，需 `bcdedit /set testsigning on` 后重启）。装之前滤镜
+              照常工作，日志里会写 `mic: ... is not there yet`。
+            - 麦克风的声音取自"正在使用摄像头"的那条 FireWire 流：要先有程序在用
+              摄像头，麦克风才有声音（iSight 的音频与视频共用一条等时通道）。
             - 分辨率固定 640×480（硬件规格）。
             - Windows 11 24H2+ 内核策略较严，CMU 驱动可能装不上，建议以 Windows 10 为主。
 
