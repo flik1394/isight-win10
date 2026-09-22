@@ -411,9 +411,52 @@ static PKSDATARANGE PinDataRangePointersStream[] = {
     (PKSDATARANGE)&PinDataRangesStream[0]
 };
 
+// Bridge data ranges carry analog audio: no format, just a connection.  Both
+// filters need one: the wave filter's bridge pin pairs with the topology's, and
+// wdmaudio walks that pair to find out which wave pin belongs to which jack.
+// (Reference layout: microsoft/Windows-driver-samples, audio/simpleaudiosample,
+// Filters/*wavtable.h + *toptable.h -- a capture device is exactly a topology
+// with a physical input pin plus a wave filter whose streaming pin is the
+// source.  See the note on KSPIN_WAVE_BRIDGE below.)
+static KSDATARANGE PinDataRangesBridge[] = {
+    {
+        sizeof(KSDATARANGE),
+        0, 0, 0,
+        STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_ANALOG),
+        STATICGUIDOF(KSDATAFORMAT_SPECIFIER_NONE)
+    }
+};
+static PKSDATARANGE PinDataRangePointersBridge[] = {
+    &PinDataRangesBridge[0]
+};
+
+#define KSPIN_WAVE_BRIDGE       0
+#define KSPIN_WAVE_HOST         1
+#define KSNODE_WAVE_ADC         0
+
 // A capture pin is a sink for IRPs and a source of data.
 static PCPIN_DESCRIPTOR WavePins[] = {
-    {
+    {   // 0 - KSPIN_WAVE_BRIDGE: the connection to the topology filter.
+        // A bridge pin is a filter pin, not a stream: nothing ever opens a
+        // stream on it (KSPIN_COMMUNICATION_NONE), so the instance counts are
+        // zero, exactly as in the reference tables.  Without this pin the wave
+        // filter has no counterpart for the topology's bridge and wdmaudio
+        // cannot tell which jack this wave pin belongs to.
+        0, 0, 0,
+        NULL,               // AutomationTable
+        {
+            0, NULL,        // Interfaces
+            0, NULL,        // Mediums
+            1, (const PKSDATARANGE*)PinDataRangePointersBridge,
+            KSPIN_DATAFLOW_IN,
+            KSPIN_COMMUNICATION_NONE,
+            &KSCATEGORY_AUDIO,
+            NULL,
+            { 0 }
+        }
+    },
+    {   // 1 - KSPIN_WAVE_HOST: the streaming pin the audio engine opens.
         1, 1, 0,            // instance counts (global, filter, min)
         NULL,               // AutomationTable
         {
@@ -429,6 +472,24 @@ static PCPIN_DESCRIPTOR WavePins[] = {
     }
 };
 
+// The ADC between the bridge and the streaming pin -- the reference capture
+// filter has one, and it is the node wdmaudio expects to see on the capture
+// path.  No automation table: this device has no volume/mute control.
+static PCNODE_DESCRIPTOR WaveNodes[] = {
+    {
+        0,                      // Flags
+        NULL,                   // AutomationTable
+        &KSNODETYPE_ADC,        // Type
+        NULL                    // Name
+    }
+};
+
+// Node pins follow the KS convention: pin 0 is the output, pin 1 the input.
+static PCCONNECTION_DESCRIPTOR WaveConnections[] = {
+    { KSFILTER_NODE, KSPIN_WAVE_BRIDGE, KSNODE_WAVE_ADC, 1 },
+    { KSNODE_WAVE_ADC, 0,               KSFILTER_NODE,   KSPIN_WAVE_HOST }
+};
+
 // PCFILTER_DESCRIPTOR is exactly 12 fields -- Version, AutomationTable,
 // PinSize, PinCount, Pins, NodeSize, NodeCount, Nodes, ConnectionCount,
 // Connections, CategoryCount, Categories.  There is no AutomationTableSize
@@ -437,13 +498,13 @@ static PCFILTER_DESCRIPTOR WaveFilterDescriptor = {
     0,                                  // Version
     NULL,                               // AutomationTable
     sizeof(PCPIN_DESCRIPTOR),           // PinSize
-    1,                                  // PinCount
+    2,                                  // PinCount (bridge + streaming)
     WavePins,                           // Pins
-    0,                                  // NodeSize
-    0,                                  // NodeCount
-    NULL,                               // Nodes
-    0,                                  // ConnectionCount
-    NULL,                               // Connections
+    sizeof(PCNODE_DESCRIPTOR),          // NodeSize
+    1,                                  // NodeCount
+    WaveNodes,                          // Nodes
+    2,                                  // ConnectionCount
+    WaveConnections,                    // Connections
     0,                                  // CategoryCount
     NULL                                // Categories
 };
@@ -616,19 +677,8 @@ protected:
 };
 
 // Bridge pins carry analog audio: no format, just a connection.
-static KSDATARANGE PinDataRangesBridge[] = {
-    {
-        sizeof(KSDATARANGE),
-        0, 0, 0,
-        STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
-        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_ANALOG),
-        STATICGUIDOF(KSDATAFORMAT_SPECIFIER_NONE)
-    }
-};
-static PKSDATARANGE PinDataRangePointersBridge[] = {
-    &PinDataRangesBridge[0]
-};
-
+// (PinDataRangesBridge / PinDataRangePointersBridge are defined once, next to
+// the wave pins, and shared by both filters.)
 #define KSPIN_TOPO_MIC_JACK     0
 #define KSPIN_TOPO_WAVE_BRIDGE  1
 #define KSNODE_TOPO_MIC         0
@@ -646,14 +696,16 @@ static PCPIN_DESCRIPTOR TopologyPins[] = {
             { 0 }
         }
     },
-    {   // 1 - bridge to the wave filter's capture pin
+    {   // 1 - bridge to the wave filter's capture pin.  The reference tables
+        // use KSCATEGORY_AUDIO here (the physical jack is the pin above, which
+        // is the one that carries the node type).
         0, 0, 0, NULL,
         {
             0, NULL, 0, NULL,
             1, (const PKSDATARANGE*)PinDataRangePointersBridge,
             KSPIN_DATAFLOW_OUT,
             KSPIN_COMMUNICATION_NONE,
-            &KSNODETYPE_LEGACY_AUDIO_CONNECTOR,
+            &KSCATEGORY_AUDIO,
             NULL,
             { 0 }
         }
@@ -670,7 +722,8 @@ static PCNODE_DESCRIPTOR TopologyNodes[] = {
 };
 
 static PCCONNECTION_DESCRIPTOR TopologyConnections[] = {
-    { KSFILTER_NODE, KSPIN_TOPO_MIC_JACK,    KSNODE_TOPO_MIC, 0 },
+    // Node pin numbering: 0 is the output, 1 the input.
+    { KSFILTER_NODE, KSPIN_TOPO_MIC_JACK,    KSNODE_TOPO_MIC, 1 },
     { KSNODE_TOPO_MIC, 0,                   KSFILTER_NODE, KSPIN_TOPO_WAVE_BRIDGE }
 };
 
