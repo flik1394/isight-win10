@@ -16,6 +16,7 @@
 
 #include <windows.h>
 #include <setupapi.h>
+#include <newdev.h>     // UpdateDriverForPlugAndPlayDevicesW + INSTALLFLAG_FORCE
 #include <devguid.h>
 #include <stdio.h>
 
