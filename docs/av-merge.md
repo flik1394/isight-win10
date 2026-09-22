@@ -112,6 +112,30 @@ __be32 samples[];              /* sample_count * 2 通道, S16_BE, 48 kHz */
 ## 里程碑
 
 - **v16** 在视频采集路径里解出音频 + 落盘取证 ✅（音频链路全通：丢包 12.4%、peak 9433）
-- **v17** 把音频包从画面里剔除（strip）+ audio pin：画面恢复干净、filter 直接交 PCM
-- **v18** 出口 2：喂音服务 + `isightmic.sys`，全系统可用
-- **v19** 实时 DSP（把 `docs/virtual-mic.md` 那张 8 步表移植进 C++）
+- **v17** 把音频包从画面里剔除（strip）+ audio pin：画面恢复干净
+- **v18** 尾部补齐：缓冲正好一帧，剔除多少就从上一帧尾部借多少填回
+- **v19** 麦克风出口：`isightmic.sys`（PortCls 虚拟麦克风）已构建+签名，
+  滤镜把解出的 PCM 直接推进驱动 → 系统里出现 "iSight Microphone (FireWire)" ✅ 待用户实测
+- **v20** 实时 DSP（把 `docs/virtual-mic.md` 那张 8 步表移植进 C++）
+
+## v19：麦克风的出口（filter → isightmic.sys）
+
+```
+iSight ──视频流（音频包混在里面）──> iSightCam.ax
+                                        │ AudioScanFrame() 每帧扫 sght
+                                        ├─ strip=1 : 从画面里剔除，画面干净
+                                        ├─ conv[] : S16_BE → S16_LE
+                                        └─ mic=1   : (L+R)/2 → 单声道
+                                                     ↓ DeviceIoControl
+                                        \\.\IsightMicCtl ──> isightmic.sys 环缓
+                                                     ↓
+                                        Windows 音频引擎 → 微信 / QQ / OBS
+```
+
+- **为什么必须是滤镜来喂**：CMU 一个设备对象只允许一条等时流，而音频单元
+  发在**视频那条流**上。谁拿着视频流，谁才听得到麦克风 —— 这不是取巧，
+  是设备约束（v10 想给音频单独开一条流，结果零字节）。
+- 因此前提是"有程序在用摄像头"。麦克风设备本身在不使用摄像头时是静音，
+  不是坏的。
+- 装驱动的步骤与自检工具见 `docs/virtual-mic.md`。
+
