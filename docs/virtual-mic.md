@@ -102,6 +102,42 @@ SNR 38 dB），缺的是一个**把处理完的 PCM 交给系统的出口**—�
 - **M3** 实时 DSP（上表 1–8 步移植到 C++）
 - **M4** INF + 测试签名 + 安装脚本 + 服务开机自启
 
+## 进度（2026-09-22 v19）
+
+**M1 完成（已编译 + 已测试签名 + 已打包）**
+
+CI 里有一条独立的 `Build iSight Virtual Mic` 工作流（`.github/workflows/vmic.yml`），
+产物 artifact 名为 `isight-vmic`：
+
+| 文件 | 作用 |
+|---|---|
+| `isightmic.sys` | PortCls WaveCyclic 采集微型端口（x64，26 KB） |
+| `isightmic.cat` / `iSightMicTest.cer` | test-sign 目录与自签证书 |
+| `isight-micdev.exe` | 建根枚举设备节点并把驱动装上去 |
+| `isight-micsvc.exe` | M1 喂音器：把一个 WAV 循环推进驱动 |
+| `isight-miccheck.exe` | 自检：开控制设备、看计数器、枚举录音端点、录回 3 秒存 WAV |
+| `sample.wav` | 48 kHz / 16 bit / 立体声 3 秒测试音 |
+
+**踩过的坑（vmic 工作流）**：把自签证书导进 runner 的 Root 存储会弹一个没人
+按的确认框 → 那一级卡死到 job 超时（run 35746443369 的日志就停在
+`[4/6] trusting the cert for this runner only` 之后 7 分钟）。所以 CI **只在
+runner 本机创建证书并导出 .cer**，信任动作留给目标机器（`install-mic.bat` 里的
+`certutil -addstore`）。另外签名失败不再连累编译产物：失败时有
+`isight-vmic-unsigned` 兜底 artifact。
+
+**M2 已接线**：`filter/iSightFilter.cpp`（v19，tag `ISIGHTFILTER-BUILD-V19-20260922-MICFEED`）
+在解码每个 `sght` 包时，把 PCM **降混成单声道**后用
+`DeviceIoControl(IOCTL_ISIGHTMIC_PUSH)` 推进 `\\.\IsightMicCtl`。
+开关是 ini 的 `[audio] mic=1`（默认开）。为什么由滤镜来喂：CMU 一个设备对象
+只允许一条等时流，而音频就挂在视频那条流上 —— 谁拿着视频流，谁才听得到麦克风。
+所以"先有程序在用摄像头"是前提，这不是权宜之计，是硬约束。
+
+- 降混为什么是免费的改进：两声道是同一个麦克风，且带**反向直流偏置**
+  （实测 L≈+75、R≈−73），`(L+R)/2` 正好抵消。
+- 驱动不在时（没装）只是日志里写一行 `mic: ... is not there yet`，画面与
+  wav 录制完全不受影响；每 5 秒重试一次，所以通话中途装驱动也能立刻生效。
+
+
 ## 已知限制
 
 - 需要测试签名（`testsigning`），Secure Boot 机器装不上
