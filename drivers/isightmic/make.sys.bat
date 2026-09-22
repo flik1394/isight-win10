@@ -6,7 +6,10 @@ set KIT=C:\Program Files (x86)\Windows Kits\10
 set INC=%KIT%\Include\10.0.26100.0
 set LIB=%KIT%\Lib\10.0.26100.0\km\x64
 
-cl /nologo /kernel /c /W3 /O2 ^
+REM /D_AMD64_ : the SDK's shared\ntdef.h needs a target-architecture macro and
+REM aborts with C1189 "No Target Architecture" without one.  The WDK's MSBuild
+REM toolset injects it; driving cl directly means we have to.
+cl /nologo /kernel /c /W3 /O2 /D_AMD64_ ^
    /I"%INC%\km" /I"%INC%\km\crt" /I"%INC%\shared" /I"%INC%\um" ^
    isightmic.cpp
 if errorlevel 1 exit /b 1
