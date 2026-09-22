@@ -219,6 +219,12 @@
 #include "debug.h"
 #include "1394Camera.h"
 
+// v19: the shared contract with isightmic.sys (the virtual microphone driver):
+// the '\\.\IsightMicCtl' device name, the IOCTL that pushes PCM into its ring
+// and the status struct.  Same header the kernel driver and the feeder compile
+// against, so the three can never drift apart.
+#include "isightmic.h"
+
 // {73912CE1-84DD-4BF4-8693-FF4603D7369F}
 static const GUID CLSID_ISightFireWireCam =
 { 0x73912ce1, 0x84dd, 0x4bf4, { 0x86, 0x93, 0xff, 0x46, 0x03, 0xd7, 0x36, 0x9f } };
@@ -227,7 +233,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V18-20260922-PADTAIL"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V19-20260922-MICFEED"
 
 // Public release number.  The build tag above changes on every internal
 // iteration (and install-all.bat greps for its "V14" prefix); this one is
@@ -574,6 +580,14 @@ struct ISightOptions
                             //     the frame buffer before the picture is
                             //     converted (fixes the flickering bands);
                             //     0 leaves the buffer untouched (v16 behaviour)
+    // v19 -- the microphone's way out of the process.  The video filter is the
+    // only thing that ever holds the camera's single isochronous stream, so it
+    // is also the only thing that can hear the microphone.  With mic=1 every
+    // decoded packet is downmixed to mono and pushed into isightmic.sys, which
+    // is what makes "iSight Microphone (FireWire)" a real recording device in
+    // WeChat / QQ / OBS / Tencent Meeting.  With mic=0 nothing is pushed and
+    // the audio only lands in the wav file, exactly like v18.
+    int  audioMic;          // [audio] mic=      1 = feed the virtual microphone
 };
 
 enum LayoutMode
@@ -866,10 +880,11 @@ static const ISightOptions &Opts()
         if (s_o.audioLog > 2) s_o.audioLog = 2;
         s_o.audioStrip = GetPrivateProfileIntA("audio", "strip", 1, ini) != 0;
         s_o.audioRawDump = GetPrivateProfileIntA("audio", "rawdump", 1, ini) != 0;
+        s_o.audioMic   = GetPrivateProfileIntA("audio", "mic", 1, ini) != 0;
 
-        FLog("options: audio %s (gain=%d wav=%d maxmb=%d log=%d)",
+        FLog("options: audio %s (gain=%d wav=%d maxmb=%d log=%d mic=%d)",
              s_o.audioOn ? "ON" : "off", s_o.audioGain, s_o.audioWav,
-             s_o.audioMaxMB, s_o.audioLog);
+             s_o.audioMaxMB, s_o.audioLog, s_o.audioMic ? 1 : 0);
 
         FLog("options: yuy2=%s rgb=%s dump=%d busmon=%d bootdelay=%dms (ini=%s)",
              OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
@@ -1598,6 +1613,11 @@ private:
     void  AudioStart();
     void  AudioStop();
     void  AudioScanFrame();
+    // v19 -- the virtual microphone driver: open it (retrying, so installing
+    // the driver mid-call works), push decoded PCM into it, close it.
+    void  MicTryOpen();
+    void  MicPush(const BYTE *s16leStereo, ULONG bytes);
+    void  MicClose();
     ULONG FrameBytes() const;            // bytes of one raw frame as streamed
     void  BuildMediaType(const GUID *subtype, REFERENCE_TIME interval, CMediaType *pmt) const;
     bool  MediaTypeCompatible(const CMediaType *pmt, CMediaType *pNormalized) const;
@@ -1678,6 +1698,15 @@ private:
     // picture loses.  Keep the tail of the previous frame to pad with.
     BYTE            *m_audioPrevTail;
     LONG             m_audioPrevTailBytes;
+
+    // v19: the virtual microphone.  One handle, opened lazily, retried while
+    // the unit is running so the driver can be installed without restarting
+    // the host application.
+    HANDLE           m_micDev;         // INVALID_HANDLE_VALUE = not feeding
+    DWORD            m_micTryMs;       // last attempt, for the retry interval
+    LONG             m_micPushed;      // bytes accepted by the driver
+    LONG             m_micFails;       // failed pushes (driver gone / busy)
+    LONG             m_micOpens;       // successful opens this session
 };
 
 //---------------------------------------------------------------------
@@ -1800,6 +1829,11 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_audioPadBytes(0)
     , m_audioPrevTail(NULL)
     , m_audioPrevTailBytes(0)
+    , m_micDev(INVALID_HANDLE_VALUE)
+    , m_micTryMs(0)
+    , m_micPushed(0)
+    , m_micFails(0)
+    , m_micOpens(0)
 {
     m_monPath[0] = 0;
     m_audioPath[0] = 0;
@@ -2287,6 +2321,11 @@ void CiSightStream::ReleaseCamera()
 #define AUDIO_MAX_FRAMES  475            // the camera's per-packet limit
 #define AUDIO_HEADER      16
 
+// v19: how often to re-try opening the virtual microphone driver while the
+// audio unit is running (the driver is a separate install, and a user may add
+// it in the middle of a call).
+#define MIC_OPEN_RETRY_MS 5000
+
 // DCAM 0x60C packs the channel differently in 1394a and 1394b mode
 static ULONG AudioChannelOf60C(ULONG v)
 {
@@ -2352,6 +2391,9 @@ void CiSightStream::AudioStart()
     m_audioTailBytes = 0;
     m_audioPadBytes = 0;
     m_audioPrevTailBytes = 0;
+    m_micDev = INVALID_HANDLE_VALUE;
+    m_micTryMs = 0;
+    m_micPushed = m_micFails = m_micOpens = 0;
 
     const ISightOptions &o = Opts();
     if (!o.audioOn || m_pCam == NULL)
@@ -2381,6 +2423,11 @@ void CiSightStream::AudioStart()
     }
     m_audioOn = true;
     m_audioStartMs = TickMs();
+
+    // v19: hand the microphone to the system.  Failing here is not an error --
+    // the driver is a separate install and the wav capture does not need it.
+    if (o.audioMic)
+        MicTryOpen();
 
     if (!o.audioWav)
         return;
@@ -2421,6 +2468,105 @@ void CiSightStream::AudioStop()
         m_audioFile = NULL;
         FLog("audio: %s closed (%ld bytes of PCM)", m_audioPath, (long)m_audioBytes);
     }
+
+    if (m_micOpens > 0 || m_micPushed > 0 || m_micFails > 0)
+        FLog("mic: session end -- %ld bytes pushed, %ld failed pushes, %ld opens",
+             (long)m_micPushed, (long)m_micFails, (long)m_micOpens);
+    MicClose();
+}
+
+//---------------------------------------------------------------------
+// v19 -- the virtual microphone.  isightmic.sys exposes a control device and
+// a ring buffer; everything that reaches the endpoint is whatever we push into
+// that ring.  Open is retried at a slow interval, so installing the driver
+// while a call is already up starts working within a few seconds.
+//---------------------------------------------------------------------
+void CiSightStream::MicTryOpen()
+{
+    if (m_micDev != INVALID_HANDLE_VALUE)
+        return;
+    DWORD now = TickMs();
+    if (m_micTryMs != 0 && (now - m_micTryMs) < MIC_OPEN_RETRY_MS)
+        return;
+    m_micTryMs = now;
+
+    HANDLE h = CreateFileW(ISIGHTMIC_CTL_WIN32_NAME, GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        if (m_micOpens == 0 && m_micFails == 0)
+            FLog("mic: %ls is not there yet (error %lu) -- the picture and the wav "
+                 "capture are unaffected; run drivers\\install-mic.bat to add the "
+                 "recording device",
+                 ISIGHTMIC_CTL_WIN32_NAME, (unsigned long)GetLastError());
+        return;
+    }
+    m_micDev = h;
+    ++m_micOpens;
+    FLog("mic: feeding the virtual microphone -- \"iSight Microphone (FireWire)\" "
+         "is now live in the system");
+}
+
+void CiSightStream::MicClose()
+{
+    if (m_micDev != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(m_micDev);
+        m_micDev = INVALID_HANDLE_VALUE;
+    }
+    m_micTryMs = 0;                 // a later stream may retry immediately
+}
+
+// The camera sends the microphone as stereo, but the two channels are the same
+// capsule with opposite DC offsets (measured: L ~ +75, R ~ -73), so averaging
+// them to mono both matches what isightmic.sys exposes (48 kHz / 16 bit / mono)
+// and cancels that offset for free.
+void CiSightStream::MicPush(const BYTE *s16leStereo, ULONG bytes)
+{
+    if (m_micDev == INVALID_HANDLE_VALUE || s16leStereo == NULL)
+        return;
+
+    BYTE mono[ISIGHTMIC_QUANTUM_BYTES];           // 960 B = 480 frames
+    const ULONG capFrames = ISIGHTMIC_QUANTUM_BYTES / ISIGHTMIC_FRAME_BYTES;
+
+    while (bytes >= 4 && m_micDev != INVALID_HANDLE_VALUE)
+    {
+        ULONG frames = bytes / 4;
+        if (frames > capFrames)
+            frames = capFrames;
+
+        for (ULONG i = 0; i < frames; ++i)
+        {
+            SHORT l = (SHORT)((ULONG)s16leStereo[i * 4] |
+                              ((ULONG)s16leStereo[i * 4 + 1] << 8));
+            SHORT r = (SHORT)((ULONG)s16leStereo[i * 4 + 2] |
+                              ((ULONG)s16leStereo[i * 4 + 3] << 8));
+            SHORT m = (SHORT)(((LONG)l + (LONG)r) / 2);
+            mono[i * 2]     = (BYTE)(m & 0xFF);
+            mono[i * 2 + 1] = (BYTE)((m >> 8) & 0xFF);
+        }
+
+        DWORD written = 0;
+        if (DeviceIoControl(m_micDev, IOCTL_ISIGHTMIC_PUSH, mono,
+                            frames * ISIGHTMIC_FRAME_BYTES, NULL, 0, &written, NULL))
+        {
+            m_micPushed += (LONG)(frames * ISIGHTMIC_FRAME_BYTES);
+        }
+        else
+        {
+            DWORD e = GetLastError();
+            ++m_micFails;
+            if (m_micFails <= 3 || (m_micFails % 500) == 0)
+                FLog("mic: push failed (error %lu) -- %ld bytes got through so far",
+                     (unsigned long)e, (long)m_micPushed);
+            if (m_micFails > 50)
+                MicClose();                       // driver went away; retry later
+        }
+
+        s16leStereo += frames * 4;
+        bytes -= frames * 4;
+    }
 }
 
 // Bytes of one raw frame exactly as the camera streams it.  Format 0 / Mode 2
@@ -2447,6 +2593,9 @@ void CiSightStream::AudioScanFrame()
     if (!m_audioOn || m_pCam == NULL)
         return;
     const ISightOptions &o = Opts();
+    // v19: the driver may be installed (or started) while the stream is up.
+    if (o.audioMic && m_micDev == INVALID_HANDLE_VALUE)
+        MicTryOpen();
     BYTE *p = NULL;
     ULONG cb = 0;
     if (m_pCam->GetRawFrameBuffer(&p, &cb) != CAM_SUCCESS || p == NULL || cb < 32)
@@ -2521,6 +2670,11 @@ void CiSightStream::AudioScanFrame()
                 fwrite(conv, 1, n, m_audioFile);
                 m_audioBytes += (LONG)n;
             }
+            // v19: the same PCM goes out to the system as a recording device.
+            // Pushing here (before the strip below rewrites the buffer) is one
+            // more pass over data that is already in a register-resident copy.
+            if (o.audioMic && m_micDev != INVALID_HANDLE_VALUE)
+                MicPush(conv, n);
             src  += n;
             todo -= n;
         }
@@ -2606,6 +2760,17 @@ void CiSightStream::AudioScanFrame()
              (m_audioFrames + m_audioLost) > 0
                  ? (100.0 * m_audioLost / (double)(m_audioFrames + m_audioLost)) : 0.0,
              (long)m_audioPeak, (long)m_audioFramesScanned, (long)m_audioBad);
+        // v19: is the system actually getting this audio?  mic=- shows the one
+        // number that answers it: frames pushed / frames decoded.
+        if (o.audioMic)
+        {
+            LONG want = m_audioFrames * ISIGHTMIC_FRAME_BYTES;   // mono bytes
+            FLog("mic: %ld of %ld mono bytes pushed (%.1f%%), %ld failed pushes%s",
+                 (long)m_micPushed, (long)want,
+                 want > 0 ? (100.0 * m_micPushed / (double)want) : 0.0,
+                 (long)m_micFails,
+                 (m_micDev == INVALID_HANDLE_VALUE) ? " -- device not open" : "");
+        }
     }
 }
 
