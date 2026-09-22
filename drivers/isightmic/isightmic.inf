@@ -1,0 +1,58 @@
+; isightmic.inf - install the iSight virtual microphone (PortCls capture miniport)
+;
+; Test-signed only.  The target machine must have `bcdedit /set testsigning on`
+; and be rebooted once before installing.  Install with:
+;     devcon install isightmic.inf ISIGHTMIC\Mic
+
+[Version]
+Signature   = "$Windows NT$"
+Class        = Media
+ClassGuid    = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider     = %Provider%
+CatalogFile  = isightmic.cat
+DriverVer    = 09/13/2026,1.0.0.0
+
+[Manufacturer]
+%Manufacturer% = IsightMic,NTamd64
+
+[IsightMic.NTamd64]
+%DeviceName%  = IsightMicInstall, ISIGHTMIC\Mic
+
+[IsightMicInstall]
+CopyFiles = IsightMic.Copy
+
+[IsightMicInstall.Services]
+AddService = isightmic, 0x00000002, IsightMic.Service
+
+[IsightMic.Copy]
+isightmic.sys
+
+[IsightMic.Service]
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1
+ServiceBinary  = %12%\isightmic.sys
+LoadOrderGroup = "Base"
+
+[IsightMicInstall.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,      %PlugPlayGuid%, IsightMic.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,    %PlugPlayGuid%, IsightMic.Interface
+
+[IsightMic.Interface]
+AddReg = IsightMic.Interface.AddReg
+
+[IsightMic.Interface.AddReg]
+HKR,,FriendlyName,,%DeviceName%
+
+[IsightMicInstall.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,%12%\isightmic.sys
+HKR,,NTMPDriver,,"isightmic.sys"
+
+[Strings]
+Provider      = "iSightCam Project"
+Manufacturer  = "iSightCam Project"
+DeviceName    = "iSight Microphone (FireWire)"
+KSCATEGORY_AUDIO   = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_CAPTURE = "{65E8773D-S56B-11D0-A3B9-00A0C9223196}"
+PlugPlayGuid  = "{B85DDDFB-F2A7-4c0e-A5C2-0E9D8C9D0E1F}"
