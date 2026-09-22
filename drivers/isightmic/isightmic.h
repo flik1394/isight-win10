@@ -41,4 +41,7 @@ typedef struct _ISIGHTMIC_STATUS {
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"
 #define ISIGHTMIC_CTL_DOS_NAME     L"\\DosDevices\\IsightMicCtl"
+// What user mode actually opens (the Win32 form of the same device).  Kernel
+// code uses the two names above, user-mode callers this one.
+#define ISIGHTMIC_CTL_WIN32_NAME   L"\\\\.\\IsightMicCtl"
 #define ISIGHTMIC_POOL_TAG         'cMsi'
