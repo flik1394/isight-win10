@@ -13,7 +13,7 @@ if errorlevel 1 exit /b 1
 
 link /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /MACHINE:X64 ^
      /LIBPATH:"%LIB%" ^
-     portcls.lib ks.lib drmk.lib ntoskrnl.lib hal.lib wmilib.lib ^
+     portcls.lib ks.lib drmk.lib ntoskrnl.lib hal.lib wmilib.lib wdmsec.lib ^
      /OUT:isightmic.sys isightmic.obj
 if errorlevel 1 exit /b 1
 
