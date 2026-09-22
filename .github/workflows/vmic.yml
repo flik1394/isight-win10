@@ -141,15 +141,30 @@ jobs:
                   -KeyUsage DigitalSignature `
                   -NotAfter (Get-Date).AddYears(10)
           Export-Certificate -Cert $cert -FilePath micpkg\iSightMicTest.cer | Out-Null
+          # signtool refuses to sign unless the certificate chains to a trusted
+          # root ("A certificate chain processed, but terminated in a root
+          # certificate which is not trusted"), and a self-signed cert is its
+          # own root -- so trust it in this runner's user stores.  CurrentUser
+          # needs no elevation, unlike LocalMachine.
+          Import-Certificate -FilePath micpkg\iSightMicTest.cer `
+                             -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Import-Certificate -FilePath micpkg\iSightMicTest.cer `
+                             -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
 
           # Catalog built from the INF; both the .sys and the .cat get signed.
           & $env:inf2cat_PATH /driver:micpkg /os:10_X64 /verbose
           if ($LASTEXITCODE -ne 0) { throw "inf2cat failed ($LASTEXITCODE)" }
-          & $env:signtool_PATH sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.sys
-          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.sys failed ($LASTEXITCODE)" }
-          & $env:signtool_PATH sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.cat
-          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.cat failed ($LASTEXITCODE)" }
+          foreach ($f in 'micpkg\isightmic.sys', 'micpkg\isightmic.cat') {
+            & $env:signtool_PATH sign /fd SHA256 /sha1 $cert.Thumbprint `
+                                    /ac micpkg\iSightMicTest.cer $f
+            if ($LASTEXITCODE -ne 0) { throw "sign $f failed ($LASTEXITCODE)" }
+          }
+          # Informational only: /pa requires a WHQL-style trusted chain, which a
+          # throwaway test cert never has.
           & $env:signtool_PATH verify /v /pa micpkg\isightmic.sys
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "signtool verify reported $LASTEXITCODE (expected for a self-signed test cert)"
+          }
           Get-ChildItem micpkg | Select-Object Name, Length
 
       - name: Assemble package
