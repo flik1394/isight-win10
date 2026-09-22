@@ -57,7 +57,12 @@ jobs:
         shell: cmd
         run: |
           set KIT=%WDK_ROOT%
-          cl /nologo /kernel /c /W3 /O2 ^
+          REM _AMD64_ is normally injected by the WDK's MSBuild platform toolset
+          REM (WindowsKernelModeDriver10.0).  We drive cl directly, so we must
+          REM define the target architecture ourselves -- otherwise the SDK's
+          REM shared\ntdef.h aborts with C1189 "No Target Architecture" before
+          REM it ever reaches our code.
+          cl /nologo /kernel /c /W3 /O2 /D_AMD64_ ^
              /I"%KIT%\Include\10.0.26100.0\km" ^
              /I"%KIT%\Include\10.0.26100.0\km\crt" ^
              /I"%KIT%\Include\10.0.26100.0\shared" ^
