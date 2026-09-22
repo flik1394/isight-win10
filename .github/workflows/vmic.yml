@@ -1,0 +1,143 @@
+name: Build iSight Virtual Mic
+
+# Builds isightmic.sys (a PortCls WaveCyclic capture miniport) plus its two
+# user-mode companions -- isight-micsvc.exe (the audio feeder) and
+# isight-micdev.exe (the root-enumerated device installer) -- test-signs the
+# driver with a throwaway self-signed cert, and uploads a ready-to-install
+# package as the "isight-vmic" artifact.
+#
+# Test-signed: the target machine must boot once with `bcdedit /set testsigning
+# on` (see README-mic.txt in the artifact).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vmic:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Locate or install the WDK
+        shell: pwsh
+        run: |
+          $wdk = 'C:\Program Files (x86)\Windows Kits\10'
+          if (Test-Path "$wdk\Include\10.0.26100.0\km\ntddk.h") {
+            Write-Host "system WDK present at $wdk"
+          } else {
+            Write-Host "system WDK not found, installing WDK NuGet package ..."
+            if (-not (Get-Command nuget.exe -ErrorAction SilentlyContinue)) {
+              Invoke-WebRequest -Uri https://dist.nuget.org/win-x86-commandline/latest/nuget.exe -OutFile nuget.exe
+            }
+            .\nuget.exe install Microsoft.Windows.WDK.x64 -Version 10.0.26100.6584 -ExcludeVersion -OutputDirectory wdkpkg
+            $wdk = Resolve-Path wdkpkg\Microsoft.Windows.WDK.x64
+          }
+          "WDK_ROOT=$wdk" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Build isightmic.sys (kernel PortCls miniport)
+        shell: cmd
+        run: |
+          set KIT=%WDK_ROOT%
+          cl /nologo /kernel /c /W3 /O2 ^
+             /I"%KIT%\Include\10.0.26100.0\km" ^
+             /I"%KIT%\Include\10.0.26100.0\km\crt" ^
+             /I"%KIT%\Include\10.0.26100.0\shared" ^
+             /I"%KIT%\Include\10.0.26100.0\um" ^
+             drivers\isightmic\isightmic.cpp
+          if errorlevel 1 exit /b 1
+          link /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /MACHINE:X64 ^
+             /LIBPATH:"%KIT%\Lib\10.0.26100.0\km\x64" ^
+             portcls.lib ks.lib drmk.lib ntoskrnl.lib hal.lib wmilib.lib wdmsec.lib ^
+             /OUT:isightmic.sys drivers\isightmic\isightmic.obj
+          if errorlevel 1 exit /b 1
+          dir isightmic.sys
+
+      - name: Build feeder and device installer (user mode)
+        shell: cmd
+        run: |
+          cl /nologo /O2 /W3 /EHsc /MD /I"drivers\isightmic" service\feed.cpp /Fe:isight-micsvc.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /O2 /W3 /EHsc /MD /DUNICODE /D_UNICODE tools\micdev.cpp setupapi.lib newdev.lib /Fe:isight-micdev.exe
+          if errorlevel 1 exit /b 1
+          dir isight-micsvc.exe isight-micdev.exe
+
+      - name: Generate a sample WAV (for the M1 loopback test)
+        shell: pwsh
+        run: |
+          python -c @'
+import struct, math, wave
+sr=48000; dur=3.0; f=440.0
+w=wave.open("sample.wav","wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr)
+for i in range(int(sr*dur)):
+    v=int(32767*0.3*math.sin(2*math.pi*f*i/sr))
+    w.writeframes(struct.pack("<hh",v,v))
+w.close()
+print("wrote sample.wav (48k/16/stereo, 3 s, 440 Hz tone)")
+'@
+
+      - name: Test-sign the driver and build its catalog
+        shell: pwsh
+        run: |
+          $sdk = 'C:\Program Files (x86)\Windows Kits\10\bin\x64'
+          New-Item -ItemType Directory -Force -Path micpkg | Out-Null
+          Copy-Item isightmic.inf, isightmic.sys micpkg/
+          # Throwaway self-signed code-signing cert (lives only on this runner).
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+                  -Subject "CN=iSightMic Test" `
+                  -CertStoreLocation "Cert:\CurrentUser\My" `
+                  -KeyUsage DigitalSignature `
+                  -NotAfter (Get-Date).AddYears(10)
+          Export-Certificate -Cert $cert -FilePath micpkg\iSightMicTest.cer
+          # Catalog built from the INF; both the .sys and the .cat get signed.
+          & "$sdk\inf2cat.exe" /driver:micpkg /os:10_X64 /verbose
+          if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
+          & "$sdk\signtool.exe" sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.sys
+          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.sys failed" }
+          & "$sdk\signtool.exe" sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.cat
+          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.cat failed" }
+          Get-ChildItem micpkg | Select-Object Name, Length
+
+      - name: Assemble package
+        shell: pwsh
+        run: |
+          Copy-Item micpkg\isightmic.inf, micpkg\isightmic.sys, micpkg\isightmic.cat, micpkg\iSightMicTest.cer `
+                    isight-micsvc.exe, isight-micdev.exe, sample.wav -Destination .
+          # The .bat / .txt carry Chinese text; cmd.exe reads them in the console
+          # codepage (936 on a Chinese Windows), so re-encode to GBK with CRLF.
+          $gbk = [Text.Encoding]::GetEncoding(936)
+          foreach ($f in "install-mic.bat", "uninstall-mic.bat", "README-mic.txt") {
+            $text = [IO.File]::ReadAllText("drivers\$f", [Text.Encoding]::UTF8)
+            $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n"
+            [IO.File]::WriteAllText($f, $text, $gbk)
+          }
+          Get-ChildItem isightmic.*, iSightMicTest.cer, isight-micsvc.exe, isight-micdev.exe, `
+                        install-mic.bat, uninstall-mic.bat, README-mic.txt |
+            Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: isight-vmic
+          path: |
+            isightmic.sys
+            isightmic.inf
+            isightmic.cat
+            iSightMicTest.cer
+            isight-micsvc.exe
+            isight-micdev.exe
+            sample.wav
+            install-mic.bat
+            uninstall-mic.bat
+            README-mic.txt
