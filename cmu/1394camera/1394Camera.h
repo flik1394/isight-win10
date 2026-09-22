@@ -214,8 +214,10 @@ public:
 	// AcquireImageEx() filled.  The iSight's microphone transmits on the video
 	// engine's isochronous channel, so its packets sit in this same buffer,
 	// interleaved with the video payload -- a caller that wants the audio has
-	// to see the raw bytes.  Valid until the next AcquireImageEx().
-	int	GetRawFrameBuffer(const unsigned char **ppData, unsigned long *pcbBytes);
+	// to see the raw bytes (and may compact them away, as v17 does).  The
+	// pointer is the same base the video converters read (pFrameStart), and
+	// it stays valid until the next AcquireImageEx().
+	int	GetRawFrameBuffer(unsigned char **ppData, unsigned long *pcbBytes);
 	
 	// Video format/mode/rate
 	BOOL HasVideoFormat(unsigned long format);

@@ -835,7 +835,7 @@ _exit:
  * \param pcbBytes receives its size in bytes
  * \return CAM_SUCCESS, or CAM_ERROR_NOT_INITIALIZED if no frame is in hand
  */
-int C1394Camera::GetRawFrameBuffer(const unsigned char **ppData, unsigned long *pcbBytes)
+int C1394Camera::GetRawFrameBuffer(unsigned char **ppData, unsigned long *pcbBytes)
 {
 	DllTrace(DLL_TRACE_ENTER,"ENTER GetRawFrameBuffer\n");
 
@@ -857,7 +857,11 @@ int C1394Camera::GetRawFrameBuffer(const unsigned char **ppData, unsigned long *
 	if(!m_pCurrentBuffer->bCurrentlyContiguous)
 		dc1394FlattenAcquisitionBuffer(m_pCurrentBuffer);
 
-	*ppData = m_pCurrentBuffer->pDataBuf;
+	// pFrameStart, not pDataBuf: the DMA writes and every video converter
+	// (getRGB/getDIB) read from pFrameStart, so a caller that inspects or
+	// rewrites the frame must use the very same base address.  pDataBuf is
+	// only the underlying (up to one page earlier) allocation.
+	*ppData = m_pCurrentBuffer->pFrameStart;
 	*pcbBytes = m_pCurrentBuffer->ulBufferSize;
 
 	DllTrace(DLL_TRACE_EXIT,"EXIT GetRawFrameBuffer (%p,%lu)\n",*ppData,*pcbBytes);

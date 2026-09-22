@@ -227,7 +227,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V16-20260922-AUDIO"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V17-20260922-STRIP"
 
 // Public release number.  The build tag above changes on every internal
 // iteration (and install-all.bat greps for its "V14" prefix); this one is
@@ -566,6 +566,10 @@ struct ISightOptions
     int  audioWav;          // [audio] wav=      1 = write the PCM to disk
     int  audioMaxMB;        // [audio] maxmb=    0 = no limit
     int  audioLog;          // [audio] log=      0/1/2, 2 = per-packet
+    int  audioStrip;        // [audio] strip=    1 = cut audio packets out of
+                            //     the frame buffer before the picture is
+                            //     converted (fixes the flickering bands);
+                            //     0 leaves the buffer untouched (v16 behaviour)
 };
 
 enum LayoutMode
@@ -744,7 +748,12 @@ static void WriteDefaultIni(const char *path)
         "gain=0\n"
         "wav=1\n"
         "maxmb=20\n"
-        "log=1\n");
+        "log=1\n"
+        "; v17: cut the audio packets out of the frame buffer again before\n"
+        "; the picture is converted.  The 1394 driver splices them into the\n"
+        "; image as if they were video bytes (flickering seams + a rainbow\n"
+        "; band at the bottom).  strip=0 restores the v16 behaviour.\n"
+        "strip=1\n");
     fclose(f);
 }
 
@@ -847,6 +856,7 @@ static const ISightOptions &Opts()
         s_o.audioLog   = GetPrivateProfileIntA("audio", "log", 1, ini);
         if (s_o.audioLog < 0) s_o.audioLog = 0;
         if (s_o.audioLog > 2) s_o.audioLog = 2;
+        s_o.audioStrip = GetPrivateProfileIntA("audio", "strip", 1, ini) != 0;
 
         FLog("options: audio %s (gain=%d wav=%d maxmb=%d log=%d)",
              s_o.audioOn ? "ON" : "off", s_o.audioGain, s_o.audioWav,
@@ -1613,6 +1623,16 @@ private:
     DWORD            m_audioStartMs;   // when the audio unit was started
     LONG             m_audioPeak;      // loudest sample seen
     LONG             m_audioBytes;     // bytes written to the wav file
+
+    // v17: audio packets are spliced into the picture by the 1394 driver
+    // (measured: ~14 packets of 816 bytes per frame -- ten horizontal
+    // seams and an 11 KB rainbow band at the bottom, see the PNG dumps).
+    // StripFrame() cuts them out so the front of the buffer is a clean
+    // 640x480 UYVY picture again.
+    LONG             m_audioStripPackets;  // packets cut this session
+    LONG             m_audioStripFrames;   // frames compacted
+    LONG             m_audioStripBytes;    // bytes cut this session
+    LONG             m_audioTailBytes;     // bytes left in the last compacted frame
 };
 
 //---------------------------------------------------------------------
@@ -1728,6 +1748,10 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_audioStartMs(0)
     , m_audioPeak(0)
     , m_audioBytes(0)
+    , m_audioStripPackets(0)
+    , m_audioStripFrames(0)
+    , m_audioStripBytes(0)
+    , m_audioTailBytes(0)
 {
     m_monPath[0] = 0;
     m_audioPath[0] = 0;
@@ -2269,6 +2293,8 @@ void CiSightStream::AudioStart()
     m_audioPeak = 0;
     m_audioBytes = 0;
     m_audioPath[0] = '\0';
+    m_audioStripPackets = m_audioStripFrames = m_audioStripBytes = 0;
+    m_audioTailBytes = 0;
 
     const ISightOptions &o = Opts();
     if (!o.audioOn || m_pCam == NULL)
@@ -2341,19 +2367,28 @@ void CiSightStream::AudioStop()
 }
 
 // Called right after a successful AcquireImageEx(): the frame the video will
-// be built from is also the buffer the camera put its audio packets in, so
-// scan it for "sght" and pull the PCM out.  Nothing here blocks; a frame
-// without audio packets (the camera sends 8 video packets per audio packet
-// or so) simply finds nothing.
+// be built from is also the buffer the camera put its audio packets in.
+// One pass over the buffer does two things:
+//   1. every valid "sght" packet is decoded into PCM (stats + optional wav);
+//   2. with [audio] strip=1 the packet is cut out again.  The 1394 driver
+//      splices audio into the picture as if it were video bytes -- measured
+//      in v16 as ~14 packets of 816 bytes per frame: ten horizontal seams
+//      and an 11 KB rainbow band at the bottom of the picture.  After
+//      compaction the front of the buffer is a clean UYVY frame and the
+//      video converters see video bytes only.
 void CiSightStream::AudioScanFrame()
 {
     if (!m_audioOn || m_pCam == NULL)
         return;
     const ISightOptions &o = Opts();
-    const BYTE *p = NULL;
+    BYTE *p = NULL;
     ULONG cb = 0;
     if (m_pCam->GetRawFrameBuffer(&p, &cb) != CAM_SUCCESS || p == NULL || cb < 32)
         return;
+
+    const bool  strip = o.audioStrip != 0;
+    const ULONG want  = m_width * m_height * 2;    // UYVY bytes of a full frame
+    ULONG keep = 0, w = 0;   // [keep,..) unexamined; [0,w) already compacted
 
     InterlockedIncrement(&m_audioFramesScanned);
     const ULONG limit = (cb > AUDIO_HEADER + 8) ? (cb - 8) : 0;
@@ -2367,8 +2402,8 @@ void CiSightStream::AudioScanFrame()
         ULONG total = RdBE32(p + start + 8);       // running frame counter
         if (count == 0 || count > AUDIO_MAX_FRAMES)
         {
-            ++m_audioBad;                          // a stray signature
-            continue;
+            ++m_audioBad;                          // a stray signature: video
+            continue;                              // bytes, leave them alone
         }
         ULONG body = start + AUDIO_HEADER;
         ULONG need = count * 4;                    // 2 channels * 16 bit
@@ -2381,6 +2416,8 @@ void CiSightStream::AudioScanFrame()
             cut = true;
         }
         if (need < 4) { ++m_audioBad; continue; }
+        ULONG end = body + need;
+        if (end > cb) end = cb;
 
         if (m_audioExpectValid && total != m_audioExpect)
         {
@@ -2424,7 +2461,35 @@ void CiSightStream::AudioScanFrame()
                  (long)m_audioPackets, (unsigned long)start, (unsigned long)cb,
                  (unsigned long)count, (unsigned long)total, cut ? " (cut)" : "");
 
-        i = body + need;                            // skip this packet's body
+        if (strip && !cut && start >= keep)
+        {
+            // cut [start, end) out: move the video bytes seen since the
+            // last cut down over it.  w <= keep <= start always holds, so
+            // source and destination never overlap the packet itself.
+            if (start > keep) { memmove(p + w, p + keep, start - keep); w += start - keep; }
+            m_audioStripBytes += (LONG)(end - start);
+            ++m_audioStripPackets;
+            keep = end;
+            i = end - 1;                           // resume after this packet
+        }
+        else
+        {
+            i = body + need - 1;                   // skip this packet's body
+        }
+    }
+
+    if (strip)
+    {
+        // move the video tail down over the (already cut) holes
+        if (cb > keep) { memmove(p + w, p + keep, cb - keep); w += cb - keep; }
+        ++m_audioStripFrames;
+        m_audioTailBytes = (LONG)w;
+        if (m_audioStripFrames <= 3 || (m_audioStripFrames % 300) == 0)
+            FLog("audio: strip frame #%ld: %ld packets / %ld bytes cut, "
+                 "%ld bytes of frame data left (a full frame is %lu)",
+                 (long)m_audioStripFrames, (long)m_audioStripPackets,
+                 (long)m_audioStripBytes, (long)m_audioTailBytes,
+                 (unsigned long)want);
     }
 
     if (o.audioLog >= 1 && m_audioPackets > 0 &&
