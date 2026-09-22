@@ -48,6 +48,23 @@ isightmic.sys,,,0x00000002    ; COPYFLG_NODECOMP
 HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
 HKR,,Driver,,isightmic.sys
 HKR,,NTMPDriver,,"isightmic.sys"
+; Register with wdmaud.drv so the device also appears on the legacy wave/mixer
+; API surface, not just as a WASAPI endpoint (the reference INF does the same).
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%DeviceName%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%DeviceName%
+
+; PortCls adapters are FILE_DEVICE_SOUND devices, and the device has to be
+; openable by ordinary users -- a recording app is not an administrator.
+[IsightMic.Install.NT.HW]
+AddReg = IsightMic.HW.AddReg
+
+[IsightMic.HW.AddReg]
+HKR,,DeviceType,0x10001,0x0000001D
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 
 [IsightMic.Install.NT.Services]
 Include = ks.inf,wdmaudio.inf
@@ -60,12 +77,26 @@ ServiceType   = 1                  ; SERVICE_KERNEL_DRIVER
 StartType     = 3                  ; SERVICE_DEMAND_START
 ErrorControl  = 1
 ServiceBinary = %12%\isightmic.sys
-LoadOrderGroup = "Base"
+; No LoadOrderGroup: this is a PnP function driver, and the reference INF does
+; not put audio adapters in one.
 
 ; The endpoint the user picks in WeChat / QQ / OBS comes from these interfaces.
+;
+; The reference string (the second column) is NOT free-form: it must be exactly
+; the name the driver passes to PcRegisterSubdevice in StartDevice -- "Wave" and
+; "Topology" here.  Microsoft's own sample says so in a comment at the call site
+; ("make sure this name matches with <...>.szPname in the inf's [Strings]
+; section"); with a mismatched name the registry values below land on an
+; interface nobody registered and the endpoint comes up unnamed or not at all.
+;
+; The category set is the reference capture set: AUDIO + REALTIME + CAPTURE on
+; the wave subdevice, AUDIO + TOPOLOGY on the topology subdevice.
 [IsightMic.Install.NT.Interfaces]
-AddInterface = %KSCATEGORY_AUDIO%,   "GLOBAL", IsightMic.I.Audio
-AddInterface = %KSCATEGORY_CAPTURE%, "GLOBAL", IsightMic.I.Capture
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Wave%,     IsightMic.I.Audio
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Wave%,     IsightMic.I.Audio
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_Wave%,     IsightMic.I.Audio
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, IsightMic.I.Topology
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, IsightMic.I.Topology
 
 [IsightMic.I.Audio]
 AddReg = IsightMic.I.Audio.AddReg
@@ -74,11 +105,11 @@ AddReg = IsightMic.I.Audio.AddReg
 HKR,,FriendlyName,,%DeviceName%
 HKR,,CLSID,,%Proxy.CLSID%
 
-[IsightMic.I.Capture]
-AddReg = IsightMic.I.Capture.AddReg
+[IsightMic.I.Topology]
+AddReg = IsightMic.I.Topology.AddReg
 
-[IsightMic.I.Capture.AddReg]
-HKR,,FriendlyName,,%DeviceName%
+[IsightMic.I.Topology.AddReg]
+HKR,,FriendlyName,,%DeviceName% Topology
 HKR,,CLSID,,%Proxy.CLSID%
 
 [Strings]
@@ -86,5 +117,9 @@ Provider            = "iSightCam Project"
 DiskName            = "iSight Virtual Microphone"
 DeviceName          = "iSight Microphone (FireWire)"
 Proxy.CLSID         = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSNAME_Wave         = "Wave"
+KSNAME_Topology     = "Topology"
 KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
 KSCATEGORY_CAPTURE  = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
