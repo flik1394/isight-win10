@@ -98,17 +98,35 @@ jobs:
           if (-not (Test-Path sample.wav)) { throw "sample.wav was not created" }
           Get-Item sample.wav | Select-Object Name, Length
 
+      # inf2cat ships with the WDK and signtool with the SDK, and on this image
+      # they are not in the same bin subtree (nor necessarily in bin\x64 at
+      # all), so search the whole Kits tree rather than guessing a path.
+      - name: Locate the signing tools
+        shell: pwsh
+        run: |
+          $kits = 'C:\Program Files (x86)\Windows Kits'
+          foreach ($tool in 'inf2cat.exe', 'signtool.exe') {
+            $hit = Get-ChildItem $kits -Recurse -Filter $tool -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+            if ($hit) {
+              Write-Host ("FOUND {0} -> {1}" -f $tool, $hit)
+              "{0}_PATH={1}" -f ($tool -replace '\.exe$', ''), $hit |
+                Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            } else {
+              Write-Host ("MISSING {0}" -f $tool)
+            }
+          }
+          Write-Host '=== Windows Kits\10\bin subtrees ==='
+          Get-ChildItem "$kits\10\bin" -Directory -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
+
       - name: Test-sign the driver and build its catalog
         shell: pwsh
         run: |
-          # The SDK tools live either in bin\x64 or bin\<version>\x64 depending
-          # on the image; find whichever actually has them.
-          $sdk = @(
-            'C:\Program Files (x86)\Windows Kits\10\bin\x64',
-            'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64'
-          ) | Where-Object { Test-Path (Join-Path $_ 'inf2cat.exe') } | Select-Object -First 1
-          if (-not $sdk) { throw "inf2cat.exe not found under Windows Kits\10\bin" }
-          Write-Host "using SDK tools from $sdk"
+          if (-not $env:inf2cat_PATH) { throw "inf2cat.exe not found anywhere under Windows Kits" }
+          if (-not $env:signtool_PATH) { throw "signtool.exe not found anywhere under Windows Kits" }
+          Write-Host "inf2cat  = $env:inf2cat_PATH"
+          Write-Host "signtool = $env:signtool_PATH"
 
           New-Item -ItemType Directory -Force -Path micpkg | Out-Null
           # The INF lives next to its source, not at the repo root.
@@ -125,44 +143,34 @@ jobs:
           Export-Certificate -Cert $cert -FilePath micpkg\iSightMicTest.cer | Out-Null
 
           # Catalog built from the INF; both the .sys and the .cat get signed.
-          & "$sdk\inf2cat.exe" /driver:micpkg /os:10_X64 /verbose
+          & $env:inf2cat_PATH /driver:micpkg /os:10_X64 /verbose
           if ($LASTEXITCODE -ne 0) { throw "inf2cat failed ($LASTEXITCODE)" }
-          & "$sdk\signtool.exe" sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.sys
+          & $env:signtool_PATH sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.sys
           if ($LASTEXITCODE -ne 0) { throw "sign isightmic.sys failed ($LASTEXITCODE)" }
-          & "$sdk\signtool.exe" sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.cat
+          & $env:signtool_PATH sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.cat
           if ($LASTEXITCODE -ne 0) { throw "sign isightmic.cat failed ($LASTEXITCODE)" }
-          & "$sdk\signtool.exe" verify /v /pa micpkg\isightmic.sys
+          & $env:signtool_PATH verify /v /pa micpkg\isightmic.sys
           Get-ChildItem micpkg | Select-Object Name, Length
 
       - name: Assemble package
         shell: pwsh
         run: |
-          Copy-Item micpkg\isightmic.inf, micpkg\isightmic.sys, micpkg\isightmic.cat, micpkg\iSightMicTest.cer `
-                    isight-micsvc.exe, isight-micdev.exe, sample.wav -Destination .
-          # The .bat / .txt carry Chinese text; cmd.exe reads them in the console
-          # codepage (936 on a Chinese Windows), so re-encode to GBK with CRLF.
+          New-Item -ItemType Directory -Force -Path pkg | Out-Null
+          Copy-Item micpkg\* pkg\ -Force
+          Copy-Item isight-micsvc.exe, isight-micdev.exe, sample.wav pkg\ -Force
+          # The .bat / .txt carry Chinese text.  cmd.exe reads them in the console
+          # codepage (936 on a Chinese Windows), so a UTF-8 file shows up as
+          # garbled text -- re-encode to GBK with CRLF, which is what cmd wants.
           $gbk = [Text.Encoding]::GetEncoding(936)
           foreach ($f in "install-mic.bat", "uninstall-mic.bat", "README-mic.txt") {
             $text = [IO.File]::ReadAllText("drivers\$f", [Text.Encoding]::UTF8)
             $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n"
-            [IO.File]::WriteAllText($f, $text, $gbk)
+            [IO.File]::WriteAllText("pkg\$f", $text, $gbk)
           }
-          Get-ChildItem isightmic.*, iSightMicTest.cer, isight-micsvc.exe, isight-micdev.exe, `
-                        install-mic.bat, uninstall-mic.bat, README-mic.txt |
-            Select-Object Name, Length
+          Get-ChildItem pkg | Select-Object Name, Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: isight-vmic
-          path: |
-            isightmic.sys
-            isightmic.inf
-            isightmic.cat
-            iSightMicTest.cer
-            isight-micsvc.exe
-            isight-micdev.exe
-            sample.wav
-            install-mic.bat
-            uninstall-mic.bat
-            README-mic.txt
+          path: pkg/
