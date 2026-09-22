@@ -64,7 +64,9 @@ jobs:
           REM it ever reaches our code.
           REM /Fo: cl puts the object file in the *current* directory, not next
           REM to the source, so pin it -- otherwise link looks in the wrong place.
-          cl /nologo /kernel /c /W3 /O2 /D_AMD64_ /Fo:isightmic.obj ^
+          REM /GS-: a kernel driver must not pull in the user-mode CRT's GS
+          REM handler (LIBCMT's gs_report.obj wants UnhandledExceptionFilter).
+          cl /nologo /kernel /c /W3 /O2 /D_AMD64_ /GS- /Fo:isightmic.obj ^
              /I"%KIT%\Include\10.0.26100.0\km" ^
              /I"%KIT%\Include\10.0.26100.0\km\crt" ^
              /I"%KIT%\Include\10.0.26100.0\shared" ^
@@ -72,8 +74,10 @@ jobs:
              drivers\isightmic\isightmic.cpp
           if errorlevel 1 exit /b 1
           link /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /MACHINE:X64 ^
+             /NODEFAULTLIB:LIBCMT /NODEFAULTLIB:LIBCMTD /NODEFAULTLIB:MSVCRT ^
              /LIBPATH:"%KIT%\Lib\10.0.26100.0\km\x64" ^
-             portcls.lib ks.lib drmk.lib ntoskrnl.lib hal.lib wmilib.lib wdmsec.lib ^
+             portcls.lib ks.lib ksguid.lib drmk.lib ntoskrnl.lib hal.lib ^
+             wmilib.lib wdmsec.lib BufferOverflowK.lib ^
              /OUT:isightmic.sys isightmic.obj
           if errorlevel 1 exit /b 1
           dir isightmic.sys
