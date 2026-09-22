@@ -93,6 +93,21 @@ jobs:
           if errorlevel 1 exit /b 1
           dir isight-micsvc.exe isight-micdev.exe
 
+      # isight-miccheck.exe is the confidence check: it opens the control
+      # device, watches the driver counters, enumerates capture endpoints and
+      # records what actually comes back out of the endpoint.  It is a
+      # convenience, not the product, so a compile error in it must NOT cost us
+      # the driver package -- hence continue-on-error and the guarded copy
+      # below.
+      - name: Build the endpoint checker (optional)
+        shell: cmd
+        continue-on-error: true
+        run: |
+          cl /nologo /O2 /W3 /EHsc /MD /I"drivers\isightmic" ^
+             tools\miccheck.cpp ole32.lib /Fe:isight-miccheck.exe
+          if errorlevel 1 exit /b 1
+          dir isight-miccheck.exe
+
       - name: Generate a sample WAV (for the M1 loopback test)
         shell: pwsh
         run: |
@@ -190,6 +205,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path pkg | Out-Null
           Copy-Item micpkg\* pkg\ -Force
           Copy-Item isight-micsvc.exe, isight-micdev.exe, sample.wav pkg\ -Force
+          Copy-Item isight-miccheck.exe pkg\ -ErrorAction SilentlyContinue
           # The .bat / .txt carry Chinese text.  cmd.exe reads them in the console
           # codepage (936 on a Chinese Windows), so a UTF-8 file shows up as
           # garbled text -- re-encode to GBK with CRLF, which is what cmd wants.
@@ -225,6 +241,7 @@ jobs:
             isightmic.sys
             isight-micsvc.exe
             isight-micdev.exe
+            isight-miccheck.exe
             sample.wav
             drivers/isightmic/isightmic.inf
             drivers/isightmic/isightmic.h
