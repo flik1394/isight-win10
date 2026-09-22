@@ -227,7 +227,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V17-20260922-STRIP"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V18-20260922-PADTAIL"
 
 // Public release number.  The build tag above changes on every internal
 // iteration (and install-all.bat greps for its "V14" prefix); this one is
@@ -566,6 +566,9 @@ struct ISightOptions
     int  audioWav;          // [audio] wav=      1 = write the PCM to disk
     int  audioMaxMB;        // [audio] maxmb=    0 = no limit
     int  audioLog;          // [audio] log=      0/1/2, 2 = per-packet
+    int  audioRawDump;      // [audio] rawdump=  1 = write the untouched
+                            //     capture buffer of the first frames to
+                            //     %LOCALAPPDATA%\iSightCam-dump\ (forensics)
     int  audioStrip;        // [audio] strip=    1 = cut audio packets out of
                             //     the frame buffer before the picture is
                             //     converted (fixes the flickering bands);
@@ -753,7 +756,11 @@ static void WriteDefaultIni(const char *path)
         "; the picture is converted.  The 1394 driver splices them into the\n"
         "; image as if they were video bytes (flickering seams + a rainbow\n"
         "; band at the bottom).  strip=0 restores the v16 behaviour.\n"
-        "strip=1\n");
+        "strip=1\n"
+        "; v18: rawdump=1 writes the first two untouched capture buffers to\n"
+        "; %%LOCALAPPDATA%%\\iSightCam-dump\\frame-raw-*.bin -- the only way to\n"
+        "; measure what an audio packet really occupies in the stream.\n"
+        "rawdump=1\n");
     fclose(f);
 }
 
@@ -857,6 +864,7 @@ static const ISightOptions &Opts()
         if (s_o.audioLog < 0) s_o.audioLog = 0;
         if (s_o.audioLog > 2) s_o.audioLog = 2;
         s_o.audioStrip = GetPrivateProfileIntA("audio", "strip", 1, ini) != 0;
+        s_o.audioRawDump = GetPrivateProfileIntA("audio", "rawdump", 1, ini) != 0;
 
         FLog("options: audio %s (gain=%d wav=%d maxmb=%d log=%d)",
              s_o.audioOn ? "ON" : "off", s_o.audioGain, s_o.audioWav,
@@ -1499,6 +1507,34 @@ static void DumpFrame(const BYTE *buf, const SubTypeInfo &si, ULONG width, ULONG
          (unsigned long)bytes);
 }
 
+// v18 forensics: the untouched capture buffer, before the audio packets are
+// cut out of it.  Offline this is the only way to measure how many bytes an
+// audio packet really occupies in the stream (the cut length is currently
+// derived from the packet header, and a wrong guess leaves the picture
+// displaced).  Only active with [audio] rawdump=1.
+static void DumpRawFrame(const BYTE *buf, ULONG cb, ULONG index)
+{
+    char dir[MAX_PATH] = "";
+    if (GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH) == 0)
+        GetTempPathA(MAX_PATH, dir);
+
+    char path[MAX_PATH] = "";
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\iSightCam-dump", dir);
+    CreateDirectoryA(path, NULL);
+
+    char file[MAX_PATH] = "";
+    _snprintf_s(file, sizeof(file), _TRUNCATE, "%s\\frame-raw-pid%lu-%lu.bin",
+                path, (unsigned long)GetCurrentProcessId(), (unsigned long)index);
+
+    FILE *f = fopen(file, "wb");
+    if (f == NULL)
+        return;
+    fwrite(buf, 1, cb, f);
+    fclose(f);
+    FLog("DumpRawFrame: %s (%lu bytes, audio packets not yet cut)",
+         file, (unsigned long)cb);
+}
+
 //---------------------------------------------------------------------
 // CiSightStream : one output pin, delivering RGB24 / YUY2 / RGB32
 //---------------------------------------------------------------------
@@ -1561,6 +1597,7 @@ private:
     void  AudioStart();
     void  AudioStop();
     void  AudioScanFrame();
+    ULONG FrameBytes() const;            // bytes of one raw frame as streamed
     void  BuildMediaType(const GUID *subtype, REFERENCE_TIME interval, CMediaType *pmt) const;
     bool  MediaTypeCompatible(const CMediaType *pmt, CMediaType *pNormalized) const;
 
@@ -1633,6 +1670,13 @@ private:
     LONG             m_audioStripFrames;   // frames compacted
     LONG             m_audioStripBytes;    // bytes cut this session
     LONG             m_audioTailBytes;     // bytes left in the last compacted frame
+    LONG             m_audioPadBytes;      // bytes borrowed from the previous frame
+
+    // v18: the audio packets eat the tail of the frame -- the buffer is
+    // exactly one frame (460800 B of YUV411) and what the audio takes the
+    // picture loses.  Keep the tail of the previous frame to pad with.
+    BYTE            *m_audioPrevTail;
+    LONG             m_audioPrevTailBytes;
 };
 
 //---------------------------------------------------------------------
@@ -1752,9 +1796,14 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_audioStripFrames(0)
     , m_audioStripBytes(0)
     , m_audioTailBytes(0)
+    , m_audioPadBytes(0)
+    , m_audioPrevTail(NULL)
+    , m_audioPrevTailBytes(0)
 {
     m_monPath[0] = 0;
     m_audioPath[0] = 0;
+    m_audioPrevTail = new BYTE[AUDIO_TAIL_CAP];
+    if (m_audioPrevTail) ZeroMemory(m_audioPrevTail, AUDIO_TAIL_CAP);
 }
 
 CiSightStream::~CiSightStream()
@@ -1780,6 +1829,11 @@ CiSightStream::~CiSightStream()
     {
         delete[] m_pFit;
         m_pFit = NULL;
+    }
+    if (m_audioPrevTail)
+    {
+        delete[] m_audioPrevTail;
+        m_audioPrevTail = NULL;
     }
 }
 
@@ -2231,6 +2285,7 @@ void CiSightStream::ReleaseCamera()
 #define AUDIO_RATE_48000  0x80000000u
 #define AUDIO_MAX_FRAMES  475            // the camera's per-packet limit
 #define AUDIO_HEADER      16
+#define AUDIO_TAIL_CAP    65536          // how much of the last frame we keep
 
 // DCAM 0x60C packs the channel differently in 1394a and 1394b mode
 static ULONG AudioChannelOf60C(ULONG v)
@@ -2295,6 +2350,8 @@ void CiSightStream::AudioStart()
     m_audioPath[0] = '\0';
     m_audioStripPackets = m_audioStripFrames = m_audioStripBytes = 0;
     m_audioTailBytes = 0;
+    m_audioPadBytes = 0;
+    m_audioPrevTailBytes = 0;
 
     const ISightOptions &o = Opts();
     if (!o.audioOn || m_pCam == NULL)
@@ -2366,6 +2423,15 @@ void CiSightStream::AudioStop()
     }
 }
 
+// Bytes of one raw frame exactly as the camera streams it.  Format 0 / Mode 2
+// is 640x480 YUV411 (IIDC: 12 bits per pixel) -> 460800 bytes, and that is
+// also what the 1394 driver allocates: the capture buffer has no slack at
+// all, so every byte the audio unit sends is a byte the picture loses.
+ULONG CiSightStream::FrameBytes() const
+{
+    return m_width * m_height * 3 / 2;
+}
+
 // Called right after a successful AcquireImageEx(): the frame the video will
 // be built from is also the buffer the camera put its audio packets in.
 // One pass over the buffer does two things:
@@ -2387,8 +2453,11 @@ void CiSightStream::AudioScanFrame()
         return;
 
     const bool  strip = o.audioStrip != 0;
-    const ULONG want  = m_width * m_height * 2;    // UYVY bytes of a full frame
+    const ULONG want  = FrameBytes();           // 460800 -- one YUV411 frame
     ULONG keep = 0, w = 0;   // [keep,..) unexamined; [0,w) already compacted
+
+    if (o.audioRawDump && m_audioFramesScanned <= 2)
+        DumpRawFrame(p, cb, (ULONG)m_audioFramesScanned);
 
     InterlockedIncrement(&m_audioFramesScanned);
     const ULONG limit = (cb > AUDIO_HEADER + 8) ? (cb - 8) : 0;
@@ -2484,12 +2553,44 @@ void CiSightStream::AudioScanFrame()
         if (cb > keep) { memmove(p + w, p + keep, cb - keep); w += cb - keep; }
         ++m_audioStripFrames;
         m_audioTailBytes = (LONG)w;
+
+        // the audio packets took the tail of this frame out of the buffer
+        // (the buffer is exactly one frame long, nothing is spare) -- pad it
+        // back with the tail of the previous frame so the converters still
+        // see a complete picture.  The last few rows of a 15 fps frame hardly
+        // move, so borrowing them is invisible.
+        LONG pad = 0;
+        if (w < want)
+        {
+            pad = (LONG)want - (LONG)w;
+            ULONG have = (m_audioPrevTailBytes >= pad) ? (ULONG)pad
+                                                       : (ULONG)m_audioPrevTailBytes;
+            if (have > 0 && m_audioPrevTail != NULL)
+                memcpy(p + w, m_audioPrevTail + (m_audioPrevTailBytes - have), have);
+            if (have < (ULONG)pad)
+                ZeroMemory(p + w + have, (ULONG)pad - have);
+            m_audioPadBytes += pad;
+            w = want;
+        }
+        else if (w > want + AUDIO_TAIL_CAP)
+        {
+            w = want + AUDIO_TAIL_CAP;          // never keep more than we can stash
+        }
+
+        // remember this frame's tail for the next one
+        if (m_audioPrevTail != NULL && w > 0)
+        {
+            ULONG save = (w < AUDIO_TAIL_CAP) ? w : (ULONG)AUDIO_TAIL_CAP;
+            memcpy(m_audioPrevTail, p + (w - save), save);
+            m_audioPrevTailBytes = (LONG)save;
+        }
+
         if (m_audioStripFrames <= 3 || (m_audioStripFrames % 300) == 0)
             FLog("audio: strip frame #%ld: %ld packets / %ld bytes cut, "
-                 "%ld bytes of frame data left (a full frame is %lu)",
+                 "%ld bytes of picture left, %ld padded (a full frame is %lu)",
                  (long)m_audioStripFrames, (long)m_audioStripPackets,
                  (long)m_audioStripBytes, (long)m_audioTailBytes,
-                 (unsigned long)want);
+                 (long)pad, (unsigned long)want);
     }
 
     if (o.audioLog >= 1 && m_audioPackets > 0 &&
