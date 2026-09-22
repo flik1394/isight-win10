@@ -25,6 +25,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # tools/make_sample_wav.py needs a real interpreter; do not assume the
+      # image's `python` resolves to anything but the Store alias.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Setup MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -76,16 +83,9 @@ jobs:
       - name: Generate a sample WAV (for the M1 loopback test)
         shell: pwsh
         run: |
-          python -c @'
-import struct, math, wave
-sr=48000; dur=3.0; f=440.0
-w=wave.open("sample.wav","wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr)
-for i in range(int(sr*dur)):
-    v=int(32767*0.3*math.sin(2*math.pi*f*i/sr))
-    w.writeframes(struct.pack("<hh",v,v))
-w.close()
-print("wrote sample.wav (48k/16/stereo, 3 s, 440 Hz tone)")
-'@
+          python tools\make_sample_wav.py sample.wav
+          if (-not (Test-Path sample.wav)) { throw "sample.wav was not created" }
+          Get-Item sample.wav | Select-Object Name, Length
 
       - name: Test-sign the driver and build its catalog
         shell: pwsh
