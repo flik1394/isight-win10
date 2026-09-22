@@ -101,23 +101,37 @@ jobs:
       - name: Test-sign the driver and build its catalog
         shell: pwsh
         run: |
-          $sdk = 'C:\Program Files (x86)\Windows Kits\10\bin\x64'
+          # The SDK tools live either in bin\x64 or bin\<version>\x64 depending
+          # on the image; find whichever actually has them.
+          $sdk = @(
+            'C:\Program Files (x86)\Windows Kits\10\bin\x64',
+            'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64'
+          ) | Where-Object { Test-Path (Join-Path $_ 'inf2cat.exe') } | Select-Object -First 1
+          if (-not $sdk) { throw "inf2cat.exe not found under Windows Kits\10\bin" }
+          Write-Host "using SDK tools from $sdk"
+
           New-Item -ItemType Directory -Force -Path micpkg | Out-Null
-          Copy-Item isightmic.inf, isightmic.sys micpkg/
+          # The INF lives next to its source, not at the repo root.
+          Copy-Item drivers\isightmic\isightmic.inf micpkg\isightmic.inf -Force
+          Copy-Item isightmic.sys micpkg\isightmic.sys -Force
+          Get-Item micpkg\isightmic.sys | Select-Object Name, Length
+
           # Throwaway self-signed code-signing cert (lives only on this runner).
           $cert = New-SelfSignedCertificate -Type CodeSigningCert `
                   -Subject "CN=iSightMic Test" `
                   -CertStoreLocation "Cert:\CurrentUser\My" `
                   -KeyUsage DigitalSignature `
                   -NotAfter (Get-Date).AddYears(10)
-          Export-Certificate -Cert $cert -FilePath micpkg\iSightMicTest.cer
+          Export-Certificate -Cert $cert -FilePath micpkg\iSightMicTest.cer | Out-Null
+
           # Catalog built from the INF; both the .sys and the .cat get signed.
           & "$sdk\inf2cat.exe" /driver:micpkg /os:10_X64 /verbose
-          if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
+          if ($LASTEXITCODE -ne 0) { throw "inf2cat failed ($LASTEXITCODE)" }
           & "$sdk\signtool.exe" sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.sys
-          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.sys failed" }
+          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.sys failed ($LASTEXITCODE)" }
           & "$sdk\signtool.exe" sign /fd SHA256 /sha1 $cert.Thumbprint micpkg\isightmic.cat
-          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.cat failed" }
+          if ($LASTEXITCODE -ne 0) { throw "sign isightmic.cat failed ($LASTEXITCODE)" }
+          & "$sdk\signtool.exe" verify /v /pa micpkg\isightmic.sys
           Get-ChildItem micpkg | Select-Object Name, Length
 
       - name: Assemble package
