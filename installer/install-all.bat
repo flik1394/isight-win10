@@ -30,7 +30,7 @@ rem    * 目标文件被占用时先改名再复制，复制后按版本标记�
 rem ============================================================
 
 set "REL=1.0.0"
-set "TAG=ISIGHTFILTER-BUILD-V18-20260922-AUDIO"
+set "TAG=ISIGHTFILTER-BUILD-V19-20260922-MICFEED"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
@@ -133,6 +133,29 @@ echo  通话中的小窗里如果红框四边都看得见、且没有多余黑�
 echo  目标矩形对了（记得把 guide 改回 0）。还嫌近就把 target 调宽
 echo  （360x480、480x480）；两侧出现黑边就调窄（270x480）。
 echo  hosts 让这块矩形只对微信生效，QQ 不受影响；target=0 恢复原样。
+echo.
+echo  ============================================================
+echo  麦克风（v19 新增）
+echo  ============================================================
+echo  本版会把 iSight 的麦克风送进系统，变成一个真正的录音设备
+echo  "iSight Microphone (FireWire)"，微信 / QQ / OBS / 腾讯会议里
+echo  可以直接选它。
+echo.
+echo  还需要装一次虚拟麦克风驱动（只做一次，要重启）：
+echo    1) 管理员运行: bcdedit /set testsigning on   然后重启
+echo    2) 进 drivers 包，右键 install-mic.bat -> 以管理员身份运行
+echo    3) 用 isight-miccheck.exe 自检，报告写在 miccheck.txt
+echo.
+echo  开关（同一个 ini %LOCALAPPDATA%\iSightCam.ini）：
+echo    [audio]
+echo    enable=1     0 = 完全不碰音频单元（画面与旧版一致）
+echo    mic=1        1 = 把麦克风送进虚拟麦克风设备（v19 默认）
+echo    wav=1        1 = 同时把 PCM 存成 iSightAudio.wav
+echo.
+echo  注意：麦克风的声音来自"正在使用摄像头"的那条 FireWire 流，
+echo  所以要先有程序在用摄像头（比如微信通话里选了摄像头），
+echo  麦克风才有声音。日志：%LOCALAPPDATA%\iSightCam.log 里的
+echo  "mic:" 行会写明推了多少字节。
 echo ============================================================
 pause
 exit /b 0
@@ -165,10 +188,10 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V18" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V19" "%~1" >nul 2>&1
 if errorlevel 1 (
-    echo     [FAIL] %~1 里没有 v14 标记 —— 这个文件还是旧版！
+    echo     [FAIL] %~1 里没有 v19 标记 —— 这个文件还是旧版！
     exit /b 1
 )
-for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v14 标记
+for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v19 标记
 exit /b 0
