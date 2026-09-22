@@ -14,6 +14,7 @@
 //   (loops forever; Ctrl+C to stop)
 
 #include <windows.h>
+#include <winioctl.h>   // CTL_CODE / METHOD_BUFFERED, used by isightmic.h
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
