@@ -1,58 +1,90 @@
-; isightmic.inf - install the iSight virtual microphone (PortCls capture miniport)
+; isightmic.inf -- install the iSight virtual microphone (PortCls WaveCyclic
+; capture miniport).
 ;
-; Test-signed only.  The target machine must have `bcdedit /set testsigning on`
-; and be rebooted once before installing.  Install with:
-;     devcon install isightmic.inf ISIGHTMIC\Mic
+; This is a software device: there is no hardware for PnP to find, so the
+; device node has to be created on purpose.  isight-micdev.exe does that (it
+; stages this INF into the driver store, creates a root-enumerated node with
+; the hardware ID below and installs the driver onto it).
+;
+; Test-signed: the target machine needs
+;     bcdedit /set testsigning on    (+ one reboot)
+; and the iSightMicTest.cer that ships with the package installed into the
+; machine's Root and TrustedPublisher stores.
 
 [Version]
 Signature   = "$Windows NT$"
-Class        = Media
-ClassGuid    = {4d36e96c-e325-11ce-bfc1-08002be10318}
-Provider     = %Provider%
-CatalogFile  = isightmic.cat
-DriverVer    = 09/13/2026,1.0.0.0
+Class       = Media
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+CatalogFile = isightmic.cat
+DriverVer   = 09/22/2026,1.0.0.0
 
 [Manufacturer]
-%Manufacturer% = IsightMic,NTamd64
+%Provider% = IsightMic,NTamd64
 
 [IsightMic.NTamd64]
-%DeviceName%  = IsightMicInstall, ISIGHTMIC\Mic
+%DeviceName% = IsightMic.Install, ISIGHTMIC\Mic
 
-[IsightMicInstall]
-CopyFiles = IsightMic.Copy
+[DestinationDirs]
+IsightMic.CopyFiles = 12
 
-[IsightMicInstall.Services]
-AddService = isightmic, 0x00000002, IsightMic.Service
+[SourceDisksNames]
+1 = %DiskName%,,,\
 
-[IsightMic.Copy]
-isightmic.sys
+[SourceDisksFiles]
+isightmic.sys = 1
 
-[IsightMic.Service]
-ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
-StartType      = 3                  ; SERVICE_DEMAND_START
-ErrorControl   = 1
-ServiceBinary  = %12%\isightmic.sys
-LoadOrderGroup = "Base"
+; PortCls adapters must pull in the class installers for KS and WDMAUDIO.
+[IsightMic.Install.NT]
+Include       = ks.inf,wdmaudio.inf
+Needs         = KS.Registration,WDMAUDIO.Registration
+CopyFiles     = IsightMic.CopyFiles
+AddReg        = IsightMic.AddReg
 
-[IsightMicInstall.Interfaces]
-AddInterface = %KSCATEGORY_AUDIO%,      %PlugPlayGuid%, IsightMic.Interface
-AddInterface = %KSCATEGORY_CAPTURE%,    %PlugPlayGuid%, IsightMic.Interface
+[IsightMic.CopyFiles]
+isightmic.sys,,,0x00000002    ; COPYFLG_NODECOMP
 
-[IsightMic.Interface]
-AddReg = IsightMic.Interface.AddReg
-
-[IsightMic.Interface.AddReg]
-HKR,,FriendlyName,,%DeviceName%
-
-[IsightMicInstall.AddReg]
+[IsightMic.AddReg]
 HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
-HKR,,Driver,,%12%\isightmic.sys
+HKR,,Driver,,isightmic.sys
 HKR,,NTMPDriver,,"isightmic.sys"
 
+[IsightMic.Install.NT.Services]
+Include = ks.inf,wdmaudio.inf
+Needs   = KS.Registration.Services,WDMAUDIO.Registration.Services
+AddService = isightmic, 0x00000002, IsightMic.Service
+
+[IsightMic.Service]
+DisplayName   = %DeviceName%
+ServiceType   = 1                  ; SERVICE_KERNEL_DRIVER
+StartType     = 3                  ; SERVICE_DEMAND_START
+ErrorControl  = 1
+ServiceBinary = %12%\isightmic.sys
+LoadOrderGroup = "Base"
+
+; The endpoint the user picks in WeChat / QQ / OBS comes from these interfaces.
+[IsightMic.Install.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,   "GLOBAL", IsightMic.I.Audio
+AddInterface = %KSCATEGORY_CAPTURE%, "GLOBAL", IsightMic.I.Capture
+
+[IsightMic.I.Audio]
+AddReg = IsightMic.I.Audio.AddReg
+
+[IsightMic.I.Audio.AddReg]
+HKR,,FriendlyName,,%DeviceName%
+HKR,,CLSID,,%Proxy.CLSID%
+
+[IsightMic.I.Capture]
+AddReg = IsightMic.I.Capture.AddReg
+
+[IsightMic.I.Capture.AddReg]
+HKR,,FriendlyName,,%DeviceName%
+HKR,,CLSID,,%Proxy.CLSID%
+
 [Strings]
-Provider      = "iSightCam Project"
-Manufacturer  = "iSightCam Project"
-DeviceName    = "iSight Microphone (FireWire)"
-KSCATEGORY_AUDIO   = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
-KSCATEGORY_CAPTURE = "{65E8773D-S56B-11D0-A3B9-00A0C9223196}"
-PlugPlayGuid  = "{B85DDDFB-F2A7-4c0e-A5C2-0E9D8C9D0E1F}"
+Provider            = "iSightCam Project"
+DiskName            = "iSight Virtual Microphone"
+DeviceName          = "iSight Microphone (FireWire)"
+Proxy.CLSID         = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_CAPTURE  = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
