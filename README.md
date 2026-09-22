@@ -55,9 +55,13 @@
 
 ## 已知限制
 
-- **无麦克风**。iSight 的麦克风走 FireWire 上一条**独立的音频通道**（不是 AV/C、不是 USB audio），
-  Windows 自带的 1394 驱动栈只做视频，认不出它。可用其它麦克风代替；
-  音频链路的技术验证见[路线图](#路线图)。
+- **麦克风要额外装一次虚拟麦克风驱动**。iSight 的麦克风走 FireWire 上一条**独立的音频通道**
+  （不是 AV/C、不是 USB audio），Windows 自带的 1394 驱动栈认不出它；而且实测这条音频
+  **与视频共用同一条等时通道**，所以只有拿到视频流的人（也就是本滤镜）才听得到它。
+  v19 起滤镜把解出来的 PCM 交给 `isightmic.sys`（PortCls 虚拟麦克风），系统里就多出
+  一个真正的录音设备 "iSight Microphone (FireWire)"。安装步骤见
+  [docs/virtual-mic.md](docs/virtual-mic.md)：开 `testsigning`、重启、跑 `drivers/install-mic.bat`。
+  它需要**先有程序在使用摄像头**（例如微信通话里选了摄像头）才有声音。
 - **分辨率固定 640×480**，这是 iSight 的硬件规格。
 - **Windows 11 24H2 及以后**的内核驱动策略更严，CMU 驱动可能装不上；
   建议以 Windows 10 为主，装不上时参考仓库文档在设备管理器里手动指定 1394 兼容驱动。
