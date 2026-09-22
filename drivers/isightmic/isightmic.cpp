@@ -374,9 +374,10 @@ protected:
 
 // 48 kHz / 16-bit / mono capture data range.
 // KSDATARANGE_AUDIO = KSDATARANGE (FormatSize, Flags, SampleSize, Reserved,
-// MajorFormat, SubFormat, Specifier) followed by six ULONGs:
-// MinimumChannels, MaximumChannels, MinimumBitsPerSample, MaximumBitsPerSample,
-// MinimumSampleFrequency, MaximumSampleFrequency.
+// MajorFormat, SubFormat, Specifier) followed by exactly five ULONGs:
+// MaximumChannels, MinimumBitsPerSample, MaximumBitsPerSample,
+// MinimumSampleFrequency, MaximumSampleFrequency.  (There is no
+// MinimumChannels member -- adding one shifts every following field.)
 static KSDATARANGE_AUDIO PinDataRangesStream[] = {
     {
         {
@@ -388,7 +389,6 @@ static KSDATARANGE_AUDIO PinDataRangesStream[] = {
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
-        ISIGHTMIC_CHANNELS,                 // MinimumChannels
         ISIGHTMIC_CHANNELS,                 // MaximumChannels
         ISIGHTMIC_BITS,                     // MinimumBitsPerSample
         ISIGHTMIC_BITS,                     // MaximumBitsPerSample
@@ -418,9 +418,12 @@ static PCPIN_DESCRIPTOR WavePins[] = {
     }
 };
 
+// PCFILTER_DESCRIPTOR is exactly 12 fields -- Version, AutomationTable,
+// PinSize, PinCount, Pins, NodeSize, NodeCount, Nodes, ConnectionCount,
+// Connections, CategoryCount, Categories.  There is no AutomationTableSize
+// member; inserting one silently reinterprets the whole descriptor.
 static PCFILTER_DESCRIPTOR WaveFilterDescriptor = {
     0,                                  // Version
-    0,                                  // AutomationTableSize
     NULL,                               // AutomationTable
     sizeof(PCPIN_DESCRIPTOR),           // PinSize
     1,                                  // PinCount
@@ -499,18 +502,14 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
 
     // The port driver needs a DMA channel object; ours is a software device, so
     // a master channel backed by ordinary nonpaged memory is all it takes.
+    // IPortWaveCyclic::NewMasterDmaChannel takes exactly eight arguments --
+    // (OutDmaChannel, OuterUnknown, ResourceList, MaximumLength,
+    //  Dma32BitAddresses, Dma64BitAddresses, DmaWidth, DmaSpeed).  It does not
+    // take a DEVICE_DESCRIPTION*.
     if (m_Port) {
-        DEVICE_DESCRIPTION dd;
-        RtlZeroMemory(&dd, sizeof(dd));
-        dd.Version            = DEVICE_DESCRIPTION_VERSION;
-        dd.Master             = TRUE;
-        dd.ScatterGather      = FALSE;
-        dd.Dma32BitAddresses  = TRUE;
-        dd.DmaWidth           = (DMA_WIDTH)(-1);   // width not meaningful here
-        dd.DmaSpeed           = (DMA_SPEED)(-1);    // speed not meaningful here
-        dd.MaximumLength      = WAVE_BUFFER_BYTES;
         st = m_Port->NewMasterDmaChannel(&s->m_DmaChannel, NULL, NULL,
-                                         WAVE_BUFFER_BYTES, TRUE, FALSE, &dd);
+                                         WAVE_BUFFER_BYTES, TRUE, FALSE,
+                                         (DMA_WIDTH)(-1), (DMA_SPEED)(-1));
     }
     if (!NT_SUCCESS(st)) { s->Release(); return st; }
 
@@ -664,12 +663,17 @@ static PCCONNECTION_DESCRIPTOR TopologyConnections[] = {
 
 static PCFILTER_DESCRIPTOR TopologyFilterDescriptor = {
     0,                                  // Version
-    0,                                  // AutomationTableSize
     NULL,                               // AutomationTable
-    sizeof(PCPIN_DESCRIPTOR), 2, TopologyPins,
-    sizeof(PCNODE_DESCRIPTOR), 1, TopologyNodes,
-    2, TopologyConnections,
-    0, NULL
+    sizeof(PCPIN_DESCRIPTOR),           // PinSize
+    2,                                  // PinCount
+    TopologyPins,                       // Pins
+    sizeof(PCNODE_DESCRIPTOR),          // NodeSize
+    1,                                  // NodeCount
+    TopologyNodes,                      // Nodes
+    2,                                  // ConnectionCount
+    TopologyConnections,                // Connections
+    0,                                  // CategoryCount
+    NULL                                // Categories
 };
 
 CMiniportTopology::CMiniportTopology(PUNKNOWN outer) {
@@ -750,14 +754,17 @@ static NTSTATUS StartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELIST
     if (!w) return STATUS_INSUFFICIENT_RESOURCES;
     wave = (PUNKNOWN)(IMiniportWaveCyclic*)w;
 
-    st = PcRegisterSubdevice(DeviceObject, L"Wave", wave);
+    // The subdevice name must match the KSNAME_* entries in isightmic.inf.
+    // (PWSTR) keeps this compiling whether the WDK declares the parameter as
+    // PWSTR or PCWSTR.
+    st = PcRegisterSubdevice(DeviceObject, (PWSTR)L"Wave", wave);
     if (!NT_SUCCESS(st)) { wave->Release(); return st; }
 
     CMiniportTopology* t = new(NonPagedPool, ISIGHTMIC_POOL_TAG) CMiniportTopology(NULL);
     if (!t) { wave->Release(); return STATUS_INSUFFICIENT_RESOURCES; }
     topo = (PUNKNOWN)(IMiniportTopology*)t;
 
-    st = PcRegisterSubdevice(DeviceObject, L"Topology", topo);
+    st = PcRegisterSubdevice(DeviceObject, (PWSTR)L"Topology", topo);
     if (!NT_SUCCESS(st)) { topo->Release(); wave->Release(); return st; }
 
     topo->Release();
