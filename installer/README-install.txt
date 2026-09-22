@@ -43,5 +43,10 @@ iSightCam 1.0.0 安装说明（Apple iSight FireWire 摄像头 → Windows 标�
     若卡住可运行 isight-diag.exe reset 手动复位 1394 总线
   * 想看滤镜到底在做什么 → %LOCALAPPDATA%\iSightCam.log
 
-注意：本组件不提供麦克风（iSight 的麦克风走独立的 FireWire 音频通道，
-Windows 驱动栈不支持），请使用其他麦克风。
+注意：麦克风需要额外装一次虚拟麦克风驱动（v19）：
+  1. 管理员运行 bcdedit /set testsigning on，然后重启
+  2. 进 drivers 包，右键 install-mic.bat -> 以管理员身份运行
+  3. 用 isight-miccheck.exe 自检，报告写在 miccheck.txt
+装好后微信 / QQ / OBS 里会出现 "iSight Microphone (FireWire)"。
+麦克风的声音取自"正在使用摄像头"的那条 FireWire 流，所以要先有程序
+在用摄像头（例如微信通话里选了摄像头），麦克风才有声音。
