@@ -9,7 +9,8 @@ set LIB=%KIT%\Lib\10.0.26100.0\km\x64
 REM /D_AMD64_ : the SDK's shared\ntdef.h needs a target-architecture macro and
 REM aborts with C1189 "No Target Architecture" without one.  The WDK's MSBuild
 REM toolset injects it; driving cl directly means we have to.
-cl /nologo /kernel /c /W3 /O2 /D_AMD64_ ^
+REM /Fo : cl writes the object to the current directory, not next to the source.
+cl /nologo /kernel /c /W3 /O2 /D_AMD64_ /Fo:isightmic.obj ^
    /I"%INC%\km" /I"%INC%\km\crt" /I"%INC%\shared" /I"%INC%\um" ^
    isightmic.cpp
 if errorlevel 1 exit /b 1
