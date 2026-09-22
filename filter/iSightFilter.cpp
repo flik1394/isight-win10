@@ -291,6 +291,7 @@ static const int kMaxRateIndex = 3;          // never ask the camera for more th
 #define ISIGHT_HEIGHT 480
 #define ISIGHT_BPP     24
 #define ISIGHT_DIB_BYTES  (ISIGHT_WIDTH * ISIGHT_HEIGHT * 3)
+#define AUDIO_TAIL_CAP    65536   // how much of the last frame we keep to pad with
 // v12: room for the tiny copy of the frame the blur backdrop is built from
 // (a 4 px block over 640x480 is the finest setting we allow: 160x120x6 BGR)
 #define kBlurScratchBytes (96 * 1024)
@@ -2285,7 +2286,6 @@ void CiSightStream::ReleaseCamera()
 #define AUDIO_RATE_48000  0x80000000u
 #define AUDIO_MAX_FRAMES  475            // the camera's per-packet limit
 #define AUDIO_HEADER      16
-#define AUDIO_TAIL_CAP    65536          // how much of the last frame we keep
 
 // DCAM 0x60C packs the channel differently in 1394a and 1394b mode
 static ULONG AudioChannelOf60C(ULONG v)
