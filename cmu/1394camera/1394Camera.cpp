@@ -820,6 +820,50 @@ _exit:
 	return ret;
 }
 
+/**\brief Hand out the raw bytes of the acquisition buffer AcquireImageEx() filled
+ *
+ * v16 (flik).  The iSight's microphone is a second unit on the same 1394 node
+ * and it transmits on the video engine's isochronous channel, so its packets
+ * arrive inside the very same DMA buffer the video payload lands in.  A caller
+ * that wants the audio therefore has to look at the raw bytes; the class only
+ * ever exposes them as a converted image.
+ *
+ * The buffer is flattened first if the driver could not give us a physically
+ * contiguous one, which is what the image conversion path does anyway.
+ *
+ * \param ppData receives the start of the buffer (NULL if there is none yet)
+ * \param pcbBytes receives its size in bytes
+ * \return CAM_SUCCESS, or CAM_ERROR_NOT_INITIALIZED if no frame is in hand
+ */
+int C1394Camera::GetRawFrameBuffer(const unsigned char **ppData, unsigned long *pcbBytes)
+{
+	DllTrace(DLL_TRACE_ENTER,"ENTER GetRawFrameBuffer\n");
+
+	if(ppData == NULL || pcbBytes == NULL)
+	{
+		DllTrace(DLL_TRACE_ERROR,"GetRawFrameBuffer: bad argument\n");
+		return CAM_ERROR_PARAM_OUT_OF_RANGE;
+	}
+
+	*ppData = NULL;
+	*pcbBytes = 0;
+
+	if(m_pCurrentBuffer == NULL || m_pCurrentBuffer->pDataBuf == NULL)
+	{
+		DllTrace(DLL_TRACE_ERROR,"GetRawFrameBuffer: no frame in hand\n");
+		return CAM_ERROR_NOT_INITIALIZED;
+	}
+
+	if(!m_pCurrentBuffer->bCurrentlyContiguous)
+		dc1394FlattenAcquisitionBuffer(m_pCurrentBuffer);
+
+	*ppData = m_pCurrentBuffer->pDataBuf;
+	*pcbBytes = m_pCurrentBuffer->ulBufferSize;
+
+	DllTrace(DLL_TRACE_EXIT,"EXIT GetRawFrameBuffer (%p,%lu)\n",*ppData,*pcbBytes);
+	return CAM_SUCCESS;
+}
+
 
 
 /**\brief Get the maximum bus speed on the path to the selected camera

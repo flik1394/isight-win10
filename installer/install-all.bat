@@ -30,7 +30,7 @@ rem    * 目标文件被占用时先改名再复制，复制后按版本标记�
 rem ============================================================
 
 set "REL=1.0.0"
-set "TAG=ISIGHTFILTER-BUILD-V15-20260922-HOSTGATE"
+set "TAG=ISIGHTFILTER-BUILD-V16-20260922-AUDIO"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
@@ -165,7 +165,7 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V15" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V16" "%~1" >nul 2>&1
 if errorlevel 1 (
     echo     [FAIL] %~1 里没有 v14 标记 —— 这个文件还是旧版！
     exit /b 1

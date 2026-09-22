@@ -227,7 +227,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V15-20260922-HOSTGATE"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V16-20260922-AUDIO"
 
 // Public release number.  The build tag above changes on every internal
 // iteration (and install-all.bat greps for its "V14" prefix); this one is
@@ -555,6 +555,17 @@ struct ISightOptions
     // available to the hosts that do work.
     char allow[256];                // [host] allow=...  empty = every host
     char deny[256];                 // [host] deny=...   never instantiates here
+    // v16 -- the microphone.  The iSight's audio unit is a second unit on the
+    // same 1394 node and it transmits on the SAME isochronous stream as the
+    // video (measured: see docs/av-merge.md), so with the video engine already
+    // running the only thing missing is telling the audio unit to start.
+    // Nothing here opens a second stream -- it cannot, the CMU driver allows
+    // one per device -- so the microphone costs no extra isochronous channel.
+    int  audioOn;           // [audio] enable=   0 = video only
+    int  audioGain;         // [audio] gain=     raw 1..43, 0 = camera default
+    int  audioWav;          // [audio] wav=      1 = write the PCM to disk
+    int  audioMaxMB;        // [audio] maxmb=    0 = no limit
+    int  audioLog;          // [audio] log=      0/1/2, 2 = per-packet
 };
 
 enum LayoutMode
@@ -711,7 +722,29 @@ static void WriteDefaultIni(const char *path)
         "; (or set deny=) to let that host use the camera again.\n"
         "[host]\n"
         "deny=QQ.exe,TIM.exe,QQExternal.exe,QQProtect.exe\n"
-        ";allow=Weixin.exe,WeChat.exe,obs64.exe\n");
+        ";allow=Weixin.exe,WeChat.exe,obs64.exe\n"
+        ";\n"
+        "; audio: the microphone (v16).  iSight's mic is a second unit on the\n"
+        "; same FireWire node and it rides the SAME isochronous stream as the\n"
+        "; picture, so turning it on costs no extra channel: the filter tells\n"
+        "; the audio unit to transmit and picks the audio packets out of the\n"
+        "; capture buffer it is already reading.\n"
+        ";\n"
+        ";   enable  1 = transmit audio alongside the video (default)\n"
+        ";   gain    raw 1..43 (about -30 dB .. +12 dB); 0 = camera default\n"
+        ";   wav     1 = write 48 kHz / 16 bit stereo PCM to\n"
+        ";           <LOCALAPPDATA>\\iSightAudio.wav  (for checking the mic)\n"
+        ";   maxmb   stop the wav file at this size, 0 = no limit\n"
+        ";   log     1 = a summary line every 100 packets, 2 = every packet\n"
+        ";\n"
+        "; If turning the mic on ever disturbs the picture, set enable=0 --\n"
+        "; the video path then behaves exactly as it did before v16.\n"
+        "[audio]\n"
+        "enable=1\n"
+        "gain=0\n"
+        "wav=1\n"
+        "maxmb=20\n"
+        "log=1\n");
     fclose(f);
 }
 
@@ -801,6 +834,23 @@ static const ISightOptions &Opts()
         GetPrivateProfileStringA("host", "deny",
                                  "QQ.exe,TIM.exe,QQExternal.exe,QQProtect.exe",
                                  s_o.deny, sizeof(s_o.deny), ini);
+
+        // [audio] (v16) -- the microphone, see the note on the option itself.
+        s_o.audioOn    = GetPrivateProfileIntA("audio", "enable", 1, ini) != 0;
+        s_o.audioGain  = GetPrivateProfileIntA("audio", "gain", 0, ini);
+        if (s_o.audioGain < 0)   s_o.audioGain = 0;
+        if (s_o.audioGain > 43)  s_o.audioGain = 43;
+        s_o.audioWav   = GetPrivateProfileIntA("audio", "wav", 1, ini) != 0;
+        s_o.audioMaxMB = GetPrivateProfileIntA("audio", "maxmb", 20, ini);
+        if (s_o.audioMaxMB < 0)    s_o.audioMaxMB = 0;
+        if (s_o.audioMaxMB > 2000) s_o.audioMaxMB = 2000;
+        s_o.audioLog   = GetPrivateProfileIntA("audio", "log", 1, ini);
+        if (s_o.audioLog < 0) s_o.audioLog = 0;
+        if (s_o.audioLog > 2) s_o.audioLog = 2;
+
+        FLog("options: audio %s (gain=%d wav=%d maxmb=%d log=%d)",
+             s_o.audioOn ? "ON" : "off", s_o.audioGain, s_o.audioWav,
+             s_o.audioMaxMB, s_o.audioLog);
 
         FLog("options: yuy2=%s rgb=%s dump=%d busmon=%d bootdelay=%dms (ini=%s)",
              OrientName(s_o.orientYUY2), OrientName(s_o.orientRGB),
@@ -1496,6 +1546,11 @@ private:
     void  StopBusMonitor();
     static DWORD WINAPI BusMonThunk(LPVOID p);
     void  ConfigureVideo();
+    // v16 -- microphone: start/stop the camera's audio unit, and pick the
+    // audio packets out of the capture buffer the video is already in.
+    void  AudioStart();
+    void  AudioStop();
+    void  AudioScanFrame();
     void  BuildMediaType(const GUID *subtype, REFERENCE_TIME interval, CMediaType *pmt) const;
     bool  MediaTypeCompatible(const CMediaType *pmt, CMediaType *pNormalized) const;
 
@@ -1542,6 +1597,22 @@ private:
     LONG             m_rejectStreak;   // v14: consecutive rejected deliveries
     LONG             m_loopRuns;       // v14: buffer-loop entries (thread alive)
     volatile LONG    m_acqStartMs;     // tick when acquisition was started
+
+    // v16 microphone state
+    bool             m_audioOn;        // the audio unit was told to transmit
+    bool             m_audioSeen;      // at least one audio packet decoded
+    FILE            *m_audioFile;      // PCM capture (optional)
+    char             m_audioPath[MAX_PATH];
+    LONG             m_audioPackets;   // packets decoded
+    LONG             m_audioFrames;    // audio frames decoded (48000/s)
+    LONG             m_audioLost;      // frames lost (sample_total gaps)
+    LONG             m_audioBad;       // 'sght' hits that failed validation
+    LONG             m_audioFramesScanned;  // video frames scanned for audio
+    ULONG            m_audioExpect;    // next expected sample_total
+    bool             m_audioExpectValid;
+    DWORD            m_audioStartMs;   // when the audio unit was started
+    LONG             m_audioPeak;      // loudest sample seen
+    LONG             m_audioBytes;     // bytes written to the wav file
 };
 
 //---------------------------------------------------------------------
@@ -1644,8 +1715,22 @@ CiSightStream::CiSightStream(HRESULT *phr, CSource *pFilter, LPCWSTR pName)
     , m_rejectStreak(0)
     , m_loopRuns(0)
     , m_acqStartMs(0)
+    , m_audioOn(false)
+    , m_audioSeen(false)
+    , m_audioFile(NULL)
+    , m_audioPackets(0)
+    , m_audioFrames(0)
+    , m_audioLost(0)
+    , m_audioBad(0)
+    , m_audioFramesScanned(0)
+    , m_audioExpect(0)
+    , m_audioExpectValid(false)
+    , m_audioStartMs(0)
+    , m_audioPeak(0)
+    , m_audioBytes(0)
 {
     m_monPath[0] = 0;
+    m_audioPath[0] = 0;
 }
 
 CiSightStream::~CiSightStream()
@@ -2047,6 +2132,9 @@ bool CiSightStream::TryStart()
          m_width, m_height, m_rateIndex, m_bringUpTries + 1,
          m_pCam->IsAcquiring() ? 1 : 0, m_pCam->GetMaxSpeed());
     m_bAcquiring = true;
+    // v16: the microphone rides this same isochronous stream -- tell the
+    // camera's audio unit to start now that the video engine is running.
+    AudioStart();
     m_consecFail = 0;
     m_bringUpTries = 0;
     InterlockedExchange(&m_acqStartMs, (LONG)TickMs());
@@ -2071,6 +2159,7 @@ void CiSightStream::ReleaseCamera()
     {
         if (m_bAcquiring)
         {
+            AudioStop();                    // v16: silence the mic first
             m_pCam->StopImageAcquisition();
             m_bAcquiring = false;
         }
@@ -2088,6 +2177,270 @@ void CiSightStream::ReleaseCamera()
     InterlockedExchange(&m_camGoneSeen, 0);
     InterlockedExchange(&m_needReset, 0);
     InterlockedExchange(&m_acqStartMs, 0);
+}
+
+//---------------------------------------------------------------------
+// v16 -- the microphone.
+//
+// The iSight's mic is not an AV/C subunit and not 61883-6 audio: it is a
+// second unit directory on the same 1394 node (spec 0x000A27 / ver
+// 0x000010) whose eleven registers sit at 0xFFFFF0020000, and it streams a
+// private packet format -- a 16-byte header whose second quadlet is the
+// ASCII "sght", then sample_count * 2 channels of 48 kHz / 16-bit big-
+// endian PCM.  Linux calls it SW_ISIGHT_AUDIO (sound/firewire/isight.c).
+//
+// The important measurement (diags/audio.cpp, v9-v12) is that the audio
+// unit does NOT get its own isochronous channel: it transmits on the video
+// engine's channel, interleaved with the video packets.  That is why the
+// microphone needs no second stream -- and it also means the CMU driver
+// allows it, because we are not opening one.  The filter already holds the
+// only isoch stream the device will give us, so the audio packets are
+// simply picked out of the capture buffer we are already reading.
+//
+// Order is Linux's: SAMPLE_RATE -> ISO_TX_CONFIG -> AUDIO_ENABLE.
+//---------------------------------------------------------------------
+#define AUDIO_BASE        0xF0020000UL   // absolute driver offset
+#define AUDIO_ENABLE      0x000
+#define AUDIO_TX_CONFIG   0x300          // low 16 = channel, high 16 = speed
+#define AUDIO_SAMPLE_RATE 0x400
+#define AUDIO_GAIN        0x500
+#define AUDIO_RATE_48000  0x80000000u
+#define AUDIO_MAX_FRAMES  475            // the camera's per-packet limit
+#define AUDIO_HEADER      16
+
+// DCAM 0x60C packs the channel differently in 1394a and 1394b mode
+static ULONG AudioChannelOf60C(ULONG v)
+{
+    if (v & 0x00008000u) return (v >> 8) & 0x3F;
+    return (v >> 28) & 0x0F;
+}
+
+static int AudioSpeedIndex(ULONG flag)
+{
+    if (flag & SPEED_FLAGS_400) return 2;
+    if (flag & SPEED_FLAGS_200) return 1;
+    return 0;
+}
+
+static inline ULONG RdBE32(const BYTE *p)
+{
+    return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) | ((ULONG)p[2] << 8) | (ULONG)p[3];
+}
+
+static void WavHeader(BYTE *h, ULONG dataBytes)
+{
+    const ULONG rate = 48000, ch = 2, bits = 16;
+    ULONG frame = ch * bits / 8;                 // 4
+    ULONG bytesPerSec = rate * frame;
+    memcpy(h,      "RIFF", 4);
+    h[4]  = (BYTE)((36 + dataBytes) & 0xFF);
+    h[5]  = (BYTE)(((36 + dataBytes) >> 8) & 0xFF);
+    h[6]  = (BYTE)(((36 + dataBytes) >> 16) & 0xFF);
+    h[7]  = (BYTE)(((36 + dataBytes) >> 24) & 0xFF);
+    memcpy(h + 8,  "WAVEfmt ", 8);
+    h[16] = 16; h[17] = h[18] = h[19] = 0;       // fmt chunk size
+    h[20] = 1;  h[21] = 0;                       // PCM
+    h[22] = (BYTE)ch; h[23] = 0;
+    h[24] = (BYTE)(rate & 0xFF);
+    h[25] = (BYTE)((rate >> 8) & 0xFF);
+    h[26] = (BYTE)((rate >> 16) & 0xFF);
+    h[27] = (BYTE)((rate >> 24) & 0xFF);
+    h[28] = (BYTE)(bytesPerSec & 0xFF);
+    h[29] = (BYTE)((bytesPerSec >> 8) & 0xFF);
+    h[30] = (BYTE)((bytesPerSec >> 16) & 0xFF);
+    h[31] = (BYTE)((bytesPerSec >> 24) & 0xFF);
+    h[32] = (BYTE)(frame & 0xFF); h[33] = (BYTE)((frame >> 8) & 0xFF);
+    h[34] = (BYTE)bits; h[35] = 0;
+    memcpy(h + 36, "data", 4);
+    h[40] = (BYTE)(dataBytes & 0xFF);
+    h[41] = (BYTE)((dataBytes >> 8) & 0xFF);
+    h[42] = (BYTE)((dataBytes >> 16) & 0xFF);
+    h[43] = (BYTE)((dataBytes >> 24) & 0xFF);
+}
+
+void CiSightStream::AudioStart()
+{
+    m_audioOn = m_audioSeen = false;
+    m_audioFile = NULL;
+    m_audioPackets = m_audioFrames = m_audioLost = m_audioBad = 0;
+    m_audioFramesScanned = 0;
+    m_audioExpectValid = false;
+    m_audioExpect = 0;
+    m_audioPeak = 0;
+    m_audioBytes = 0;
+    m_audioPath[0] = '\0';
+
+    const ISightOptions &o = Opts();
+    if (!o.audioOn || m_pCam == NULL)
+        return;
+
+    // which channel the video engine is on: that is where the audio goes too
+    ULONG iso = 0, ch = 0;
+    if (m_pCam->ReadQuadlet(0x60C, &iso) == CAM_SUCCESS)
+        ch = AudioChannelOf60C(iso);
+    int  spd = AudioSpeedIndex((ULONG)m_pCam->GetMaxSpeed());
+    ULONG txv = (ch & 0x3F) | ((ULONG)spd << 16);
+
+    int r1 = m_pCam->WriteQuadlet(AUDIO_BASE + AUDIO_SAMPLE_RATE, AUDIO_RATE_48000);
+    int r2 = m_pCam->WriteQuadlet(AUDIO_BASE + AUDIO_TX_CONFIG,   txv);
+    int r3 = 0;
+    if (o.audioGain > 0)
+        r3 = m_pCam->WriteQuadlet(AUDIO_BASE + AUDIO_GAIN, (ULONG)o.audioGain);
+    int r4 = m_pCam->WriteQuadlet(AUDIO_BASE + AUDIO_ENABLE, 0x80000000u);
+
+    FLog("audio: unit start -- channel=%lu speed=%d (0x60C=0x%08lX) "
+         "rate=%d tx=%d gain=%d enable=%d",
+         (unsigned long)ch, spd, (unsigned long)iso, r1, r2, r3, r4);
+    if (r4 != CAM_SUCCESS)
+    {
+        FLog("audio: the unit did not start (enable -> %d) -- video only", r4);
+        return;
+    }
+    m_audioOn = true;
+    m_audioStartMs = TickMs();
+
+    if (!o.audioWav)
+        return;
+    char dir[MAX_PATH] = "";
+    if (GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH) == 0)
+        GetTempPathA(MAX_PATH, dir);
+    _snprintf_s(m_audioPath, sizeof(m_audioPath), _TRUNCATE,
+                "%s\\iSightAudio.wav", dir[0] ? dir : ".");
+    m_audioFile = fopen(m_audioPath, "wb");
+    if (m_audioFile == NULL)
+    {
+        FLog("audio: cannot open %s -- PCM capture off", m_audioPath);
+        return;
+    }
+    BYTE hdr[44];
+    WavHeader(hdr, 0);
+    fwrite(hdr, 1, 44, m_audioFile);
+    fflush(m_audioFile);
+    FLog("audio: writing 48 kHz / 16 bit stereo PCM to %s", m_audioPath);
+}
+
+void CiSightStream::AudioStop()
+{
+    const bool wasOn = m_audioOn;
+    m_audioOn = false;
+    if (m_pCam != NULL && wasOn)
+    {
+        m_pCam->WriteQuadlet(AUDIO_BASE + AUDIO_ENABLE, 0);
+        FLog("audio: unit stopped");
+    }
+    if (m_audioFile != NULL)
+    {
+        BYTE hdr[44];
+        WavHeader(hdr, (ULONG)m_audioBytes);
+        fseek(m_audioFile, 0, SEEK_SET);
+        fwrite(hdr, 1, 44, m_audioFile);
+        fclose(m_audioFile);
+        m_audioFile = NULL;
+        FLog("audio: %s closed (%ld bytes of PCM)", m_audioPath, (long)m_audioBytes);
+    }
+}
+
+// Called right after a successful AcquireImageEx(): the frame the video will
+// be built from is also the buffer the camera put its audio packets in, so
+// scan it for "sght" and pull the PCM out.  Nothing here blocks; a frame
+// without audio packets (the camera sends 8 video packets per audio packet
+// or so) simply finds nothing.
+void CiSightStream::AudioScanFrame()
+{
+    if (!m_audioOn || m_pCam == NULL)
+        return;
+    const ISightOptions &o = Opts();
+    const BYTE *p = NULL;
+    ULONG cb = 0;
+    if (m_pCam->GetRawFrameBuffer(&p, &cb) != CAM_SUCCESS || p == NULL || cb < 32)
+        return;
+
+    InterlockedIncrement(&m_audioFramesScanned);
+    const ULONG limit = (cb > AUDIO_HEADER + 8) ? (cb - 8) : 0;
+    for (ULONG i = 0; i + 8 <= limit; ++i)
+    {
+        if (p[i] != 0x73 || p[i+1] != 0x67 || p[i+2] != 0x68 || p[i+3] != 0x74)
+            continue;
+        if (i < 4) continue;
+        ULONG start = i - 4;                       // sample_count
+        ULONG count = RdBE32(p + start);
+        ULONG total = RdBE32(p + start + 8);       // running frame counter
+        if (count == 0 || count > AUDIO_MAX_FRAMES)
+        {
+            ++m_audioBad;                          // a stray signature
+            continue;
+        }
+        ULONG body = start + AUDIO_HEADER;
+        ULONG need = count * 4;                    // 2 channels * 16 bit
+        bool  cut  = false;
+        if (body + need > cb)
+        {
+            // the packet straddles the end of this capture buffer; take
+            // what is here (the rest is past the frame, dropped)
+            need = (cb > body) ? ((cb - body) & ~3UL) : 0;
+            cut = true;
+        }
+        if (need < 4) { ++m_audioBad; continue; }
+
+        if (m_audioExpectValid && total != m_audioExpect)
+        {
+            LONG gap = (LONG)((long long)total - (long long)m_audioExpect);
+            if (gap > 0) m_audioLost += gap;
+        }
+        m_audioExpect = total + count;
+        m_audioExpectValid = true;
+
+        ++m_audioPackets;
+        m_audioFrames += (LONG)count;
+        m_audioSeen = true;
+
+        // S16_BE -> S16_LE, and the loudest sample along the way
+        BYTE  conv[2048];
+        ULONG todo = need;
+        const BYTE *src = p + body;
+        while (todo > 0)
+        {
+            ULONG n = (todo > sizeof(conv)) ? sizeof(conv) : todo;
+            for (ULONG k = 0; k + 1 < n; k += 2)
+            {
+                conv[k]     = src[k + 1];
+                conv[k + 1] = src[k];
+                SHORT v = (SHORT)((src[k] << 8) | src[k + 1]);
+                LONG  a = v < 0 ? -v : v;
+                if (a > m_audioPeak) m_audioPeak = a;
+            }
+            if (m_audioFile != NULL && (o.audioMaxMB == 0 ||
+                m_audioBytes < (LONG)o.audioMaxMB * 1024L * 1024L))
+            {
+                fwrite(conv, 1, n, m_audioFile);
+                m_audioBytes += (LONG)n;
+            }
+            src  += n;
+            todo -= n;
+        }
+
+        if (o.audioLog >= 2)
+            FLog("audio: packet #%ld at +%lu of %lu: %lu frames, total=%lu%s",
+                 (long)m_audioPackets, (unsigned long)start, (unsigned long)cb,
+                 (unsigned long)count, (unsigned long)total, cut ? " (cut)" : "");
+
+        i = body + need;                            // skip this packet's body
+    }
+
+    if (o.audioLog >= 1 && m_audioPackets > 0 &&
+        (m_audioPackets % 100) == 0 && (m_audioPackets / 100) <= 100)
+    {
+        DWORD ms = TickMs() - m_audioStartMs;
+        double secs = ms / 1000.0;
+        double got  = m_audioFrames / 48000.0;
+        FLog("audio: %ld packets, %ld frames (%.1f s of audio in %.1f s of video), "
+             "lost %ld frames (%.1f%%), peak %ld, %ld video frames scanned, %ld bad",
+             (long)m_audioPackets, (long)m_audioFrames, got, secs,
+             (long)m_audioLost,
+             (m_audioFrames + m_audioLost) > 0
+                 ? (100.0 * m_audioLost / (double)(m_audioFrames + m_audioLost)) : 0.0,
+             (long)m_audioPeak, (long)m_audioFramesScanned, (long)m_audioBad);
+    }
 }
 
 // Must end up with Format 0 / Mode 2 (640x480 YUV422). The iSight also
@@ -2429,6 +2782,11 @@ HRESULT CiSightStream::FillBuffer(IMediaSample *pSample)
 
         if (rc == CAM_SUCCESS)
         {
+            // v16: the camera interleaves its microphone packets with the
+            // video in this very buffer, so pick them out before the frame
+            // is converted.
+            AudioScanFrame();
+
             // size the scratch buffer from what the camera actually streams
             ULONG frameBytes = m_width * m_height * 3;
             if (m_pScratch == NULL || m_scratchBytes < frameBytes)

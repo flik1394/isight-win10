@@ -210,6 +210,13 @@ public:
 	int	WriteQuadlet(unsigned long address,	unsigned long data);
 	int	ReadQuadlet(unsigned long address, unsigned	long *pData);
 	
+	// v16 (flik): read-only access to the acquisition buffer that the last
+	// AcquireImageEx() filled.  The iSight's microphone transmits on the video
+	// engine's isochronous channel, so its packets sit in this same buffer,
+	// interleaved with the video payload -- a caller that wants the audio has
+	// to see the raw bytes.  Valid until the next AcquireImageEx().
+	int	GetRawFrameBuffer(const unsigned char **ppData, unsigned long *pcbBytes);
+	
 	// Video format/mode/rate
 	BOOL HasVideoFormat(unsigned long format);
 	int	SetVideoFormat(unsigned	long format);
