@@ -62,6 +62,7 @@ cd obj\flt-%ARCH%
 cl /nologo /c /O2 /MD /EHsc /GR /W3 /FS /Zc:twoPhase- ^
    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /DMY1394CAMERA_EXPORTS ^
    /I..\..\cmu\1394camera /I..\..\baseclasses ^
+   /I..\..\drivers\isightmic ^
    ..\..\filter\iSightFilter.cpp
 if errorlevel 1 ( cd ..\.. & exit /b 1 )
 cd ..\..
