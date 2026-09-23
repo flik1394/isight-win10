@@ -10,6 +10,13 @@
 ;     bcdedit /set testsigning on    (+ one reboot)
 ; and the iSightMicTest.cer that ships with the package installed into the
 ; machine's Root and TrustedPublisher stores.
+;
+; DriverVer 1.0.1.0 (2026-09-23): the driver could not start at all before this
+; version.  StartDevice handed the *miniport* to PcRegisterSubdevice, which
+; wants the *port*, so PortCls answered 0xC000000D and PnP marked the device
+; problem 0x0a CM_PROB_FAILED_START.  The version had to move or a machine that
+; already staged 1.0.0.0 would keep the old copy (SetupCopyOEMInf reports
+; "already staged" for a same-version package and nothing gets replaced).
 
 [Version]
 Signature   = "$Windows NT$"
@@ -17,7 +24,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/22/2026,1.0.0.0
+DriverVer   = 09/23/2026,1.0.1.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64
