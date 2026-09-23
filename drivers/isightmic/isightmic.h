@@ -26,6 +26,17 @@
 #define IOCTL_ISIGHTMIC_GETSTATUS \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_READ_ACCESS)
 
+// Ask the loaded .sys which build it is.  Output buffer = a NUL-terminated
+// narrow string.  A separate IOCTL rather than a new ISIGHTMIC_STATUS field on
+// purpose: the DirectShow filter includes this header too, and extending the
+// struct would drag the filter into a rebuild for a diagnostic.
+#define IOCTL_ISIGHTMIC_GETBUILD \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+// Bumped whenever the driver changes.  Kept in the same shape as the filter's
+// tag so one grep over a binary answers "which build is this".
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V21-20260923-PORTCLS"
+
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
 
