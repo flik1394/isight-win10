@@ -19,9 +19,18 @@ rem    3. 顺带把循环的进入/退出、GetDeliveryBuffer 失败、被拒样
 rem       日志；总线监视线程还会在 FillBuffer 计数停住时直接喊
 rem       "STREAM PARKED"，死画面从此可以在日志里一眼认出来。
 rem
-rem  上一版（v13）加了取帧探针与"4 秒无帧自愈"；v12 的 [layout] mode=
+rem  上一版（v19）把 iSight 的麦克风送进了系统（虚拟麦克风驱动
+rem  isightmic.sys），并修掉了帧长算错导致的越界写。
+rem
+rem  v20 修的是"开音频画面就花"的真因：相机把音频折进同一帧窗口里，
+rem  每帧占掉 7 处 × 2 行 = 14 行（iso 包，落在行边界上）。v17~v19 只
+rem  剪掉音频负载（1632 字节/处），每处留下 288 字节残渣，共 2016 字节
+rem  卡在画面中间，导致后面所有行的网格错位 → 横向条带。v20 不再改变
+rem  帧长：把每个含音频的 960 字节槽用上一槽覆盖，帧长入=出，行网格不动。
+rem
+rem  更早（v13）加了取帧探针与"4 秒无帧自愈"；v12 的 [layout] mode=
 rem  （fit/blur/fill/stretch）与 guide 标尺一并带入（target=0 时完全不生效）。
-rem  更早：v11 [layout] hosts=/guide=、v10 target=WxH + [format] types=、
+rem  v11 [layout] hosts=/guide=、v10 target=WxH + [format] types=、
 rem  v9 总线复位自动重连、v8 修微信画面颠倒与中文乱码。
 rem
 rem  沿用两条保护（曾经把 64 位组件静默漏装过）：
@@ -30,7 +39,7 @@ rem    * 目标文件被占用时先改名再复制，复制后按版本标记�
 rem ============================================================
 
 set "REL=1.0.0"
-set "TAG=ISIGHTFILTER-BUILD-V19-20260922-MICFEED"
+set "TAG=ISIGHTFILTER-BUILD-V20-20260923-HEAL"
 set "SRC64=%~dp0iSightCam64.ax"
 set "SRC32=%~dp0iSightCam32.ax"
 set "DST64=%SystemRoot%\System32\iSightCam.ax"
@@ -142,13 +151,17 @@ echo  "iSight Microphone (FireWire)"，微信 / QQ / OBS / 腾讯会议里
 echo  可以直接选它。
 echo.
 echo  还需要装一次虚拟麦克风驱动（只做一次，要重启）：
-echo    1) 管理员运行: bcdedit /set testsigning on   然后重启
+echo    1) 进 drivers 包，右键 enable-testsigning.bat -> 以管理员身份运行
+echo       （它会自己提权、打开测试签名并回读状态；等价于
+echo        bcdedit /set testsigning on，但不会"找不到命令"）
+echo       然后重启电脑
 echo    2) 进 drivers 包，右键 install-mic.bat -> 以管理员身份运行
 echo    3) 用 isight-miccheck.exe 自检，报告写在 miccheck.txt
 echo.
 echo  开关（同一个 ini %LOCALAPPDATA%\iSightCam.ini）：
 echo    [audio]
 echo    enable=1     0 = 完全不碰音频单元（画面与旧版一致）
+echo    strip=1      1 = 把音频占掉的那 14 行用上一行补回去（v20）
 echo    mic=1        1 = 把麦克风送进虚拟麦克风设备（v19 默认）
 echo    wav=1        1 = 同时把 PCM 存成 iSightAudio.wav
 echo.
@@ -188,10 +201,10 @@ rem  子过程：按版本标记校验
 rem ============================================================
 :VerifyFile
 rem %1=目标 %2=位数标签
-findstr /m /c:"ISIGHTFILTER-BUILD-V19" "%~1" >nul 2>&1
+findstr /m /c:"ISIGHTFILTER-BUILD-V20" "%~1" >nul 2>&1
 if errorlevel 1 (
-    echo     [FAIL] %~1 里没有 v19 标记 —— 这个文件还是旧版！
+    echo     [FAIL] %~1 里没有 v20 标记 —— 这个文件还是旧版！
     exit /b 1
 )
-for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v19 标记
+for %%A in ("%~1") do echo     [ OK ] 已安装 %~2 位 %%~zA 字节，含 v20 标记
 exit /b 0
