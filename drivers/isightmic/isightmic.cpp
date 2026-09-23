@@ -807,35 +807,76 @@ STDMETHODIMP_(NTSTATUS) CMiniportTopology::DataRangeIntersection(IN ULONG PinId,
 }
 
 // ---------------------------------------------------------------------------
-// Adapter: register the wave + topology subdevices
+// Adapter: bind a port + miniport pair and register it as a subdevice
+//
+// A subdevice is the binding of FOUR things: a port object, a miniport object,
+// a resource list, and a reference string.  PcRegisterSubdevice takes the
+// PORT -- its signature is (DeviceObject, Name, PUNKNOWN Unknown) and the docs
+// say Unknown is "the IPort interface of the port driver object that is bound
+// to the subdevice".
+//
+// Handing it the *miniport* is what broke the first two installs: PortCls
+// queried the object for IPort, the miniport's QueryInterface answered
+// STATUS_INVALID_PARAMETER (the PortCls convention for "no such interface"),
+// and PcRegisterSubdevice propagated it.  PnP recorded that as problem 0x0a
+// CM_PROB_FAILED_START with problem status 0xc000000d, StartDevice failed, no
+// subdevice was ever enumerated, and "iSight Microphone (FireWire)" never
+// appeared -- while the control device kept working, because DriverEntry
+// creates that one and DriverEntry does not care about any of this.
+//
+// The sequence is the one in the "Subdevice Creation" topic:
+//     PcNewPort -> IPort::Init(DeviceObject, Irp, miniport, adapter, resources)
+//     -> PcRegisterSubdevice(DeviceObject, name, port)
+//     -> drop both references (the port holds its own on the miniport, and
+//        PcRegisterSubdevice holds its own on the port).
+// UnknownAdapter may be NULL -- the docs say so explicitly, and we have no
+// adapter object to pass.
 // ---------------------------------------------------------------------------
+static NTSTATUS InstallSubdevice(PDEVICE_OBJECT DeviceObject,
+                                 PIRP Irp,
+                                 PRESOURCELIST ResourceList,
+                                 PWSTR Name,
+                                 REFCLSID PortClassId,
+                                 PUNKNOWN Miniport) {
+    PPORT port = NULL;
+    NTSTATUS st = PcNewPort(&port, PortClassId);
+    if (!NT_SUCCESS(st)) return st;
+
+    st = port->Init(DeviceObject, Irp, Miniport, NULL, ResourceList);
+    if (NT_SUCCESS(st))
+        st = PcRegisterSubdevice(DeviceObject, Name, port);
+    // No DbgPrint here on purpose: it needs a kernel debugger to be seen at all,
+    // while the installer now writes the PnP problem code into its report --
+    // `pnputil /enum-devices /problem` names CM_PROB_FAILED_START in plain
+    // English, which is what actually localised this bug.
+
+    port->Release();
+    return st;
+}
+
 static NTSTATUS StartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELIST ResourceList) {
-    UNREFERENCED_PARAMETER(Irp);
-    UNREFERENCED_PARAMETER(ResourceList);
     NTSTATUS st;
-    PUNKNOWN wave = NULL;
-    PUNKNOWN topo = NULL;
 
     CMiniportWaveCyclic* w = new(NonPagedPool, ISIGHTMIC_POOL_TAG) CMiniportWaveCyclic(NULL);
     if (!w) return STATUS_INSUFFICIENT_RESOURCES;
-    wave = (PUNKNOWN)(IMiniportWaveCyclic*)w;
+    PUNKNOWN wave = (PUNKNOWN)(IMiniportWaveCyclic*)w;
 
-    // The subdevice name must match the KSNAME_* entries in isightmic.inf.
-    // (PWSTR) keeps this compiling whether the WDK declares the parameter as
-    // PWSTR or PCWSTR.
-    st = PcRegisterSubdevice(DeviceObject, (PWSTR)L"Wave", wave);
-    if (!NT_SUCCESS(st)) { wave->Release(); return st; }
+    // The name must match the KSNAME_* reference strings in isightmic.inf, and
+    // the buffer has to stay valid for the device object's lifetime -- a string
+    // literal in the driver's .rdata outlives it.
+    st = InstallSubdevice(DeviceObject, Irp, ResourceList, (PWSTR)L"Wave",
+                          CLSID_PortWaveCyclic, wave);
+    wave->Release();
+    if (!NT_SUCCESS(st)) return st;
 
     CMiniportTopology* t = new(NonPagedPool, ISIGHTMIC_POOL_TAG) CMiniportTopology(NULL);
-    if (!t) { wave->Release(); return STATUS_INSUFFICIENT_RESOURCES; }
-    topo = (PUNKNOWN)(IMiniportTopology*)t;
+    if (!t) return STATUS_INSUFFICIENT_RESOURCES;
+    PUNKNOWN topo = (PUNKNOWN)(IMiniportTopology*)t;
 
-    st = PcRegisterSubdevice(DeviceObject, (PWSTR)L"Topology", topo);
-    if (!NT_SUCCESS(st)) { topo->Release(); wave->Release(); return st; }
-
+    st = InstallSubdevice(DeviceObject, Irp, ResourceList, (PWSTR)L"Topology",
+                          CLSID_PortTopology, topo);
     topo->Release();
-    wave->Release();
-    return STATUS_SUCCESS;
+    return st;
 }
 
 static NTSTATUS AddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalDeviceObject) {
@@ -903,6 +944,17 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
                 st->State = g_State;
                 st->Opens = g_Opens;
                 info = sizeof(ISIGHTMIC_STATUS);
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+        } else if (code == IOCTL_ISIGHTMIC_GETBUILD) {
+            ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+            if (buf && outLen >= 1) {
+                ULONG n = (ULONG)sizeof(ISIGHTMIC_BUILD_TAG);   // includes the NUL
+                RtlZeroMemory(buf, outLen);
+                if (n > outLen) n = outLen;
+                RtlCopyMemory(buf, ISIGHTMIC_BUILD_TAG, n - 1);
+                info = n;
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
             }
