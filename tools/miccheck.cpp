@@ -96,6 +96,18 @@ static void ProbeDriver(StatusProbe* p, int seconds) {
     p->opened = true;
     say("[1] control device  : open OK");
 
+    // Which .sys is actually loaded.  Without this, "the driver is installed"
+    // and "the driver is the one I just built" are the same sentence.
+    char build[128] = "";
+    DWORD got = 0;
+    if (DeviceIoControl(h, IOCTL_ISIGHTMIC_GETBUILD, NULL, 0, build,
+                        sizeof(build) - 1, &got, NULL) && got > 0) {
+        build[(got < sizeof(build)) ? got : (sizeof(build) - 1)] = 0;
+        say("    driver build     : %s", build);
+    } else {
+        say("    driver build     : not reported (this .sys predates the GETBUILD ioctl)");
+    }
+
     ISIGHTMIC_STATUS st;
     DWORD err = 0;
     if (!ReadStatus(h, &st, &err)) {
