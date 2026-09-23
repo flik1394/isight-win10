@@ -30,6 +30,27 @@ static const GUID KSCATEGORY_CAPTURE = {
 
 #define HWID  L"ISIGHTMIC\\Mic"
 
+#define ISIGHT_MICDEV_TAG "ISIGHT-MICDEV-BUILD-V21-20260923-ROOTID"
+
+// The string handed to SetupDiCreateDeviceInfo when DICD_GENERATE_ID is set is
+// NOT the hardware ID.  It has to be a *root-enumerated device ID*: no
+// "Enumerator\" prefix and no instance suffix (the docs' example is "*PNP0500").
+// Passing the hardware ID "ISIGHTMIC\Mic" fails with
+//     0xE0000205  SPAPI_E_INVALID_DEVINST_NAME
+// because the backslash makes it look like an instance ID whose enumerator is
+// "ISIGHTMIC" -- an enumerator that does not exist.  That is exactly the error
+// the v20 package died on.
+//
+// Keep a few spellings and take the first one Windows accepts, so the exact
+// accepted shape never has to be guessed again; the winner is printed.
+static const wchar_t *kRootDeviceIds[] = {
+    L"iSightMic",        // bare root device ID -- the documented form
+    L"*ISIGHTMIC",       // the shape the docs use for their example
+    L"Root\\iSightMic",  // the prefixed form older samples pass around
+    L"ISIGHTMIC\\Mic",   // the hardware ID; known to be rejected, kept as a witness
+    NULL
+};
+
 static void PrintErr(const wchar_t *what, DWORD err) {
     wchar_t *msg = NULL;
     FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
@@ -50,6 +71,7 @@ static int DoInstall(const wchar_t *infArg) {
         return 2;
     }
     wprintf(L"INF: %s\n", inf);
+    wprintf(L"tool: %hs\n", ISIGHT_MICDEV_TAG);
 
     // 1. stage into the driver store (this is what makes the signed .cat count)
     wchar_t dest[MAX_PATH];
@@ -80,17 +102,40 @@ static int DoInstall(const wchar_t *infArg) {
     HDEVINFO h = SetupDiCreateDeviceInfoList(&classGuid, NULL);
     if (h == INVALID_HANDLE_VALUE) { PrintErr(L"create device info list", GetLastError()); return 3; }
 
+    // 3. the device information element.  Pick the first root device ID that
+    //    Windows will take (see kRootDeviceIds above).
     SP_DEVINFO_DATA did;
-    ZeroMemory(&did, sizeof(did));
-    did.cbSize = sizeof(did);
-    if (!SetupDiCreateDeviceInfoW(h, L"ISIGHTMIC\\Mic", &classGuid, NULL, NULL,
-                                  DICD_GENERATE_ID, &did)) {
-        PrintErr(L"create device info", GetLastError());
+    const wchar_t *devId = NULL;
+    DWORD lastErr = 0;
+    for (int i = 0; kRootDeviceIds[i]; i++) {
+        ZeroMemory(&did, sizeof(did));
+        did.cbSize = sizeof(did);
+        SetLastError(0);
+        if (SetupDiCreateDeviceInfoW(h, kRootDeviceIds[i], &classGuid, NULL, NULL,
+                                     DICD_GENERATE_ID, &did)) {
+            devId = kRootDeviceIds[i];
+            break;
+        }
+        lastErr = GetLastError();
+        wprintf(L"  %-28s \"%s\" rejected (0x%08lx)\n",
+                L"create device info", kRootDeviceIds[i], lastErr);
+    }
+    if (!devId) {
+        wprintf(L"  %-28s no root device ID was accepted\n", L"create device info");
+        if (lastErr == 0xE0000205)
+            wprintf(L"        0xE0000205 is SPAPI_E_INVALID_DEVINST_NAME: with\n"
+                    L"        DICD_GENERATE_ID the name must be a bare root device ID,\n"
+                    L"        so a \"ISIGHTMIC\\\" prefix is not allowed here.\n");
         SetupDiDestroyDeviceInfoList(h);
         return 4;
     }
 
-    // 3. the hardware ID the INF's [Models] section is keyed on
+    wchar_t instId[512] = L"";
+    SetupDiGetDeviceInstanceIdW(h, &did, instId, 511, NULL);
+    wprintf(L"  %-28s ok  %s  (from \"%s\")\n",
+            L"create device info", instId, devId);
+
+    // 4. the hardware ID the INF's [Models] section is keyed on
     wchar_t hwids[64] = HWID;
     hwids[wcslen(HWID) + 1] = L'\0';   // MULTI_SZ: double null
     if (!SetupDiSetDeviceRegistryPropertyW(h, &did, SPDRP_HARDWAREID,
@@ -100,38 +145,52 @@ static int DoInstall(const wchar_t *infArg) {
         SetupDiDestroyDeviceInfoList(h);
         return 5;
     }
+    wprintf(L"  %-28s %s\n", L"hardware id", HWID);
 
-    // 4. pick the driver and install it.  DIF_SELECTBESTCOMPATDRV searches the
-    //    driver store (where we just staged the INF); DIF_INSTALLDEVICE then
-    //    registers the node and starts the driver.
-    BOOL ok = SetupDiCallClassInstaller(DIF_SELECTBESTCOMPATDRV, h, &did);
-    if (!ok) PrintErr(L"select best driver", GetLastError());
+    // 5. register the node with PnP, then let PnP itself choose and install the
+    //    driver.  This is the order devcon uses for a root-enumerated device:
+    //    DIF_REGISTERDEVICE first, UpdateDriverForPlugAndPlayDevices second.
+    //    Driving the DIF codes by hand only happens if that fails.
+    if (SetupDiCallClassInstaller(DIF_REGISTERDEVICE, h, &did))
+        wprintf(L"  %-28s ok\n", L"register device node");
+    else
+        PrintErr(L"register device node", GetLastError());
 
-    ok = SetupDiCallClassInstaller(DIF_REGISTERDEVICE, h, &did);
-    if (!ok) PrintErr(L"register device node", GetLastError());
-    else wprintf(L"  %-28s ok\n", L"register device node");
-
-    ok = SetupDiCallClassInstaller(DIF_INSTALLDEVICE, h, &did);
-    if (!ok) {
-        DWORD e = GetLastError();
-        PrintErr(L"install device", e);
-        // second chance: hand the hardware ID to PnP directly
-        BOOL reboot = FALSE;
-        if (UpdateDriverForPlugAndPlayDevicesW(NULL, HWID, inf, INSTALLFLAG_FORCE, &reboot)) {
-            wprintf(L"  %-28s ok\n", L"install (PnP update)");
-            ok = TRUE;
-        } else {
-            PrintErr(L"install (PnP update)", GetLastError());
-        }
+    BOOL ok = FALSE;
+    BOOL reboot = FALSE;
+    if (UpdateDriverForPlugAndPlayDevicesW(
+            NULL, HWID, inf,
+            INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE, &reboot)) {
+        ok = TRUE;
+        wprintf(L"  %-28s ok%s\n", L"install device",
+                reboot ? L" -- a reboot was requested" : L"");
     } else {
-        wprintf(L"  %-28s ok\n", L"install device");
+        PrintErr(L"install device", GetLastError());
+        if (SetupDiCallClassInstaller(DIF_SELECTBESTCOMPATDRV, h, &did)) {
+            wprintf(L"  %-28s ok\n", L"select best driver");
+            if (SetupDiCallClassInstaller(DIF_INSTALLDEVICE, h, &did)) {
+                ok = TRUE;
+                wprintf(L"  %-28s ok\n", L"install device (DIF)");
+            } else {
+                PrintErr(L"install device (DIF)", GetLastError());
+            }
+        } else {
+            PrintErr(L"select best driver", GetLastError());
+        }
     }
 
-    // 5. start it
+    // 6. start it.  PnP normally has already; this is the belt to that braces.
     if (ok) {
-        if (SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, h, &did)) {
-            wprintf(L"  %-28s ok\n", L"start device");
-        }
+        SP_PROPCHANGE_PARAMS pcp;
+        ZeroMemory(&pcp, sizeof(pcp));
+        pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+        pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+        pcp.StateChange = DICS_ENABLE;
+        pcp.Scope = DICS_FLAG_GLOBAL;
+        pcp.HwProfile = 0;
+        if (SetupDiSetClassInstallParamsW(h, &did, &pcp.ClassInstallHeader, sizeof(pcp)) &&
+            SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, h, &did))
+            wprintf(L"  %-28s ok\n", L"enable device");
     }
 
     SetupDiDestroyDeviceInfoList(h);
@@ -142,8 +201,9 @@ static int DoInstall(const wchar_t *infArg) {
                 L"and the machine booted once with testsigning on.\n");
         return 6;
     }
-    wprintf(L"\niSight virtual microphone installed.  Look for\n"
-            L"\"iSight Microphone (FireWire)\" in the recording devices list.\n");
+    wprintf(L"\niSight virtual microphone installed as %s.\n"
+            L"Look for \"iSight Microphone (FireWire)\" in the recording devices list.\n",
+            instId);
     return 0;
 }
 
