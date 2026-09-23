@@ -233,7 +233,7 @@ static const GUID CLSID_ISightFireWireCam =
 // string to prove that the file it just registered is really this version --
 // a silently failed copy (the .ax is mapped by a running host and the copy
 // is refused) has burned this project more than once.
-#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V19-20260922-MICFEED"
+#define ISIGHT_BUILD_TAG "ISIGHTFILTER-BUILD-V20-20260923-HEAL"
 
 // Public release number.  The build tag above changes on every internal
 // iteration (and install-all.bat greps for its "V14" prefix); this one is
@@ -767,12 +767,14 @@ static void WriteDefaultIni(const char *path)
         "wav=1\n"
         "maxmb=20\n"
         "log=1\n"
-        "; v17: cut the audio packets out of the frame buffer again before\n"
-        "; the picture is converted.  The 1394 driver splices them into the\n"
-        "; image as if they were video bytes (flickering seams + a rainbow\n"
-        "; band at the bottom).  strip=0 restores the v16 behaviour.\n"
+        "; strip=1 -- v20: the camera folds its audio into the frame as seven\n"
+        "; two-row holes (iso packets, on row boundaries).  Those rows are lost,\n"
+        "; so put the row above back over each hole.  The frame keeps its exact\n"
+        "; length: nothing is cut, nothing is padded, no row moves.  strip=0\n"
+        "; hands the raw buffer straight to the converters (v16 behaviour: you\n"
+        "; see fourteen rows of white noise in the picture).\n"
         "strip=1\n"
-        "; v18: rawdump=1 writes the first two untouched capture buffers to\n"
+        "; v18: rawdump=1 writes the first three untouched capture buffers to\n"
         "; %%LOCALAPPDATA%%\\iSightCam-dump\\frame-raw-*.bin -- the only way to\n"
         "; measure what an audio packet really occupies in the stream.\n"
         "rawdump=1\n");
@@ -2320,6 +2322,9 @@ void CiSightStream::ReleaseCamera()
 #define AUDIO_RATE_48000  0x80000000u
 #define AUDIO_MAX_FRAMES  475            // the camera's per-packet limit
 #define AUDIO_HEADER      16
+// v20: how many 960-byte isochronous slots one frame can be cut into.  640x480
+// YUV411 is 480 of them; the map only has to cover anything a mode can produce.
+#define AUDIO_SLOT_MAX    4096
 
 // v19: how often to re-try opening the virtual microphone driver while the
 // audio unit is running (the driver is a separate install, and a user may add
@@ -2602,8 +2607,38 @@ void CiSightStream::AudioScanFrame()
         return;
 
     const bool  strip = o.audioStrip != 0;
-    const ULONG want  = FrameBytes();           // 460800 -- one YUV411 frame
-    ULONG keep = 0, w = 0;   // [keep,..) unexamined; [0,w) already compacted
+    // ---- what the capture buffer really contains (v20, measured) ----------
+    // It is exactly one 640x480 YUV411 frame: 460800 bytes = 480 rows of 960.
+    // The camera folds its audio into that same window as seven two-row
+    // holes, each landing on a row boundary (rows 60,122,184,246,308,370,432,
+    // 1920 bytes = two 960-byte isochronous slots each, 13440 bytes = 14 rows
+    // per frame).  The audio payload only fills 1680 of those 1920 bytes; the
+    // rest is packet padding.  Those fourteen rows are lost, not displaced:
+    // rendering the untouched buffer as 480 rows shows the room with fourteen
+    // rows of white noise in it and nothing else out of place.
+    //
+    // v17/v18/v19 cut 16+count*4 = 1632 bytes per hole and padded the tail.
+    // That left 48 + 240 = 288 bytes of padding behind at each of the seven
+    // sites -- 2016 stray bytes in the middle of the picture -- so every row
+    // after a hole was shifted by a non-integral number of rows.  That is the
+    // horizontal banding with audio on, and no choice of pad length could fix
+    // it.
+    //
+    // v20 never changes the frame length: for every slot that holds audio
+    // bytes, paint that slot with a copy of the slot above it.  Length in ==
+    // length out (no pad, no clamp, no overflow) and the row grid never
+    // moves, so the other 466 rows are byte-for-byte the camera's.
+    ULONG want = FrameBytes();
+    if (want > cb) {
+        FLog("audio: frame-size mismatch -- FrameBytes()=%lu but the capture "
+             "buffer is only %lu; not healing (mode changed?)",
+             (unsigned long)want, (unsigned long)cb);
+    }
+    const ULONG slot  = (m_width > 0) ? ((ULONG)m_width * 3 / 2) : 0;
+    const ULONG slots = (slot >= 64 && slot <= cb) ? (cb / slot) : 0;
+    const bool  heal  = strip && slots > 0 && slots <= AUDIO_SLOT_MAX;
+    BYTE        dirty[AUDIO_SLOT_MAX / 8];
+    ZeroMemory(dirty, sizeof(dirty));
 
     if (o.audioRawDump && m_audioFramesScanned <= 2)
         DumpRawFrame(p, cb, (ULONG)m_audioFramesScanned);
@@ -2684,67 +2719,50 @@ void CiSightStream::AudioScanFrame()
                  (long)m_audioPackets, (unsigned long)start, (unsigned long)cb,
                  (unsigned long)count, (unsigned long)total, cut ? " (cut)" : "");
 
-        if (strip && !cut && start >= keep)
+        if (heal)
         {
-            // cut [start, end) out: move the video bytes seen since the
-            // last cut down over it.  w <= keep <= start always holds, so
-            // source and destination never overlap the packet itself.
-            if (start > keep) { memmove(p + w, p + keep, start - keep); w += start - keep; }
-            m_audioStripBytes += (LONG)(end - start);
-            ++m_audioStripPackets;
-            keep = end;
-            i = end - 1;                           // resume after this packet
+            // Remember which row-sized slots this packet lives in and paint
+            // them in the second pass, once the whole buffer has been read --
+            // a packet may straddle a slot boundary, and we must not overwrite
+            // bytes we have not looked at yet.
+            ULONG s0 = start / slot;
+            ULONG s1 = (end > start) ? ((end - 1) / slot) : s0;
+            for (ULONG s = s0; s <= s1 && s < slots; ++s)
+                dirty[s >> 3] |= (BYTE)(1u << (s & 7));
         }
-        else
-        {
-            i = body + need - 1;                   // skip this packet's body
-        }
+        i = body + need - 1;                       // skip this packet's body
     }
 
-    if (strip)
+    if (heal)
     {
-        // move the video tail down over the (already cut) holes
-        if (cb > keep) { memmove(p + w, p + keep, cb - keep); w += cb - keep; }
+        // Second pass: paint every slot that held audio with the slot above
+        // it.  The frame keeps its exact length, so there is nothing to pad
+        // and the row grid is untouched -- the picture is the camera's own,
+        // except for the fourteen rows the audio took, which come back as a
+        // copy of the row above (a two-row freeze seven times a frame: the
+        // geometry is right and the eye never finds it).
+        ULONG healed = 0;
+        for (ULONG s = 0; s < slots; ++s)
+        {
+            if ((dirty[s >> 3] & (BYTE)(1u << (s & 7))) == 0)
+                continue;
+            BYTE *dst = p + (ULONG)s * slot;
+            if (s > 0) memmove(dst, dst - slot, slot);
+            else       memset(dst, 0x80, slot);      // row 0 has no row above
+            ++healed;
+        }
+        m_audioStripBytes  += (LONG)(healed * slot);
+        m_audioStripPackets = (LONG)healed;
+        m_audioTailBytes    = (LONG)cb;              // length is never changed
         ++m_audioStripFrames;
-        m_audioTailBytes = (LONG)w;
-
-        // the audio packets took the tail of this frame out of the buffer
-        // (the buffer is exactly one frame long, nothing is spare) -- pad it
-        // back with the tail of the previous frame so the converters still
-        // see a complete picture.  The last few rows of a 15 fps frame hardly
-        // move, so borrowing them is invisible.
-        LONG pad = 0;
-        if (w < want)
-        {
-            pad = (LONG)want - (LONG)w;
-            ULONG have = (m_audioPrevTailBytes >= pad) ? (ULONG)pad
-                                                       : (ULONG)m_audioPrevTailBytes;
-            if (have > 0 && m_audioPrevTail != NULL)
-                memcpy(p + w, m_audioPrevTail + (m_audioPrevTailBytes - have), have);
-            if (have < (ULONG)pad)
-                ZeroMemory(p + w + have, (ULONG)pad - have);
-            m_audioPadBytes += pad;
-            w = want;
-        }
-        else if (w > want + AUDIO_TAIL_CAP)
-        {
-            w = want + AUDIO_TAIL_CAP;          // never keep more than we can stash
-        }
-
-        // remember this frame's tail for the next one
-        if (m_audioPrevTail != NULL && w > 0)
-        {
-            ULONG save = (w < AUDIO_TAIL_CAP) ? w : (ULONG)AUDIO_TAIL_CAP;
-            memcpy(m_audioPrevTail, p + (w - save), save);
-            m_audioPrevTailBytes = (LONG)save;
-        }
 
         if (m_audioStripFrames <= 3 || (m_audioStripFrames % 300) == 0)
-            FLog("audio: strip frame #%ld: %ld packets / %ld bytes cut, "
-                 "%ld bytes of picture left, %ld padded (a full frame is %lu)",
+            FLog("audio: healed frame #%ld: %ld of %lu slots (%ld bytes = %ld "
+                 "rows) painted over with the row above; frame still %ld bytes, "
+                 "nothing padded",
                  (long)m_audioStripFrames, (long)m_audioStripPackets,
-                 (long)m_audioStripBytes, (long)m_audioTailBytes,
-                 (long)pad, (unsigned long)want);
+                 (unsigned long)slots, (long)m_audioStripBytes,
+                 (long)(m_audioStripBytes / (LONG)slot), (long)cb);
     }
 
     if (o.audioLog >= 1 && m_audioPackets > 0 &&
@@ -2764,10 +2782,10 @@ void CiSightStream::AudioScanFrame()
         // number that answers it: frames pushed / frames decoded.
         if (o.audioMic)
         {
-            LONG want = m_audioFrames * ISIGHTMIC_FRAME_BYTES;   // mono bytes
+            LONG micWant = m_audioFrames * ISIGHTMIC_FRAME_BYTES;   // mono bytes
             FLog("mic: %ld of %ld mono bytes pushed (%.1f%%), %ld failed pushes%s",
-                 (long)m_micPushed, (long)want,
-                 want > 0 ? (100.0 * m_micPushed / (double)want) : 0.0,
+                 (long)m_micPushed, (long)micWant,
+                 micWant > 0 ? (100.0 * m_micPushed / (double)micWant) : 0.0,
                  (long)m_micFails,
                  (m_micDev == INVALID_HANDLE_VALUE) ? " -- device not open" : "");
         }
