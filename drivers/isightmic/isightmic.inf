@@ -52,7 +52,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/24/2026,1.0.3.0
+DriverVer   = 09/24/2026,1.0.4.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64

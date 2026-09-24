@@ -81,6 +81,65 @@ static bool ReadStatus(HANDLE h, ISIGHTMIC_STATUS* out, DWORD* err) {
     return true;
 }
 
+static bool ReadDiag(HANDLE h, ISIGHTMIC_DIAG* out) {
+    DWORD got = 0;
+    return DeviceIoControl(h, IOCTL_ISIGHTMIC_GETDIAG, NULL, 0, out,
+                           sizeof(*out), &got, NULL) && got >= sizeof(*out);
+}
+
+// ---------------------------------------------------------------------------
+// The driver-side call trace
+//
+// WASAPI answers AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008) for a whole family
+// of completely different failures: the audio stack never opened the filter,
+// opened it but never asked about a data format, asked about formats but never
+// instantiated the pin, or instantiated the pin and failed inside NewStream.
+// All four look identical from the outside, and they need opposite fixes.
+// These counters are the only place the difference is visible.  Read the
+// columns in order: the first one still at zero is the step that never ran.
+// ---------------------------------------------------------------------------
+static void ProbeDiag(const char* when) {
+    HANDLE h = CreateFileW(L"\\\\.\\IsightMicCtl", GENERIC_READ | GENERIC_WRITE,
+                           0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        say("    call trace (%s): control device unavailable (err=%u)",
+            when, GetLastError());
+        return;
+    }
+    ISIGHTMIC_DIAG d;
+    if (!ReadDiag(h, &d)) {
+        say("    call trace (%s): GETDIAG failed (err=%u) -- this .sys predates v24",
+            when, GetLastError());
+        CloseHandle(h);
+        return;
+    }
+    CloseHandle(h);
+
+    say("    call trace (%s):", when);
+    say("        filter instances     wave=%u topology=%u",
+        d.WaveInitCalls, d.TopoInitCalls);
+    say("        format intersection  wave=%u (length probes=%u) topology=%u",
+        d.WaveIntersect, d.WaveIntersectProbe, d.TopoIntersect);
+    say("        last intersection    pin=%u outLen=%u status=0x%08X reqSpec=%08X",
+        d.WaveIntersectLastPin, d.WaveIntersectLastOutLen,
+        d.WaveIntersectLastStatus, d.WaveIntersectReqSpec);
+    say("        NewStream            entered=%u failed=%u"
+        "  [dma=%u init=%u svc=%u last=0x%08X]",
+        d.NewStreamEntered, d.NewStreamFailed,
+        d.FailDma, d.FailStreamInit, d.FailServiceGroup, d.LastFailStatus);
+
+    if (d.WaveInitCalls == 0)
+        say("    -> the audio stack never opened the wave filter.");
+    else if (d.WaveIntersect == 0)
+        say("    -> the filter was opened but never asked for a data format.");
+    else if (d.NewStreamEntered == 0)
+        say("    -> formats were negotiated, but PortCls never instantiated the pin.");
+    else if (d.NewStreamFailed != 0)
+        say("    -> the pin was instantiated and NewStream failed inside the driver.");
+    else
+        say("    -> a capture stream was created successfully.");
+}
+
 static void ProbeDriver(StatusProbe* p, int seconds) {
     ZeroMemory(p, sizeof(*p));
     HANDLE h = CreateFileW(L"\\\\.\\IsightMicCtl", GENERIC_READ | GENERIC_WRITE,
@@ -150,6 +209,7 @@ static void ProbeDriver(StatusProbe* p, int seconds) {
             st.Played - prevPlayed);
     else
         say("    -> stream exists but played did not advance: the endpoint is not in RUN.");
+    ProbeDiag("before");
     CloseHandle(h);
 }
 
@@ -355,6 +415,11 @@ int main(int argc, char** argv) {
         CaptureFrom(dev, seconds);
         dev->Release();
     }
+    // Read the trace again now that we have just tried to open the endpoint the
+    // way WeChat does.  The delta between this and the "before" reading is what
+    // our own attempt touched -- and if it is all zeros, our attempt never
+    // reached the driver either, which is itself the answer.
+    ProbeDiag("after");
 
     say("=== done ===");
     if (g_rep) { fclose(g_rep); g_rep = NULL; }

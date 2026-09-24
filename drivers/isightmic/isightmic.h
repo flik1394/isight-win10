@@ -43,7 +43,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V23-20260924-PINCAT"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V24-20260924-CALLTRACE"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -58,13 +58,33 @@ typedef struct _ISIGHTMIC_STATUS {
     unsigned long Opens;      // how many times the control device was opened
 } ISIGHTMIC_STATUS, *PISIGHTMIC_STATUS;
 
+// Where the audio stack actually got to.  Read top to bottom: the first column
+// that is still zero is the step that never happened, and that is the bug.
+//
+// This exists because "the endpoint is published but closes the instant you
+// open it" has at least four very different causes -- the engine never opened
+// the filter, it opened it but never asked about formats, it asked about
+// formats but never instantiated the pin, or it instantiated the pin and we
+// failed inside NewStream -- and they all look identical from WASAPI, which
+// can only report AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008) for every one.
 typedef struct _ISIGHTMIC_DIAG {
+    // --- keep these six in this order: they are the v23 fields ---
     unsigned long NewStreamEntered;   // PortCls called IMiniportWaveCyclic::NewStream
     unsigned long NewStreamFailed;    // ... and we returned a failure
     unsigned long FailDma;            // NewMasterDmaChannel failed
     unsigned long FailStreamInit;     // stream Init / stream object alloc failed
     unsigned long FailServiceGroup;   // PcNewServiceGroup failed
     unsigned long LastFailStatus;     // NTSTATUS of the most recent failure
+    // --- v24 additions ---
+    unsigned long WaveInitCalls;      // wave filter instances created
+    unsigned long TopoInitCalls;      // topology filter instances created
+    unsigned long WaveIntersect;      // wave DataRangeIntersection calls
+    unsigned long WaveIntersectProbe; // ... of which were length-only probes
+    unsigned long WaveIntersectLastPin;
+    unsigned long WaveIntersectLastOutLen;  // OutputBufferLength the caller offered
+    unsigned long WaveIntersectLastStatus;  // what we returned to the last call
+    unsigned long WaveIntersectReqSpec;     // requested Specifier, first ULONG
+    unsigned long TopoIntersect;      // topology DataRangeIntersection calls
 } ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"

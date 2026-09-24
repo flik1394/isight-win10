@@ -81,6 +81,19 @@ static ULONG g_FailStreamInit;
 static ULONG g_FailServiceGroup;
 static ULONG g_LastFailStatus;
 
+// v24 call-trace counters.  Plain ULONGs, incremented from arbitrary threads
+// and read from an IOCTL; a torn read only ever makes the snapshot
+// self-inconsistent, never wrong in a way that changes a diagnosis.
+static ULONG g_WaveInitCalls;
+static ULONG g_TopoInitCalls;
+static ULONG g_WaveIntersect;
+static ULONG g_WaveIntersectProbe;
+static ULONG g_WaveIntersectLastPin;
+static ULONG g_WaveIntersectLastOutLen;
+static ULONG g_WaveIntersectLastStatus;
+static ULONG g_WaveIntersectReqSpec;
+static ULONG g_TopoIntersect;
+
 static void RingInit(PRING r) {
     r->Buffer = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, RING_BYTES, ISIGHTMIC_POOL_TAG);
     r->Cap = (r->Buffer != NULL) ? RING_BYTES : 0;
@@ -613,6 +626,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::Init(IN PUNKNOWN UnknownAdapter,
     if (m_Port) m_Port->AddRef();
     // Virtual device: there is no real bus resource to claim.
     UNREFERENCED_PARAMETER(ResourceList);
+    g_WaveInitCalls++;
     return STATUS_SUCCESS;
 }
 
@@ -702,15 +716,28 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
                                                                    IN ULONG OutputBufferLength,
                                                                    OUT PVOID ResultantFormat,
                                                                    OUT PULONG ResultantFormatLength) {
-    UNREFERENCED_PARAMETER(PinId);
     UNREFERENCED_PARAMETER(DataRange);
-    UNREFERENCED_PARAMETER(MatchingDataRange);
+
+    // v24 call trace.  "WASAPI says the format is unsupported" covers both
+    // "nobody ever asked us about a format" and "we answered and it was
+    // rejected", and only the second one is a format bug.  Keep enough of the
+    // last call to tell them apart without a debugger.
+    g_WaveIntersect++;
+    g_WaveIntersectLastPin = PinId;
+    g_WaveIntersectLastOutLen = OutputBufferLength;
+    if (MatchingDataRange) g_WaveIntersectReqSpec = MatchingDataRange->Specifier.Data1;
+
     if (OutputBufferLength < sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
+        g_WaveIntersectProbe++;
+        g_WaveIntersectLastStatus = STATUS_BUFFER_TOO_SMALL;
         if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
         return STATUS_BUFFER_TOO_SMALL;
     }
     PKSDATAFORMAT_WAVEFORMATEX fmt = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
-    if (!fmt) return STATUS_INVALID_PARAMETER;
+    if (!fmt) {
+        g_WaveIntersectLastStatus = STATUS_INVALID_PARAMETER;
+        return STATUS_INVALID_PARAMETER;
+    }
     RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEX));
     fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
     fmt->DataFormat.SampleSize  = ISIGHTMIC_FRAME_BYTES;
@@ -725,6 +752,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
     fmt->WaveFormatEx.cbSize          = 0;
     fmt->WaveFormatEx.nAvgBytesPerSec = ISIGHTMIC_SAMPLERATE * ISIGHTMIC_FRAME_BYTES;
     if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
+    g_WaveIntersectLastStatus = STATUS_SUCCESS;
     return STATUS_SUCCESS;
 }
 
@@ -865,6 +893,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportTopology::Init(IN PUNKNOWN UnknownAdapter,
     UNREFERENCED_PARAMETER(ResourceList);
     m_Port = Port;
     if (m_Port) m_Port->AddRef();
+    g_TopoInitCalls++;
     return STATUS_SUCCESS;
 }
 
@@ -883,6 +912,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportTopology::DataRangeIntersection(IN ULONG PinId,
     UNREFERENCED_PARAMETER(PinId);
     UNREFERENCED_PARAMETER(DataRange);
     UNREFERENCED_PARAMETER(MatchingDataRange);
+    g_TopoIntersect++;
     if (ResultantFormat && OutputBufferLength >= sizeof(KSDATARANGE) && MatchingDataRange)
         RtlCopyMemory(ResultantFormat, MatchingDataRange, sizeof(KSDATARANGE));
     if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATARANGE);
@@ -1091,6 +1121,15 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
                 dg->FailStreamInit   = g_FailStreamInit;
                 dg->FailServiceGroup = g_FailServiceGroup;
                 dg->LastFailStatus   = g_LastFailStatus;
+                dg->WaveInitCalls    = g_WaveInitCalls;
+                dg->TopoInitCalls    = g_TopoInitCalls;
+                dg->WaveIntersect    = g_WaveIntersect;
+                dg->WaveIntersectProbe = g_WaveIntersectProbe;
+                dg->WaveIntersectLastPin = g_WaveIntersectLastPin;
+                dg->WaveIntersectLastOutLen = g_WaveIntersectLastOutLen;
+                dg->WaveIntersectLastStatus = g_WaveIntersectLastStatus;
+                dg->WaveIntersectReqSpec = g_WaveIntersectReqSpec;
+                dg->TopoIntersect    = g_TopoIntersect;
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
