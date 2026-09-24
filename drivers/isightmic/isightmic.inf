@@ -26,6 +26,25 @@
 ; interface was registered.  Measured with isight-check/ksprobe.py: the Realtek
 ; wave filter answers that property with 270 bytes, every iSight pin with
 ; nothing.  Same reason to move the version again.
+;
+; DriverVer 1.0.3.0 (2026-09-24): the endpoint existed and was published but
+; died the moment anything opened it -- 微信 showed "iSight Microphone" in its
+; input list and closed the device again on the spot, and WASAPI answered
+; AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008) to GetMixFormat, to every shared
+; mode IsFormatSupported and to exclusive-mode Initialize, while the driver's
+; own stream counter stayed 0.
+;
+; The wave filter's streaming pin was declared with Category KSCATEGORY_AUDIO
+; {6994AD04-...}, which is the *render* value; a capture pin needs
+; PINNAME_CAPTURE {FB6C4281-0353-11D1-905F-0000C0CC16BA}.  Both working capture
+; filters on the machine that was measured (Realtek rtmicinwave and
+; rtstereomixwave) use it, and the render sibling rearlineoutwave3 uses
+; KSCATEGORY_AUDIO.  With the render value on a capture pin the audio engine
+; never instantiated the pin at all: KSPROPERTY_PIN_GLOBALCINSTANCES stayed
+; {1,0} through a whole round of open attempts, so NewStream was never reached.
+; MinFilterInstanceCount on the same pin went 0 -> 1 to match those references.
+; (See isight-check/ksprobe.py for the pin property dump and micdiag.py for the
+; NewStream break-down.)  Version moved for the same staging reason as above.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -33,7 +52,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/24/2026,1.0.2.0
+DriverVer   = 09/24/2026,1.0.3.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64
