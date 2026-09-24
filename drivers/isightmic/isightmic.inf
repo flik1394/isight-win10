@@ -17,6 +17,15 @@
 ; problem 0x0a CM_PROB_FAILED_START.  The version had to move or a machine that
 ; already staged 1.0.0.0 would keep the old copy (SetupCopyOEMInf reports
 ; "already staged" for a same-version package and nothing gets replaced).
+;
+; DriverVer 1.0.2.0 (2026-09-24): the device started but no recording endpoint
+; ever appeared.  StartDevice registered the two subdevices but never called
+; PcRegisterPhysicalConnection, so KSPROPERTY_PIN_PHYSICALCONNECTION had no
+; answer and AudioEndpointBuilder could not pair the wave bridge pin with the
+; topology bridge pin -- no graph, no endpoint, even though every KSCATEGORY_*
+; interface was registered.  Measured with isight-check/ksprobe.py: the Realtek
+; wave filter answers that property with 270 bytes, every iSight pin with
+; nothing.  Same reason to move the version again.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -24,7 +33,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/23/2026,1.0.1.0
+DriverVer   = 09/24/2026,1.0.2.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64
