@@ -35,7 +35,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V21-20260923-PORTCLS"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V22-20260924-PHYSCONN"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
