@@ -837,7 +837,8 @@ static NTSTATUS InstallSubdevice(PDEVICE_OBJECT DeviceObject,
                                  PRESOURCELIST ResourceList,
                                  PWSTR Name,
                                  REFCLSID PortClassId,
-                                 PUNKNOWN Miniport) {
+                                 PUNKNOWN Miniport,
+                                 PPORT* OutPort) {
     PPORT port = NULL;
     NTSTATUS st = PcNewPort(&port, PortClassId);
     if (!NT_SUCCESS(st)) return st;
@@ -850,12 +851,19 @@ static NTSTATUS InstallSubdevice(PDEVICE_OBJECT DeviceObject,
     // `pnputil /enum-devices /problem` names CM_PROB_FAILED_START in plain
     // English, which is what actually localised this bug.
 
-    port->Release();
-    return st;
+    if (!NT_SUCCESS(st)) {
+        port->Release();
+        return st;
+    }
+    if (OutPort) *OutPort = port;       // caller releases it
+    else         port->Release();
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS StartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELIST ResourceList) {
     NTSTATUS st;
+    PPORT wavePort = NULL;
+    PPORT topoPort = NULL;
 
     CMiniportWaveCyclic* w = new(NonPagedPool, ISIGHTMIC_POOL_TAG) CMiniportWaveCyclic(NULL);
     if (!w) return STATUS_INSUFFICIENT_RESOURCES;
@@ -865,17 +873,48 @@ static NTSTATUS StartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELIST
     // the buffer has to stay valid for the device object's lifetime -- a string
     // literal in the driver's .rdata outlives it.
     st = InstallSubdevice(DeviceObject, Irp, ResourceList, (PWSTR)L"Wave",
-                          CLSID_PortWaveCyclic, wave);
+                          CLSID_PortWaveCyclic, wave, &wavePort);
     wave->Release();
     if (!NT_SUCCESS(st)) return st;
 
     CMiniportTopology* t = new(NonPagedPool, ISIGHTMIC_POOL_TAG) CMiniportTopology(NULL);
-    if (!t) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!t) { wavePort->Release(); return STATUS_INSUFFICIENT_RESOURCES; }
     PUNKNOWN topo = (PUNKNOWN)(IMiniportTopology*)t;
 
     st = InstallSubdevice(DeviceObject, Irp, ResourceList, (PWSTR)L"Topology",
-                          CLSID_PortTopology, topo);
+                          CLSID_PortTopology, topo, &topoPort);
     topo->Release();
+    if (!NT_SUCCESS(st)) { wavePort->Release(); return st; }
+
+    // ---------------------------------------------------------------------
+    // THE STEP THAT WAS MISSING (2026-09-24).  Registering the two subdevices
+    // is not enough: PortCls also has to be told that the wave filter's bridge
+    // pin is hard-wired to the topology filter's bridge pin.  That registration
+    // is the ONLY thing that gives KSPROPERTY_PIN_PHYSICALCONNECTION any
+    // content, and SysAudio / AudioEndpointBuilder walk exactly that property
+    // to pair a wave pin with a topology pin and build the audio graph.
+    //
+    // Without it the driver looks healthy from every angle: the device starts,
+    // all four KSCATEGORY_* interfaces appear under DeviceClasses, and
+    // isight-micdev.exe (which enumerates KSCATEGORY_CAPTURE) proudly lists
+    // "iSight Microphone (FireWire)" -- yet HKLM\...\MMDevices\Audio\Capture
+    // stays empty, so Sound, WeChat and everything else see no microphone.
+    //
+    // Proven on the box with isight-check/ksprobe.py: the Realtek wave filter
+    // answers KSPROPERTY_PIN_PHYSICALCONNECTION with 270 bytes naming its
+    // topology filter; every iSight pin answered nothing.
+    //
+    // Direction matters.  FromUnknown is the port whose subdevice *supplies*
+    // the data (its pin is the output side); ToUnknown is the one that *sinks*
+    // it.  On a capture path the signal leaves the topology's bridge pin and
+    // enters the wave filter's bridge pin, so topology is From, wave is To.
+    // ---------------------------------------------------------------------
+    st = PcRegisterPhysicalConnection(DeviceObject,
+                                      topoPort, KSPIN_TOPO_WAVE_BRIDGE,
+                                      wavePort, KSPIN_WAVE_BRIDGE);
+
+    topoPort->Release();
+    wavePort->Release();
     return st;
 }
 
