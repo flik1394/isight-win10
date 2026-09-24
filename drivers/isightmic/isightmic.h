@@ -33,9 +33,17 @@
 #define IOCTL_ISIGHTMIC_GETBUILD \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_READ_ACCESS)
 
+// NewStream break-down, for telling "the audio engine never instantiated the
+// pin" apart from "it did, and we failed inside NewStream" -- two problems
+// with opposite fixes.  Output buffer = ISIGHTMIC_DIAG.  Same rule as above:
+// its own IOCTL and its own struct, so adding a counter never forces the
+// DirectShow filter to be rebuilt.
+#define IOCTL_ISIGHTMIC_GETDIAG \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_READ_ACCESS)
+
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V22-20260924-PHYSCONN"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V23-20260924-PINCAT"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -49,6 +57,15 @@ typedef struct _ISIGHTMIC_STATUS {
     unsigned long State;      // KSSTATE of the last stream (0=stop .. 3=run)
     unsigned long Opens;      // how many times the control device was opened
 } ISIGHTMIC_STATUS, *PISIGHTMIC_STATUS;
+
+typedef struct _ISIGHTMIC_DIAG {
+    unsigned long NewStreamEntered;   // PortCls called IMiniportWaveCyclic::NewStream
+    unsigned long NewStreamFailed;    // ... and we returned a failure
+    unsigned long FailDma;            // NewMasterDmaChannel failed
+    unsigned long FailStreamInit;     // stream Init / stream object alloc failed
+    unsigned long FailServiceGroup;   // PcNewServiceGroup failed
+    unsigned long LastFailStatus;     // NTSTATUS of the most recent failure
+} ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"
 #define ISIGHTMIC_CTL_DOS_NAME     L"\\DosDevices\\IsightMicCtl"

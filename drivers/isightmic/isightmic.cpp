@@ -68,6 +68,19 @@ static ULONG g_Streams;
 static ULONG g_State;
 static ULONG g_Opens;
 
+// NewStream break-down.  NewStream increments g_Streams on its *last* line, so
+// g_Streams == 0 cannot distinguish "PortCls never called us because it never
+// instantiated the pin" from "we were called and failed half way through".
+// Those two need opposite fixes (pin descriptor vs. DMA/service-group code), so
+// count the entry and each failure site separately.  Reported through
+// IOCTL_ISIGHTMIC_GETDIAG.
+static ULONG g_NewStreamEntered;
+static ULONG g_NewStreamFailed;
+static ULONG g_FailDma;
+static ULONG g_FailStreamInit;
+static ULONG g_FailServiceGroup;
+static ULONG g_LastFailStatus;
+
 static void RingInit(PRING r) {
     r->Buffer = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, RING_BYTES, ISIGHTMIC_POOL_TAG);
     r->Cap = (r->Buffer != NULL) ? RING_BYTES : 0;
@@ -431,6 +444,28 @@ static PKSDATARANGE PinDataRangePointersBridge[] = {
     &PinDataRangesBridge[0]
 };
 
+// Pin category of the streaming pin on a *capture* wave filter.
+//
+// This is not decoration.  Two independent working capture filters on the
+// machine this was measured on -- Realtek's rtmicinwave and rtstereomixwave --
+// both report KSPROPERTY_PIN_CATEGORY = {FB6C4281-...} for their host pin,
+// while the render sibling on the same codec (rearlineoutwave3) reports
+// KSCATEGORY_AUDIO {6994AD04-...}.  This table used to say KSCATEGORY_AUDIO,
+// i.e. the render value, on a capture pin.  The consequence was measurable:
+// through a full round of GetMixFormat / IsFormatSupported / Initialize
+// (shared *and* exclusive) KSPROPERTY_PIN_GLOBALCINSTANCES stayed {1,0} and
+// this driver's own stream counter stayed 0 -- the audio engine never
+// instantiated the host pin, so NewStream was never reached and WASAPI could
+// only report AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008).
+//
+// ksmedia.h spells these bytes PINNAME_CAPTURE (== STATIC_PINNAME_VIDEO_CAPTURE);
+// uuids.h calls the same value PIN_CATEGORY_CAPTURE.  It is written out
+// literally here rather than referenced symbolically because the WDK header
+// only ships the alias macro and the exact spelling moves between SDK versions.
+static const GUID ISIGHTMIC_PIN_CATEGORY_CAPTURE = {
+    0xFB6C4281, 0x0353, 0x11D1, { 0x90, 0x5F, 0x00, 0x00, 0xC0, 0xCC, 0x16, 0xBA }
+};
+
 #define KSPIN_WAVE_BRIDGE       0
 #define KSPIN_WAVE_HOST         1
 #define KSNODE_WAVE_ADC         0
@@ -457,7 +492,35 @@ static PCPIN_DESCRIPTOR WavePins[] = {
         }
     },
     {   // 1 - KSPIN_WAVE_HOST: the streaming pin the audio engine opens.
-        1, 1, 0,            // instance counts (global, filter, min)
+        //
+        // Two fields in this entry are load-bearing, and both were wrong.
+        //
+        // (a) The third number is MinFilterInstanceCount.  portcls.h maps it to
+        // KSPROPERTY_PIN_NECESSARYINSTANCES, which MSDN defines as "a definite
+        // lower bound on the number of instances of a pin that must exist in
+        // order for a filter to be able to function".  It used to be 0 here.
+        // Realtek's rtmicinwave (a working capture filter on the same machine)
+        // reports 1 for exactly this pin role.
+        //
+        // (b) The pin category ("Category" below) is what tells the audio
+        // engine whether this host pin carries render or capture audio.  It
+        // used to be KSCATEGORY_AUDIO -- the *render* value -- on a capture
+        // pin.  See ISIGHTMIC_PIN_CATEGORY_CAPTURE above for the measurements.
+        //
+        // The measurement that pinned this down: while WASAPI ran its whole
+        // round of GetMixFormat / IsFormatSupported / Initialize (shared and
+        // exclusive), KSPROPERTY_PIN_GLOBALCINSTANCES -- the kernel's own
+        // global instance counter, not the per-filter-instance one -- stayed
+        // {1,0}.  A working render pin on this machine reads {1,1} in the same
+        // poll, so the metric is meaningful: the audio engine never
+        // instantiated our host pin at all, which is why NewStream was never
+        // reached and WASAPI could only report
+        // AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008).
+        //
+        // (The bridge pin above stays 0,0,0 and KSCATEGORY_AUDIO -- that is
+        // what the documentation prescribes for bridge pins, and both working
+        // reference filters do the same.)
+        1, 1, 1,            // instance counts (global, filter, min)
         NULL,               // AutomationTable
         {
             0, NULL,        // Interfaces
@@ -465,7 +528,7 @@ static PCPIN_DESCRIPTOR WavePins[] = {
             1, (const PKSDATARANGE*)PinDataRangePointersStream,
             KSPIN_DATAFLOW_OUT,
             KSPIN_COMMUNICATION_SINK,
-            &KSCATEGORY_AUDIO,
+            &ISIGHTMIC_PIN_CATEGORY_CAPTURE,
             NULL,
             { 0 }
         }
@@ -553,6 +616,15 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::Init(IN PUNKNOWN UnknownAdapter,
     return STATUS_SUCCESS;
 }
 
+// Record one NewStream failure: bump the site counter, and remember the last
+// NTSTATUS so a user-mode caller can tell STATUS_INSUFFICIENT_RESOURCES from
+// STATUS_INVALID_DEVICE_STATE without a debugger attached.
+static void NoteNewStreamFailure(PULONG Site, NTSTATUS st) {
+    (*Site)++;
+    g_NewStreamFailed++;
+    g_LastFailStatus = (ULONG)st;
+}
+
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICSTREAM* Stream,
                                                        IN PUNKNOWN OuterUnknown,
                                                        IN POOL_TYPE PoolType,
@@ -565,10 +637,12 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
     UNREFERENCED_PARAMETER(Capture);
     if (!Stream || !DmaChannel || !ServiceGroup) return STATUS_INVALID_PARAMETER;
     *Stream = NULL; *DmaChannel = NULL; *ServiceGroup = NULL;
+    g_NewStreamEntered++;
 
     CMiniportWaveCyclicStream* s =
         new(PoolType, ISIGHTMIC_POOL_TAG) CMiniportWaveCyclicStream(OuterUnknown);
-    if (!s) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!s) { NoteNewStreamFailure(&g_FailStreamInit, STATUS_INSUFFICIENT_RESOURCES);
+              return STATUS_INSUFFICIENT_RESOURCES; }
 
     NTSTATUS st = STATUS_SUCCESS;
 
@@ -583,14 +657,23 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
                                          WAVE_BUFFER_BYTES, TRUE, FALSE,
                                          (DMA_WIDTH)(-1), (DMA_SPEED)(-1));
     }
-    if (!NT_SUCCESS(st)) { s->Release(); return st; }
+    if (!NT_SUCCESS(st)) {
+        NoteNewStreamFailure(&g_FailDma, st);
+        s->Release(); return st;
+    }
 
     st = s->Init(Pin, TRUE, DataFormat);
-    if (!NT_SUCCESS(st)) { s->Release(); return st; }
+    if (!NT_SUCCESS(st)) {
+        NoteNewStreamFailure(&g_FailStreamInit, st);
+        s->Release(); return st;
+    }
 
     // Service group: PortCls calls the stream back through it when we notify.
     st = PcNewServiceGroup(&s->m_ServiceGroup, NULL);
-    if (!NT_SUCCESS(st)) { s->Release(); return st; }
+    if (!NT_SUCCESS(st)) {
+        NoteNewStreamFailure(&g_FailServiceGroup, st);
+        s->Release(); return st;
+    }
     s->m_ServiceGroup->AddMember(PSERVICESINK(s));
 
     s->m_Port = m_Port;
@@ -994,6 +1077,21 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
                 if (n > outLen) n = outLen;
                 RtlCopyMemory(buf, ISIGHTMIC_BUILD_TAG, n - 1);
                 info = n;
+            } else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+        } else if (code == IOCTL_ISIGHTMIC_GETDIAG) {
+            ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+            if (buf && outLen >= sizeof(ISIGHTMIC_DIAG)) {
+                PISIGHTMIC_DIAG dg = (PISIGHTMIC_DIAG)buf;
+                RtlZeroMemory(dg, sizeof(ISIGHTMIC_DIAG));
+                dg->NewStreamEntered = g_NewStreamEntered;
+                dg->NewStreamFailed  = g_NewStreamFailed;
+                dg->FailDma          = g_FailDma;
+                dg->FailStreamInit   = g_FailStreamInit;
+                dg->FailServiceGroup = g_FailServiceGroup;
+                dg->LastFailStatus   = g_LastFailStatus;
+                info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
             }
