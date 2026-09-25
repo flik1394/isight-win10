@@ -44,6 +44,19 @@ typedef LONG (WINAPI *PFN_KsCreatePin)(HANDLE FilterHandle,
                                        PKSPIN_CONNECT Connect,
                                        ACCESS_MASK DesiredAccess,
                                        PHANDLE ConnectionHandle);
+
+// Layout-identical mirror of KSPIN_CONNECT.  The trailing PIN_DIRECTION member
+// and the KSPIN_INTERFACE_STANDARD id macro are named differently between the
+// WDK's ks.h and whatever ks.h the CI checker step picks up (error C2065 /
+// C2039 in run 36161830770), so stop depending on either: this struct has the
+// exact same binary layout (GUID+Id+Flags twice, then two ULONGs, no padding)
+// and the Standard interface id is always 0.
+typedef struct {
+    KSPIN_INTERFACE Interface;      // {Set GUID, Id, Flags}
+    KSPIN_MEDIUM    Medium;         // {Set GUID, Id, Flags}
+    ULONG           PinId;
+    ULONG           PinFlow;        // KSPIN_DATAFLOW_OUT
+} ISIGHT_PIN_CONNECT;
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -372,14 +385,16 @@ static void DirectPinProbe(void) {
     say("    trying KsCreatePin on pin %u (Standard/DevIO, dataflow=OUT) ...",
         capturePin);
 
-    KSPIN_CONNECT conn;
+    ISIGHT_PIN_CONNECT conn;
     ZeroMemory(&conn, sizeof(conn));
     conn.Interface.Set  = KSINTERFACESETID_Standard;
-    conn.Interface.Id   = KSPIN_INTERFACE_STANDARD;
+    conn.Interface.Id   = 0;            // KSPIN_INTERFACE_STANDARD
+    conn.Interface.Flags = 0;
     conn.Medium.Set     = KSMEDIUMSETID_Standard;
     conn.Medium.Id      = KSMEDIUM_STANDARD_DEVIO;
+    conn.Medium.Flags   = 0;
     conn.PinId          = (ULONG)capturePin;
-    conn.PinPinFlow     = KSPIN_DATAFLOW_OUT;
+    conn.PinFlow        = KSPIN_DATAFLOW_OUT;
 
     HANDLE ph = NULL;
     HMODULE ksuser = LoadLibraryW(L"ksuser.dll");
@@ -397,7 +412,7 @@ static void DirectPinProbe(void) {
         CloseHandle(f);
         return;
     }
-    LONG rc = pKsCreatePin(f, &conn, GENERIC_READ, &ph);
+    LONG rc = pKsCreatePin(f, (PKSPIN_CONNECT)&conn, GENERIC_READ, &ph);
     if (rc == 0) {
         say("    KsCreatePin SUCCESS -- the pin instantiates fine from user mode.");
         say("    -> the fault is NOT in the create path; engine/topology side.");
