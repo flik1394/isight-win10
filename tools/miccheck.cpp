@@ -27,6 +27,10 @@
 #include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
+#include <setupapi.h>
+#include <ks.h>
+#include <ksmedia.h>
+#include <ksuser.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -36,6 +40,8 @@
 #include "isightmic.h"
 
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "ksuser.lib")
 
 static FILE* g_rep = NULL;
 
@@ -211,6 +217,177 @@ static void ProbeDriver(StatusProbe* p, int seconds) {
         say("    -> stream exists but played did not advance: the endpoint is not in RUN.");
     ProbeDiag("before");
     CloseHandle(h);
+}
+
+// ---------------------------------------------------------------------------
+// 2b -- bypass the audio engine entirely: talk to the wave filter directly.
+//
+// V27 left us with a strange state: 684 format negotiations, every single one
+// answered SUCCESS with a fully written format, and still NewStream entered=0.
+// When PortCls instantiates a pin it first asks KSPROPERTY_PIN_GLOBALCINSTANCES
+// for free slots; if that says 0, it refuses without ever calling NewStream --
+// which is exactly the symptom we see.  This probe reads that property for
+// every pin, then tries KsCreatePin on the capture host pin with the same
+// Standard/DevIO interface-medium pair the audio engine uses.  Whatever
+// happens, the answer is decisive:
+//   - instances max=0            -> the pin descriptor is the bug (V28 fixes it)
+//   - KsCreatePin fails err=N    -> the create path fails there, N names the layer
+//   - KsCreatePin succeeds       -> the pin works; the fault is above (topology
+//                                   bridge / engine side)
+// ---------------------------------------------------------------------------
+static const char* FlowName(ULONG f) {
+    switch (f) {
+    case KSPIN_DATAFLOW_IN:  return "IN";
+    case KSPIN_DATAFLOW_OUT: return "OUT";
+    default: return "?";
+    }
+}
+
+static const char* CommName(ULONG c) {
+    switch (c) {
+    case KSPIN_COMMUNICATION_NONE:      return "NONE";
+    case KSPIN_COMMUNICATION_SINK:      return "SINK";
+    case KSPIN_COMMUNICATION_SOURCE:    return "SOURCE";
+    case KSPIN_COMMUNICATION_BOTH:      return "BOTH";
+    case KSPIN_COMMUNICATION_BRIDGE:    return "BRIDGE";
+    default: return "?";
+    }
+}
+
+static bool KsPinGet(HANDLE f, ULONG pinId, ULONG propId,
+                     void* out, DWORD outLen, DWORD* got) {
+    KSP_PIN kp;
+    ZeroMemory(&kp, sizeof(kp));
+    kp.Property.Set   = KSPROPSETID_Pin;
+    kp.Property.Id    = propId;
+    kp.Property.Flags = KSPROPERTY_TYPE_GET;
+    kp.PinId          = pinId;
+    return DeviceIoControl(f, IOCTL_KS_PROPERTY, &kp, sizeof(kp),
+                           out, outLen, got, NULL) ? true : false;
+}
+
+static void DirectPinProbe(void) {
+    // 1. find our wave filter among KSCATEGORY_AUDIO interfaces
+    HDEVINFO set = SetupDiGetClassDevsW(&KSCATEGORY_AUDIO, NULL, NULL,
+                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) {
+        say("[2b] direct pin probe: SetupDi failed (err=%u)", GetLastError());
+        return;
+    }
+
+    WCHAR path[1024] = L"";
+    bool  havePath = false;
+    for (DWORD i = 0; i < 64 && !havePath; i++) {
+        SP_DEVICE_INTERFACE_DATA di;
+        di.cbSize = sizeof(di);
+        if (!SetupDiEnumDeviceInterfaces(set, NULL, &KSCATEGORY_AUDIO, i, &di)) break;
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &di, NULL, 0, &need, NULL);
+        if (!need) continue;
+        BYTE* buf = (BYTE*)malloc(need);
+        if (!buf) break;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* dd = (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)buf;
+        dd->cbSize = sizeof(*dd);
+        if (SetupDiGetDeviceInterfaceDetailW(set, &di, dd, need, NULL, NULL)) {
+            // the wave filter's reference string ends the path with "\wave";
+            // the topology filter ends with "\topology".  Ignore the latter.
+            size_t len = wcslen(dd->DevicePath);
+            if (len > 5 && _wcsicmp(dd->DevicePath + len - 5, L"\\wave") == 0 &&
+                wcsstr(dd->DevicePath, L"isightmic") != NULL) {
+                wcsncpy_s(path, dd->DevicePath, _TRUNCATE);
+                havePath = true;
+            }
+        }
+        free(buf);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+
+    if (!havePath) {
+        say("[2b] direct pin probe: no isightmic \\wave filter under KSCATEGORY_AUDIO.");
+        return;
+    }
+    {
+        char ansi[1024];
+        WideCharToMultiByte(CP_ACP, 0, path, -1, ansi, sizeof(ansi), NULL, NULL);
+        say("[2b] direct pin probe: wave filter found");
+        say("    %s", ansi);
+    }
+
+    HANDLE f = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        say("    open failed (err=%u)", GetLastError());
+        return;
+    }
+
+    // 2. per-pin properties
+    ULONG ctypes = 0; DWORD got = 0;
+    if (!KsPinGet(f, 0, KSPROPERTY_PIN_CTYPES, &ctypes, sizeof(ctypes), &got) || got != 4) {
+        say("    KSPROPERTY_PIN_CTYPES failed (err=%u)", GetLastError());
+        CloseHandle(f);
+        return;
+    }
+    say("    pins: %u", ctypes);
+
+    int capturePin = -1;
+    for (ULONG id = 0; id < ctypes; id++) {
+        ULONG df = 0, comm = 0; DWORD g1 = 0, g2 = 0, g3 = 0;
+        KSPIN_CINSTANCES inst;
+        ZeroMemory(&inst, sizeof(inst));
+        bool okDf  = KsPinGet(f, id, KSPROPERTY_PIN_DATAFLOW, &df, sizeof(df), &g1);
+        bool okCm  = KsPinGet(f, id, KSPROPERTY_PIN_COMMUNICATION, &comm, sizeof(comm), &g2);
+        bool okIn  = KsPinGet(f, id, KSPROPERTY_PIN_GLOBALCINSTANCES, &inst,
+                              sizeof(inst), &g3);
+        say("      pin %u: dataflow=%s comm=%s  instances max=%u current=%u"
+            "  (df=%u cm=%u in=%u)",
+            id,
+            okDf ? FlowName(df) : "ERR",
+            okCm ? CommName(comm) : "ERR",
+            okIn ? inst.PossibleCount : 0,
+            okIn ? inst.CurrentCount : 0,
+            okDf ? 1 : 0, okCm ? 1 : 0, okIn ? 1 : 0);
+        if (okDf && df == KSPIN_DATAFLOW_OUT && capturePin < 0) capturePin = (int)id;
+    }
+
+    // 3. the decisive attempt: create the capture pin ourselves
+    if (capturePin < 0) {
+        say("    no dataflow=OUT pin found -- nothing to create.");
+        CloseHandle(f);
+        return;
+    }
+    say("    trying KsCreatePin on pin %u (Standard/DevIO, dataflow=OUT) ...",
+        capturePin);
+
+    KSPIN_CONNECT conn;
+    ZeroMemory(&conn, sizeof(conn));
+    conn.Interface.Set  = KSINTERFACESETID_Standard;
+    conn.Interface.Id   = KSPIN_INTERFACE_STANDARD;
+    conn.Medium.Set     = KSMEDIUMSETID_Standard;
+    conn.Medium.Id      = KSMEDIUM_STANDARD_DEVIO;
+    conn.PinId          = (ULONG)capturePin;
+    conn.PinPinFlow     = KSPIN_DATAFLOW_OUT;
+
+    HANDLE ph = NULL;
+    if (KsCreatePin(f, &conn, GENERIC_READ, &ph)) {
+        say("    KsCreatePin SUCCESS -- the pin instantiates fine from user mode.");
+        say("    -> the fault is NOT in the create path; engine/topology side.");
+        Sleep(150);        // let PortCls run the pin a moment
+        CloseHandle(ph);
+    } else {
+        DWORD e = GetLastError();
+        say("    KsCreatePin FAILED (err=0x%08X / %u)", e, e);
+        if (e == 0)
+            say("    -> unknown error mapping.");
+        else if (e == ERROR_NO_SYSTEM_RESOURCES)
+            say("    -> out of free pin instances: the descriptor's instance counts are the bug.");
+        else if (e == ERROR_INVALID_PARAMETER || e == ERROR_INVALID_FUNCTION)
+            say("    -> interface/medium/format rejected before miniport saw it.");
+        else if (e == ERROR_DEVICE_IN_USE || e == ERROR_BUSY)
+            say("    -> pin slots exhausted or filter busy.");
+        else
+            say("    -> error code above names the failing layer precisely.");
+    }
+    CloseHandle(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +584,7 @@ int main(int argc, char** argv) {
 
     StatusProbe p;
     ProbeDriver(&p, 2);
+    DirectPinProbe();
 
     IMMDevice* dev = NULL;
     char name[256] = "";
