@@ -58,6 +58,17 @@
 ; requested channel count; the feeder is mono, so the stream upmixes
 ; mono -> requested channels.  Same staging reason: the version has to move or
 ; SetupCopyOEMInf keeps the old copy.
+;
+; DriverVer 1.0.8.0 (2026-09-25): the format negotiation finally reached the
+; pin: with a correct user-mode KsCreatePin probe (KSPIN_CONNECT is 72 bytes on
+; x64, the appended KSDATAFORMAT must start at offset 72) NewStream WAS
+; entered -- twice, once from the probe and once from the audio engine -- and
+; failed both times with STATUS_DEVICE_CONFIGURATION_ERROR (0xC0000182) at the
+; IPortWaveCyclic::NewMasterDmaChannel step.  NewMasterDmaChannel ends in
+; IoGetDmaAdapter, which cannot give bus-master DMA to a root-enumerated
+; software device.  The Microsoft MSVAD virtual-audio sample avoids the call
+; entirely: the stream object implements IDmaChannel itself and NewStream
+; returns the stream as the DMA channel.  Same fix here (V28-SELFDMACH).
 
 [Version]
 Signature   = "$Windows NT$"
@@ -65,7 +76,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/25/2026,1.0.7.0
+DriverVer   = 09/25/2026,1.0.8.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64

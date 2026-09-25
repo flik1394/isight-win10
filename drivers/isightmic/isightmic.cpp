@@ -165,7 +165,7 @@ VOID StreamTimerDpc(IN PKDPC Dpc, IN PVOID DeferredContext,
 // so we fill it ourselves on a timer and hand the port driver the position; the
 // port driver copies from the DMA buffer into the KS stream.
 // ---------------------------------------------------------------------------
-class CMiniportWaveCyclicStream : public IMiniportWaveCyclicStream, public IServiceSink {
+class CMiniportWaveCyclicStream : public IMiniportWaveCyclicStream, public IServiceSink, public IDmaChannel {
 public:
     CMiniportWaveCyclicStream(PUNKNOWN outer);
     ~CMiniportWaveCyclicStream();
@@ -187,6 +187,25 @@ public:
     STDMETHODIMP_(NTSTATUS) SetState(IN KSSTATE State);
     STDMETHODIMP_(void)     Silence(IN PVOID Buffer, IN ULONG ByteCount);
 
+    // IDmaChannel - the stream is its own DMA channel, MSVAD style.  A software
+    // device has no bus-master DMA: IPortWaveCyclic::NewMasterDmaChannel ends in
+    // IoGetDmaAdapter, which fails on a root-enumerated device with
+    // STATUS_DEVICE_CONFIGURATION_ERROR (0xC0000182) -- the V27 NewStream
+    // failure.  MSVAD avoids the call entirely by handing the port the stream
+    // object itself as the IDmaChannel; we do the same.
+    STDMETHODIMP_(NTSTATUS) AllocateBuffer(IN ULONG BufferSize, IN PHYSICAL_ADDRESS PhysicalAddressConstraint);
+    STDMETHODIMP_(void)     FreeBuffer(void);
+    STDMETHODIMP_(ULONG)    MaximumBufferSize(void);
+    STDMETHODIMP_(ULONG)    AllocatedBufferSize(void);
+    STDMETHODIMP_(ULONG)    BufferSize(void);
+    STDMETHODIMP_(void)     SetBufferSize(IN ULONG BufferSize);
+    STDMETHODIMP_(PHYSICAL_ADDRESS) PhysicalAddress(void);
+    STDMETHODIMP_(ULONG)    TransferCount(void);
+    STDMETHODIMP_(PVOID)    SystemAddress(void);
+    STDMETHODIMP_(PADAPTER_OBJECT) GetAdapterObject(void);
+    STDMETHODIMP_(void)     CopyTo(IN PVOID Destination, IN PVOID Source, IN ULONG RequestedLength);
+    STDMETHODIMP_(void)     CopyFrom(IN PVOID Destination, IN PVOID Source, IN ULONG RequestedLength);
+
     // Private helper.  No port-side stream interface is handed to a WaveCyclic
     // miniport here (the port reaches the stream through the service group), so
     // this only records what the caller told us.
@@ -198,7 +217,11 @@ public:
 
     PPORTWAVECYCLIC        m_Port;
     PSERVICEGROUP          m_ServiceGroup;
-    PDMACHANNEL            m_DmaChannel;
+    // IDmaChannel storage (also aliased through m_Buffer/m_BufferSize for the
+    // feeder service loop).
+    PVOID                  m_DmaBuffer;
+    ULONG                  m_DmaAllocated;  // bytes actually allocated
+    ULONG                  m_DmaSize;       // logical buffer size
     PVOID                  m_Buffer;
     ULONG                  m_BufferSize;
     ULONG                  m_Position;
@@ -218,7 +241,9 @@ CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {
     UNREFERENCED_PARAMETER(outer);
     m_Port = NULL;
     m_ServiceGroup = NULL;
-    m_DmaChannel = NULL;
+    m_DmaBuffer = NULL;
+    m_DmaAllocated = 0;
+    m_DmaSize = 0;
     m_Buffer = NULL;
     m_BufferSize = 0;
     m_Position = 0;
@@ -234,11 +259,7 @@ CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {
 
 CMiniportWaveCyclicStream::~CMiniportWaveCyclicStream() {
     if (m_TimerOn) { KeCancelTimer(&m_Timer); m_TimerOn = FALSE; }
-    if (m_DmaChannel) {
-        m_DmaChannel->FreeBuffer();
-        m_DmaChannel->Release();
-        m_DmaChannel = NULL;
-    }
+    FreeBuffer();
     if (m_ServiceGroup) { m_ServiceGroup->Release(); m_ServiceGroup = NULL; }
 }
 
@@ -251,6 +272,8 @@ STDMETHODIMP CMiniportWaveCyclicStream::QueryInterface(REFIID iid, PVOID* ppv) {
         *ppv = (PVOID)(IServiceSink*)this;
     else if (IsEqualGUIDAligned(iid, IID_IMiniportWaveCyclicStream))
         *ppv = (PVOID)(IMiniportWaveCyclicStream*)this;
+    else if (IsEqualGUIDAligned(iid, IID_IDmaChannel))
+        *ppv = (PVOID)(IDmaChannel*)this;
     if (*ppv) { AddRef(); return STATUS_SUCCESS; }
     return STATUS_INVALID_PARAMETER;
 }
@@ -286,14 +309,95 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::NormalizePhysicalPosition(IN 
 
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(IN PKSDATAFORMAT DataFormat) {
     UNREFERENCED_PARAMETER(DataFormat);
-    if (!m_DmaChannel) return STATUS_INVALID_DEVICE_STATE;
-    NTSTATUS st = m_DmaChannel->AllocateBuffer(WAVE_BUFFER_BYTES, NULL);
+    // Allocate the cyclic buffer on our own IDmaChannel implementation.
+    PHYSICAL_ADDRESS constraint;
+    constraint.QuadPart = 0;
+    NTSTATUS st = AllocateBuffer(WAVE_BUFFER_BYTES, constraint);
     if (!NT_SUCCESS(st)) return st;
-    m_Buffer = m_DmaChannel->SystemAddress();
-    if (!m_Buffer) return STATUS_INSUFFICIENT_RESOURCES;
-    m_BufferSize = WAVE_BUFFER_BYTES;
+    m_Buffer = m_DmaBuffer;
+    m_BufferSize = m_DmaSize;
     if (m_BufferSize) RtlZeroMemory(m_Buffer, m_BufferSize);
     return STATUS_SUCCESS;
+}
+
+// --- IDmaChannel: the stream is its own DMA channel (MSVAD style) ----------
+
+STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::AllocateBuffer(
+    IN ULONG BufferSize, IN PHYSICAL_ADDRESS PhysicalAddressConstraint) {
+    UNREFERENCED_PARAMETER(PhysicalAddressConstraint);
+    if (BufferSize == 0) return STATUS_INVALID_PARAMETER;
+    if (m_DmaBuffer) {
+        if (m_DmaAllocated >= BufferSize) { m_DmaSize = BufferSize; return STATUS_SUCCESS; }
+        FreeBuffer();
+    }
+    m_DmaBuffer = ExAllocatePoolWithTag(NonPagedPool, BufferSize, ISIGHTMIC_POOL_TAG);
+    if (!m_DmaBuffer) { g_FailDma++; return STATUS_INSUFFICIENT_RESOURCES; }
+    m_DmaAllocated = BufferSize;
+    m_DmaSize = BufferSize;
+    RtlZeroMemory(m_DmaBuffer, BufferSize);
+    return STATUS_SUCCESS;
+}
+
+STDMETHODIMP_(void) CMiniportWaveCyclicStream::FreeBuffer(void) {
+    if (m_DmaBuffer) {
+        ExFreePoolWithTag(m_DmaBuffer, ISIGHTMIC_POOL_TAG);
+        m_DmaBuffer = NULL;
+    }
+    m_DmaAllocated = 0;
+    m_DmaSize = 0;
+    m_Buffer = NULL;
+    m_BufferSize = 0;
+}
+
+STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::MaximumBufferSize(void) {
+    return WAVE_BUFFER_BYTES;
+}
+
+STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::AllocatedBufferSize(void) {
+    return m_DmaAllocated;
+}
+
+STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::BufferSize(void) {
+    return m_DmaSize;
+}
+
+STDMETHODIMP_(void) CMiniportWaveCyclicStream::SetBufferSize(IN ULONG BufferSize) {
+    if (BufferSize <= m_DmaAllocated) m_DmaSize = BufferSize;
+}
+
+STDMETHODIMP_(PHYSICAL_ADDRESS) CMiniportWaveCyclicStream::PhysicalAddress(void) {
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = 0;
+    if (m_DmaBuffer) pa = MmGetPhysicalAddress(m_DmaBuffer);
+    return pa;
+}
+
+STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::TransferCount(void) {
+    return m_DmaSize;
+}
+
+STDMETHODIMP_(PVOID) CMiniportWaveCyclicStream::SystemAddress(void) {
+    return m_DmaBuffer;
+}
+
+// A software device has no DMA adapter; the port only needs one for hardware
+// transfers, and our buffer is ordinary nonpaged pool.
+STDMETHODIMP_(PADAPTER_OBJECT) CMiniportWaveCyclicStream::GetAdapterObject(void) {
+    return NULL;
+}
+
+STDMETHODIMP_(void) CMiniportWaveCyclicStream::CopyTo(IN PVOID Destination,
+                                                      IN PVOID Source,
+                                                      IN ULONG RequestedLength) {
+    if (Destination && Source && RequestedLength)
+        RtlCopyMemory(Destination, Source, RequestedLength);
+}
+
+STDMETHODIMP_(void) CMiniportWaveCyclicStream::CopyFrom(IN PVOID Destination,
+                                                        IN PVOID Source,
+                                                        IN ULONG RequestedLength) {
+    if (Destination && Source && RequestedLength)
+        RtlCopyMemory(Destination, Source, RequestedLength);
 }
 
 // Returns the *previous* notification interval -- that is what this method is
@@ -688,22 +792,6 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
 
     NTSTATUS st = STATUS_SUCCESS;
 
-    // The port driver needs a DMA channel object; ours is a software device, so
-    // a master channel backed by ordinary nonpaged memory is all it takes.
-    // IPortWaveCyclic::NewMasterDmaChannel takes exactly eight arguments --
-    // (OutDmaChannel, OuterUnknown, ResourceList, MaximumLength,
-    //  Dma32BitAddresses, Dma64BitAddresses, DmaWidth, DmaSpeed).  It does not
-    // take a DEVICE_DESCRIPTION*.
-    if (m_Port) {
-        st = m_Port->NewMasterDmaChannel(&s->m_DmaChannel, NULL, NULL,
-                                         WAVE_BUFFER_BYTES, TRUE, FALSE,
-                                         (DMA_WIDTH)(-1), (DMA_SPEED)(-1));
-    }
-    if (!NT_SUCCESS(st)) {
-        NoteNewStreamFailure(&g_FailDma, st);
-        s->Release(); return st;
-    }
-
     st = s->Init(Pin, TRUE, DataFormat);
     if (!NT_SUCCESS(st)) {
         NoteNewStreamFailure(&g_FailStreamInit, st);
@@ -723,8 +811,9 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
 
     *Stream = (PMINIPORTWAVECYCLICSTREAM)s;
     (*Stream)->AddRef();
-    *DmaChannel = s->m_DmaChannel;
-    if (*DmaChannel) (*DmaChannel)->AddRef();
+    // The stream is its own DMA channel (MSVAD style) -- see the class comment.
+    *DmaChannel = (PDMACHANNEL)(IDmaChannel*)s;
+    (*DmaChannel)->AddRef();
     *ServiceGroup = s->m_ServiceGroup;
     if (*ServiceGroup) (*ServiceGroup)->AddRef();
 

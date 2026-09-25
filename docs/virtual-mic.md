@@ -138,6 +138,255 @@ runner 本机创建证书并导出 .cer**，信任动作留给目标机器（`in
   wav 录制完全不受影响；每 5 秒重试一次，所以通话中途装驱动也能立刻生效。
 
 
+## 画面为什么会花：v17~v19 都判断错了，v20 才修好
+
+> 这一节原来写的是"v18 的帧长算错 614400 → 每帧越界写 165 KB，v19 已修"。
+> **那个结论是错的**，2026-09-23 拿到用户本机的原始缓冲后推翻。留在这里
+> 是因为推理过程本身值钱：它说明"从日志数字推结构"会推错，"渲染出来看"不会。
+
+### 当时怎么想错的
+
+v18 的日志：
+
+```
+audio: strip frame #1: 14 packets / 11424 bytes cut, 449376 bytes of frame data left (a full frame is 614400)
+```
+
+`449376 + 11424 = 460800` 恰好等于 640×480 YUV411，而 v18 认为一帧是 614400
+（`w*h*2`，YUY2 尺寸）。于是推断"补齐会写 165 KB 越界"。数字都对，
+但**结论错**：`cb`（`GetRawFrameBuffer` 返回的 `ulBufferSize`）就是 460800，
+v18 的 `want` 只是打印错、并让补齐多写，用户看到的条带另有原因。
+
+### 真相（用本机 dump 量出来的）
+
+```
+isight-check/rawview.py   frame-raw-pid*.bin   → 把原始缓冲按 480 行渲染成 PNG
+isight-check/slotprobe.py 同一份数据            → 判"一个音频事件占多少字节"
+```
+
+- 缓冲 = 恰好一帧：460800 字节 = 480 行 × 960 字节（一行 = 640px YUV411）。
+- 音频占 **7 处 × 2 行 = 14 行**，落点在行边界（第 60、122、184、246、308、
+  370、432 行，间隔 62 行），每处 **1920 字节 = 两个 960 字节 iso 包槽**
+  （负载只填 1680，剩 240 是填充）。三个连续缓冲落点完全一致 → **无漂移**。
+- 原始缓冲按 480 行渲染 = **一张连续正常的画面 + 14 行白色噪声条**，
+  其余一行都不错位 ⇒ 这 14 行是被覆盖丢弃的，不是"插在字节之间"。
+- 所以 v17~v19 "剪掉音频载荷再补齐"必然失败：每处只剪 1632 字节，
+  留下 288 字节残渣 ×7 = **2016 字节卡在画面中间**，后面每一行都偏移了
+  非整数行 —— 横向条带就是这么来的。
+
+### v20 的修法
+
+帧长一个字节都不动：扫出每个含音频字节的 960 字节槽，用**上一槽**覆盖它
+（第二遍做，避免覆盖还没读到的字节）。
+
+```c
+const ULONG slot  = (m_width > 0) ? ((ULONG)m_width * 3 / 2) : 0;   // 一行
+const ULONG slots = (slot >= 64 && slot <= cb) ? (cb / slot) : 0;   // 480
+/* 第一遍：验证 sght 包时，把 [start,end) 覆盖到的槽在 dirty 位图里打标 */
+/* 第二遍：dirty 的槽 = memmove(该槽, 上一槽, 960) */
+```
+
+- 入长 = 出长 ⇒ 不需要补齐、不需要夹紧、不可能越界；
+- 行网格不动 ⇒ 其余 466 行与相机发出的逐字节一致，只有 14 行是"上一行的复制"；
+- `want = FrameBytes()` 只留着做模式变化的告警，不再参与改写。
+
+教训（都值得复用）：
+1. **缓冲区改写，目标长度只能来自缓冲区自身（`cb`）**，不能来自"我以为这个模式多大"。
+2. **别用日志数字推内存布局**——`rawdump=1` 存原始缓冲 + 渲染成图，十分钟定案；
+   我按日志推了两轮，两轮都错。
+3. **抓"同一构建、只差一个开关"的两份输出**（本机 dump 里
+   `pid18884`=开音频 / `pid26988`=关音频）是最省事的 A/B。
+
+## 装不上的原因：设备实例名传错了（2026-09-23 修）
+
+首次在真机上装 v20 驱动包，卡在这一步：
+
+```
+INF: ...\isightmic.inf
+  staged in driver store       C:\WINDOWS\INF\oem275.inf
+  class                        Media
+  create device info           FAILED (0xe0000205)
+```
+
+证书、驱动库暂存都过了，只有建节点失败，错误码 `0xE0000205`
+（`SPAPI_E_INVALID_DEVINST_NAME`，SetupAPI 的错误，`FormatMessage` 查不到，
+所以日志里是空的）。
+
+**根因**：`SetupDiCreateDeviceInfo` 的 `DeviceName` 参数在带 `DICD_GENERATE_ID`
+时**不是硬件 ID**，而是**裸的根枚举设备 ID** —— 不带 `枚举器\` 前缀，也不带
+实例后缀（微软文档给的例子是 `*PNP0500`）。原来的代码传的是硬件 ID：
+
+```c
+SetupDiCreateDeviceInfoW(h, L"ISIGHTMIC\\Mic", ..., DICD_GENERATE_ID, &did);  /* 错 */
+```
+
+`ISIGHTMIC\Mic` 里有反斜杠，Windows 就把它读成"枚举器为 ISIGHTMIC 的设备实例
+ID"，而系统里没有这个枚举器 → 非法实例名。硬件 ID 有反斜杠是正常的
+（INF 的 `[Models]` 就写成 `ISIGHTMIC\Mic`），**只有这里这个参数不能有**。
+
+**修法**（`tools/micdev.cpp`，tag `ISIGHT-MICDEV-BUILD-V21-20260923-ROOTID`）：
+
+1. 候选表按序试，取第一个被接受的写法，并把选中的写进日志，不再靠猜：
+   `"iSightMic"` → `"*ISIGHTMIC"` → `"Root\iSightMic"` → `"ISIGHTMIC\Mic"`。
+2. 顺手把顺序改成 devcon 的做法：设 `SPDRP_HARDWAREID` → `DIF_REGISTERDEVICE`
+   → `UpdateDriverForPlugAndPlayDevices`（让 PnP 自己挑驱动），失败才回落手
+   动 `DIF_SELECTBESTCOMPATDRV` + `DIF_INSTALLDEVICE`。
+3. 建完用 `SetupDiGetDeviceInstanceId` 打出真正生成的实例 ID。
+
+**附带的一处连带错误**：`install-mic-v20.bat` 里验收查的是
+`...\Enum\ISIGHTMIC` —— 那是按"枚举器 = ISIGHTMIC"想的。根枚举设备的节点在
+`Enum\ROOT\...` 下面，所以这条即使装成功了也会报 `[X]`。已改成在
+`Enum\ROOT` 下按硬件 ID 递归搜。
+
+**怎么确认的**：非管理员跑 `SetupDiCreateDeviceInfo` 一律返回 `0x5`
+（`ERROR_ACCESS_DENIED`），这个 API 要求 Administrators 组，所以在
+普通权限下没法用"试名字"的办法定位，只能靠文档 + 错误码。见
+`isight-check/probe_devname.py`（留档，需要在管理员下才有意义）。
+
+## 装上了但用不了：子设备交给了 miniport，PortCls 要的是 port（2026-09-23 修）
+
+上一节修好之后，设备节点建起来了、驱动也装上了，但系统里**看不到录音端点**：
+
+```
+实例 ID:      ROOT\ISIGHTMIC\0000
+设备描述:     iSight Microphone (FireWire)
+状态:         问题
+问题代码:     10 (0x0A) [CM_PROB_FAILED_START]
+问题状态:     0xC000000D
+驱动程序名称: oem275.inf            <- pnputil /enum-devices /problem
+```
+
+`0xC000000D` = `STATUS_INVALID_PARAMETER`。`setupapi.dev.log` 里的同一件事：
+
+```
+dvi:  Start: ROOT\ISIGHTMIC\0000
+!     Device 'ROOT\ISIGHTMIC\0000' not started:
+      Device has problem: 0x0a (CM_PROB_FAILED_START), problem status: 0xc000000d.
+```
+
+**根因**：`StartDevice` 把 **miniport** 传给了 `PcRegisterSubdevice`：
+
+```c
+CMiniportWaveCyclic* w = new(...) CMiniportWaveCyclic(NULL);
+wave = (PUNKNOWN)(IMiniportWaveCyclic*)w;
+st = PcRegisterSubdevice(DeviceObject, (PWSTR)L"Wave", wave);   /* 错 */
+```
+
+而官方文档对第三个参数写得很死：
+
+> `Unknown` — Pointer to the **IPort** interface of **the port driver object**
+> that is bound to the subdevice.
+
+PortCls 拿到对象后去 QI 它的 IPort，miniport 的 `QueryInterface` 回
+`STATUS_INVALID_PARAMETER`（这是 PortCls 系列 miniport 表示"没这个接口"的惯例，
+MSVAD 也这么写），PortCls 把这个 status 原样抛出来 → `StartDevice` 失败 →
+一条子设备都没枚举出来 → 端点当然没有。
+
+而 `\\.\IsightMicCtl` 一直是好的，因为控制设备是 `DriverEntry` 建的，
+和这套装配流程完全无关 —— 这个"活着一半"的状态最容易把人带偏。
+
+**修法**：按 "Subdevice Creation" 那一节把四件东西绑起来（port / miniport /
+资源列表 / 引用字符串）：
+
+```c
+PPORT port = NULL;
+NTSTATUS st = PcNewPort(&port, PortClassId);            /* CLSID_PortWaveCyclic */
+if (!NT_SUCCESS(st)) return st;
+st = port->Init(DeviceObject, Irp, Miniport, NULL, ResourceList);
+if (NT_SUCCESS(st)) st = PcRegisterSubdevice(DeviceObject, Name, port);
+port->Release();                       /* PcRegisterSubdevice 自己 AddRef 了 */
+```
+
+- `UnknownAdapter` 传 `NULL` 是允许的，文档原话："This pointer is optional and
+  can be specified as NULL."
+- `CLSID_PortWaveCyclic` / `CLSID_PortTopology` 在 portcls.h 里，配合已有的
+  `#define INITGUID` 可直接用。
+- 子设备名必须和 INF 里 `KSNAME_*` 的引用字符串一致（"Wave"/"Topology"），
+  且那块缓冲区要活到设备对象销毁 —— 驱动 `.rdata` 里的字面量满足。
+
+**DriverVer 必须跟着抬**：`1.0.0.0` → `1.0.1.0`。同版本号的包
+`SetupCopyOEMInf` 会回"already staged"，**一个字节都不替换**，然后我们会拿着
+旧 `.sys` 白测一轮。
+
+### 这一轮暴露的方法问题：验收判据不够硬
+
+`install-mic-v20.bat` 原来验收三条 —— 驱动文件落盘 / 设备节点在 /
+服务项在。**这三条在驱动启动失败时照样全过**，所以它报了 `[OK] 虚拟麦克风已安装`，
+而实际上端点根本不存在。从"装上了"到"能用"之间那段，是靠不住的。
+
+现在加了第四条，也是唯一真正的判据：**`isight-micdev.exe list` 的输出里必须
+出现 `iSight Microphone`**。失败时还会把
+`pnputil /enum-devices /class Media` 和 `/enum-devices /problem` 追加进报告 ——
+`/problem` 会用英文直接点名 `CM_PROB_FAILED_START` 和状态码，这次就是靠它一眼定案的。
+
+顺带加了 `IOCTL_ISIGHTMIC_GETBUILD`：驱动自报构建标记
+（`ISIGHTMIC-BUILD-V21-20260923-PORTCLS`），`miccheck` 会打印出来。
+单独一个 IOCTL 而不是往 `ISIGHTMIC_STATUS` 加字段，是为了不把 DirectShow 滤镜
+也拖进一次重建。
+
+## 2026-09-24：设备正常、接口全在，却一个录音端点都没有
+
+前两个 bug 修完（设备实例名、port/miniport）之后，设备**启动正常**了：
+`ROOT\ISIGHTMIC\0000` 的 `ConfigFlags=0`、没有 `Problem` 键，
+四个 `KSCATEGORY_*` 接口全部注册在 `DeviceClasses` 下，
+`isight-micdev.exe list` 也把 `iSight Microphone (FireWire)` 列了出来。
+
+但 "声音" 和微信里什么都没有：
+
+```
+HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture
+    共 21 个端点，其中 iSight 的 0 个
+```
+
+**关键区分**：`KSCATEGORY_*` 是 INF 里 `AddInterface` 注册的**内核流接口**，注册了
+就一直在；"声音"面板/微信/WASAPI 读的是 `MMDevices\Audio\Capture` 下由
+`AudioEndpointBuilder` 服务建出来的 **MMDevice 端点**。**接口注册 ≠ 端点存在**，
+两个工具（`micdev list` 查 KS，`miccheck` 查 MMDevice）结论矛盾时就是这个原因。
+
+### 定位手段：`isight-check/ksprobe.py`
+
+枚举 `KSCATEGORY_AUDIO` 的每个过滤器，`CreateFile` 打开，对 pin 0/1 扫一遍
+`KSPROPERTY_PIN_*`（`KSPROPSETID_Pin`）的 id 并打印原始字节。对照结果：
+
+| 设备 | `id10 KSPROPERTY_PIN_PHYSICALCONNECTION` |
+|---|---|
+| Realtek 内置麦克风（真实硬件，有端点） | **270 字节**，`Size=0x10e Pin=0 "\??\HDAUDIO..."` |
+| iSight 的每一个 pin | **完全没有响应** |
+
+### 根因与修复
+
+`StartDevice` 注册完两个子设备就结束了，**从来没调
+`PcRegisterPhysicalConnection`**。PortCls 因此不知道 wave 过滤器的桥钉和
+topology 过滤器的桥钉是硬连着的，`KSPROPERTY_PIN_PHYSICALCONNECTION` 无内容，
+而 SysAudio / AudioEndpointBuilder 正是靠这个属性把两个过滤器配对成一张图 ——
+配不出来，端点就不存在。
+
+修复（`repo/drivers/isightmic/isightmic.cpp`）：
+
+```c
+// InstallSubdevice 现在把 port 交还给调用方（原来在函数里就 Release 了）
+InstallSubdevice(..., L"Wave",     CLSID_PortWaveCyclic, wave, &wavePort);
+InstallSubdevice(..., L"Topology", CLSID_PortTopology,   topo, &topoPort);
+
+// 两个子设备都注册完之后，登记它们之间的硬连线。
+// 方向：From = 数据源（输出钉脚）= topology 的桥钉 DATAFLOW_OUT
+//       To   = 数据接收（输入钉脚）= wave 的桥钉     DATAFLOW_IN
+PcRegisterPhysicalConnection(DeviceObject,
+                             topoPort, KSPIN_TOPO_WAVE_BRIDGE,
+                             wavePort, KSPIN_WAVE_BRIDGE);
+```
+
+`DriverVer` 1.0.1.0 → **1.0.2.0**，构建标记 `ISIGHTMIC-BUILD-V22-20260924-PHYSCONN`。
+
+### 安装脚本随之改了两处
+
+- **装之前先摘掉所有 `ROOT\ISIGHTMIC\*` 节点**。原来的工具用
+  `DICD_GENERATE_ID`，每跑一次就新建一个实例，重启后会出现好几个同名麦克风；
+  而且摘掉旧节点能让 Windows **当场卸载**旧驱动，新节点才可能立刻绑定新的
+  `.sys`，省掉一次重启。
+- **端点验收改成轮询**（最多 5 次、约 12 秒）。设备启动后音频服务建端点不是
+  瞬时的，验收写死了会误报失败。
+
 ## 已知限制
 
 - 需要测试签名（`testsigning`），Secure Boot 机器装不上

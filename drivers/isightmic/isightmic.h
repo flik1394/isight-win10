@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V27-20260925-DUALPHASE"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V28-20260925-SELFDMACH"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -73,7 +73,7 @@ typedef struct _ISIGHTMIC_DIAG {
     // --- keep these six in this order: they are the v23 fields ---
     unsigned long NewStreamEntered;   // PortCls called IMiniportWaveCyclic::NewStream
     unsigned long NewStreamFailed;    // ... and we returned a failure
-    unsigned long FailDma;            // NewMasterDmaChannel failed
+    unsigned long FailDma;            // IDmaChannel::AllocateBuffer failed
     unsigned long FailStreamInit;     // stream Init / stream object alloc failed
     unsigned long FailServiceGroup;   // PcNewServiceGroup failed
     unsigned long LastFailStatus;     // NTSTATUS of the most recent failure
