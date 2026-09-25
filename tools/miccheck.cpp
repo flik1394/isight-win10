@@ -28,6 +28,11 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <propvarutil.h>
 #include <setupapi.h>
+// The KS GUIDs (KSCATEGORY_AUDIO, KSPROPSETID_Pin, ...) are declared by ks.h
+// as extern references whose definitions live in the *kernel* ks.lib.  A user
+// -mode exe cannot link those, so include initguid.h first: it flips INITGUID
+// on and every DEFINE_GUIDSTRUCT in ks.h/ksmedia.h is then defined right here.
+#include <initguid.h>
 #include <ks.h>
 #include <ksmedia.h>
 #include <ksuser.h>
