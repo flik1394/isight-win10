@@ -193,7 +193,7 @@ public:
     // STATUS_DEVICE_CONFIGURATION_ERROR (0xC0000182) -- the V27 NewStream
     // failure.  MSVAD avoids the call entirely by handing the port the stream
     // object itself as the IDmaChannel; we do the same.
-    STDMETHODIMP_(NTSTATUS) AllocateBuffer(IN ULONG BufferSize, IN PHYSICAL_ADDRESS PhysicalAddressConstraint);
+    STDMETHODIMP_(NTSTATUS) AllocateBuffer(IN ULONG BufferSize, IN PPHYSICAL_ADDRESS PhysicalAddressConstraint);
     STDMETHODIMP_(void)     FreeBuffer(void);
     STDMETHODIMP_(ULONG)    MaximumBufferSize(void);
     STDMETHODIMP_(ULONG)    AllocatedBufferSize(void);
@@ -312,7 +312,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(IN PKSDATAFORMAT Da
     // Allocate the cyclic buffer on our own IDmaChannel implementation.
     PHYSICAL_ADDRESS constraint;
     constraint.QuadPart = 0;
-    NTSTATUS st = AllocateBuffer(WAVE_BUFFER_BYTES, constraint);
+    NTSTATUS st = AllocateBuffer(WAVE_BUFFER_BYTES, &constraint);
     if (!NT_SUCCESS(st)) return st;
     m_Buffer = m_DmaBuffer;
     m_BufferSize = m_DmaSize;
@@ -323,7 +323,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(IN PKSDATAFORMAT Da
 // --- IDmaChannel: the stream is its own DMA channel (MSVAD style) ----------
 
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::AllocateBuffer(
-    IN ULONG BufferSize, IN PHYSICAL_ADDRESS PhysicalAddressConstraint) {
+    IN ULONG BufferSize, IN PPHYSICAL_ADDRESS PhysicalAddressConstraint) {
     UNREFERENCED_PARAMETER(PhysicalAddressConstraint);
     if (BufferSize == 0) return STATUS_INVALID_PARAMETER;
     if (m_DmaBuffer) {
