@@ -745,19 +745,26 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
                                                                    OUT PVOID ResultantFormat,
                                                                    OUT PULONG ResultantFormatLength) {
     UNREFERENCED_PARAMETER(DataRange);
+    UNREFERENCED_PARAMETER(MatchingDataRange);
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(ResultantFormat);
+    UNREFERENCED_PARAMETER(ResultantFormatLength);
 
-    // v24/v25 call trace.  "WASAPI says the format is unsupported" covers both
-    // "nobody ever asked us about a format" and "we answered and it was
-    // rejected", and only the second one is a format bug.  Keep enough of the
-    // last call to tell them apart without a debugger.
+    // v26.  Diagnostics show PortCls always calls this with OutputBufferLength
+    // == 0 (6982 calls, every single one a length probe, status 0xC0000023),
+    // and never comes back for a second pass.  It treats BUFFER_TOO_SMALL as
+    // "this range does not match", so a custom implementation that honours the
+    // two-phase protocol never gets to produce a format and the pin is never
+    // instantiated.  Every working WaveCyclic sample therefore returns
+    // STATUS_NOT_IMPLEMENTED here and lets PortCls's built-in default
+    // intersection (which handles KSDATARANGE_AUDIO properly) do the job.
+    // Keep the counters so the next verification can confirm PortCls now
+    // instantiates the pin on its own.
     g_WaveIntersect++;
     g_WaveIntersectLastPin = PinId;
     g_WaveIntersectLastOutLen = OutputBufferLength;
     if (MatchingDataRange) {
         g_WaveIntersectReqSpec = MatchingDataRange->Specifier.Data1;
-        // The client's requested format, if it carries the KSDATARANGE_AUDIO
-        // extension (channels / sample rate / bits).  Only read it when the
-        // FormatSize says the extension is present, so a bare KSDATARANGE is safe.
         if (MatchingDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
             PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)MatchingDataRange;
             g_ClientChannels   = a->MaximumChannels;
@@ -765,47 +772,8 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
             g_ClientBits       = a->MaximumBitsPerSample;
         }
     }
-
-    if (OutputBufferLength < sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
-        g_WaveIntersectProbe++;
-        g_WaveIntersectLastStatus = STATUS_BUFFER_TOO_SMALL;
-        if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-    g_WaveIntersectPhase2++;
-
-    // Second stage: write a concrete format.  We accept the channel count the
-    // engine asked for (1 or 2) but physically produce 48 kHz / 16-bit mono and
-    // upmix to the requested channel count, so the only variable is nChannels.
-    ULONG channels = 1;
-    if (MatchingDataRange && MatchingDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
-        PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)MatchingDataRange;
-        if (a->MaximumChannels >= 1) {
-            channels = a->MaximumChannels;
-            if (channels > (ULONG)ISIGHTMIC_MAX_CHANNELS) channels = (ULONG)ISIGHTMIC_MAX_CHANNELS;
-        }
-    }
-    PKSDATAFORMAT_WAVEFORMATEX fmt = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
-    if (!fmt) {
-        g_WaveIntersectLastStatus = STATUS_INVALID_PARAMETER;
-        return STATUS_INVALID_PARAMETER;
-    }
-    RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEX));
-    fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-    fmt->DataFormat.SampleSize  = (ULONG)(ISIGHTMIC_BITS / 8 * channels);
-    fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-    fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
-    fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
-    fmt->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
-    fmt->WaveFormatEx.nChannels       = (WORD)channels;
-    fmt->WaveFormatEx.nSamplesPerSec  = ISIGHTMIC_SAMPLERATE;
-    fmt->WaveFormatEx.nBlockAlign     = (WORD)(ISIGHTMIC_BITS / 8 * channels);
-    fmt->WaveFormatEx.wBitsPerSample  = ISIGHTMIC_BITS;
-    fmt->WaveFormatEx.cbSize          = 0;
-    fmt->WaveFormatEx.nAvgBytesPerSec = ISIGHTMIC_SAMPLERATE * (ISIGHTMIC_BITS / 8 * channels);
-    if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-    g_WaveIntersectLastStatus = STATUS_SUCCESS;
-    return STATUS_SUCCESS;
+    g_WaveIntersectLastStatus = STATUS_NOT_IMPLEMENTED;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 // ---------------------------------------------------------------------------
