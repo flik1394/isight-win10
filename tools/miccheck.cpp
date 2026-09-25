@@ -382,7 +382,7 @@ static void DirectPinProbe(void) {
         CloseHandle(f);
         return;
     }
-    say("    trying KsCreatePin on pin %u (Standard/DevIO, dataflow=OUT) ...",
+    say("    trying KsCreatePin on pin %u (Standard/DevIO, OUT, +48k/stereo/16 format) ...",
         capturePin);
 
     ISIGHT_PIN_CONNECT conn;
@@ -395,6 +395,30 @@ static void DirectPinProbe(void) {
     conn.Medium.Flags   = 0;
     conn.PinId          = (ULONG)capturePin;
     conn.PinFlow        = KSPIN_DATAFLOW_OUT;
+
+    // KsCreatePin's documented contract: the KSPIN_CONNECT is followed by a
+    // KSDATAFORMAT.  The bare-connect attempt got ERROR_INVALID_USER_BUFFER
+    // (1784) -- the create handler wants the format appended, which is also
+    // exactly what the audio engine sends after its 18k successful format
+    // negotiations.  Use 48 kHz / stereo / 16-bit, the shared-mode candidate.
+    BYTE buf[sizeof(ISIGHT_PIN_CONNECT) + sizeof(KSDATAFORMAT_WAVEFORMATEX)];
+    ZeroMemory(buf, sizeof(buf));
+    CopyMemory(buf, &conn, sizeof(conn));
+    KSDATAFORMAT_WAVEFORMATEX* fmt =
+        (KSDATAFORMAT_WAVEFORMATEX*)(buf + sizeof(ISIGHT_PIN_CONNECT));
+    fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
+    fmt->DataFormat.Flags       = 0;
+    fmt->DataFormat.SampleSize  = 4;                        // 2 ch * 2 bytes
+    fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+    fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
+    fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+    fmt->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
+    fmt->WaveFormatEx.nChannels       = 2;
+    fmt->WaveFormatEx.nSamplesPerSec  = 48000;
+    fmt->WaveFormatEx.nBlockAlign     = 4;
+    fmt->WaveFormatEx.wBitsPerSample  = 16;
+    fmt->WaveFormatEx.cbSize          = 0;
+    fmt->WaveFormatEx.nAvgBytesPerSec = 48000 * 4;
 
     HANDLE ph = NULL;
     HMODULE ksuser = LoadLibraryW(L"ksuser.dll");
@@ -412,7 +436,7 @@ static void DirectPinProbe(void) {
         CloseHandle(f);
         return;
     }
-    LONG rc = pKsCreatePin(f, (PKSPIN_CONNECT)&conn, GENERIC_READ, &ph);
+    LONG rc = pKsCreatePin(f, (PKSPIN_CONNECT)buf, GENERIC_READ, &ph);
     if (rc == 0) {
         say("    KsCreatePin SUCCESS -- the pin instantiates fine from user mode.");
         say("    -> the fault is NOT in the create path; engine/topology side.");
