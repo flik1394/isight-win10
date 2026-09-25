@@ -45,6 +45,19 @@
 ; MinFilterInstanceCount on the same pin went 0 -> 1 to match those references.
 ; (See isight-check/ksprobe.py for the pin property dump and micdiag.py for the
 ; NewStream break-down.)  Version moved for the same staging reason as above.
+;
+; DriverVer 1.0.5.0 (2026-09-25): the endpoint published and the audio engine
+; opened the wave filter (wave=1) and negotiated a format 1174 times, but every
+; negotiation was a length-probe only -- PortCls never reached the "write the
+; actual format" stage, so NewStream was never called and the endpoint still
+; died with AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008).  Root cause: the capture
+; data range declared MaximumChannels=1 (mono) while WASAPI shared mode
+; (WeChat / QQ) negotiates in stereo, so the range intersection was empty
+; before DataRangeIntersection ever produced a format.  Fix: widen
+; MaximumChannels to 2 and have DataRangeIntersection echo the engine's
+; requested channel count; the feeder is mono, so the stream upmixes
+; mono -> requested channels.  Same staging reason: the version has to move or
+; SetupCopyOEMInf keeps the old copy.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -52,7 +65,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/24/2026,1.0.4.0
+DriverVer   = 09/25/2026,1.0.5.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64
