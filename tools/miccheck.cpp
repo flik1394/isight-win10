@@ -32,10 +32,18 @@
 // as extern references whose definitions live in the *kernel* ks.lib.  A user
 // -mode exe cannot link those, so include initguid.h first: it flips INITGUID
 // on and every DEFINE_GUIDSTRUCT in ks.h/ksmedia.h is then defined right here.
+// Note ks.h/ksmedia.h ship with the Windows SDK, but ksuser.h does NOT (it is
+// WDK-only, and the CI checker step compiles with SDK includes only) -- so
+// KsCreatePin is declared locally and loaded from ksuser.dll at runtime.
 #include <initguid.h>
 #include <ks.h>
 #include <ksmedia.h>
-#include <ksuser.h>
+
+// ksuser.h equivalent, without the WDK header.
+typedef LONG (WINAPI *PFN_KsCreatePin)(HANDLE FilterHandle,
+                                       PKSPIN_CONNECT Connect,
+                                       ACCESS_MASK DesiredAccess,
+                                       PHANDLE ConnectionHandle);
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -46,7 +54,8 @@
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "ksuser.lib")
+// KsCreatePin is loaded from ksuser.dll at runtime (see the typedef above);
+// ksuser.lib also exists, but only in the WDK lib set, not the SDK one.
 
 static FILE* g_rep = NULL;
 
@@ -373,25 +382,40 @@ static void DirectPinProbe(void) {
     conn.PinPinFlow     = KSPIN_DATAFLOW_OUT;
 
     HANDLE ph = NULL;
-    if (KsCreatePin(f, &conn, GENERIC_READ, &ph)) {
+    HMODULE ksuser = LoadLibraryW(L"ksuser.dll");
+    if (!ksuser) {
+        say("    ksuser.dll not loadable (err=%u) -- cannot attempt pin creation.",
+            GetLastError());
+        CloseHandle(f);
+        return;
+    }
+    PFN_KsCreatePin pKsCreatePin =
+        (PFN_KsCreatePin)GetProcAddress(ksuser, "KsCreatePin");
+    if (!pKsCreatePin) {
+        say("    KsCreatePin not found in ksuser.dll (err=%u).", GetLastError());
+        FreeLibrary(ksuser);
+        CloseHandle(f);
+        return;
+    }
+    LONG rc = pKsCreatePin(f, &conn, GENERIC_READ, &ph);
+    if (rc == 0) {
         say("    KsCreatePin SUCCESS -- the pin instantiates fine from user mode.");
         say("    -> the fault is NOT in the create path; engine/topology side.");
         Sleep(150);        // let PortCls run the pin a moment
         CloseHandle(ph);
     } else {
-        DWORD e = GetLastError();
-        say("    KsCreatePin FAILED (err=0x%08X / %u)", e, e);
-        if (e == 0)
-            say("    -> unknown error mapping.");
-        else if (e == ERROR_NO_SYSTEM_RESOURCES)
+        DWORD e = (DWORD)rc;
+        say("    KsCreatePin FAILED (rc=0x%08X / %u)", e, e);
+        if (e == 0xC0000044 || e == 0x1F)
             say("    -> out of free pin instances: the descriptor's instance counts are the bug.");
-        else if (e == ERROR_INVALID_PARAMETER || e == ERROR_INVALID_FUNCTION)
-            say("    -> interface/medium/format rejected before miniport saw it.");
-        else if (e == ERROR_DEVICE_IN_USE || e == ERROR_BUSY)
+        else if (e == 0xC000000D || e == 0xC0000001 || e == 0x57 || e == 1)
+            say("    -> interface/medium/format rejected before the miniport saw it.");
+        else if (e == 0xC000008A || e == 0xC0000242)
             say("    -> pin slots exhausted or filter busy.");
         else
-            say("    -> error code above names the failing layer precisely.");
+            say("    -> the NTSTATUS above names the failing layer precisely.");
     }
+    FreeLibrary(ksuser);
     CloseHandle(f);
 }
 
