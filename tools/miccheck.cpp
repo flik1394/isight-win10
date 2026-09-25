@@ -48,15 +48,24 @@ typedef LONG (WINAPI *PFN_KsCreatePin)(HANDLE FilterHandle,
 // Layout-identical mirror of KSPIN_CONNECT.  The trailing PIN_DIRECTION member
 // and the KSPIN_INTERFACE_STANDARD id macro are named differently between the
 // WDK's ks.h and whatever ks.h the CI checker step picks up (error C2065 /
-// C2039 in run 36161830770), so stop depending on either: this struct has the
-// exact same binary layout (GUID+Id+Flags twice, then two ULONGs, no padding)
-// and the Standard interface id is always 0.
+// C2039 in run 36161830770), so stop depending on either.  Real KSPIN_CONNECT
+// on x64 is 56 bytes: Interface(16) Medium(16) PinId(4) [pad 4]
+// PinToHandle(8) Priority(8).  A previous 40-byte guess (PinFlow instead of
+// PinToHandle+Priority) put the appended KSDATAFORMAT 16 bytes too early and
+// the kernel parsed FormatSize/Flags/SampleSize/MajorGUID.lo as a garbage
+// PinToHandle -> KsCreatePin returned E_FAIL.  The format MUST begin at
+// offset 56.
 typedef struct {
     KSPIN_INTERFACE Interface;      // {Set GUID, Id, Flags}
     KSPIN_MEDIUM    Medium;         // {Set GUID, Id, Flags}
     ULONG           PinId;
-    ULONG           PinFlow;        // KSPIN_DATAFLOW_OUT
+    ULONG           _pad;           // natural alignment before the HANDLE
+    HANDLE          PinToHandle;    // NULL: create a new pin instance
+    ULONG           PriorityClass;  // KSPRIORITY_NORMAL
+    ULONG           PrioritySubclass;
 } ISIGHT_PIN_CONNECT;
+// 56 = sizeof(real KSPIN_CONNECT) on x64; the appended format lives right after.
+typedef char isight_pin_connect_size_check[(sizeof(ISIGHT_PIN_CONNECT) == 56) ? 1 : -1];
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -394,7 +403,10 @@ static void DirectPinProbe(void) {
     conn.Medium.Id      = KSMEDIUM_STANDARD_DEVIO;
     conn.Medium.Flags   = 0;
     conn.PinId          = (ULONG)capturePin;
-    conn.PinFlow        = KSPIN_DATAFLOW_OUT;
+    conn._pad           = 0;
+    conn.PinToHandle    = NULL;             // new pin instance
+    conn.PriorityClass  = 1;                // KSPRIORITY_NORMAL
+    conn.PrioritySubclass = 1;
 
     // KsCreatePin's documented contract: the KSPIN_CONNECT is followed by a
     // KSDATAFORMAT.  The bare-connect attempt got ERROR_INVALID_USER_BUFFER
