@@ -48,36 +48,36 @@ typedef LONG (WINAPI *PFN_KsCreatePin)(HANDLE FilterHandle,
 // Layout-identical mirror of KSPIN_CONNECT.  The trailing PIN_DIRECTION member
 // and the KSPIN_INTERFACE_STANDARD id macro are named differently between the
 // WDK's ks.h and whatever ks.h the CI checker step picks up (error C2065 /
-// C2039 in run 36161830770), so stop depending on either.  Real KSPIN_CONNECT
-// on x64 is 56 bytes: Interface(16) Medium(16) PinId(4) [pad 4]
-// PinToHandle(8) Priority(8).  A previous 40-byte guess (PinFlow instead of
-// PinToHandle+Priority) put the appended KSDATAFORMAT 16 bytes too early and
-// the kernel parsed FormatSize/Flags/SampleSize/MajorGUID.lo as a garbage
-// PinToHandle -> KsCreatePin returned E_FAIL.  The format MUST begin at
-// offset 56.  We do NOT use the SDK's KSPIN_INTERFACE/KSPIN_MEDIUM types here:
-// the CI's ks.h evidently sizes one of them differently (C2118 in run
-// 36164815749), so the identifier pairs are our own GUID+ULONG+ULONG, which
-// is what the wire format actually is.
+// C2039 in run 36161830770), so stop depending on either.  We do NOT use the
+// SDK's KSPIN_INTERFACE/KSPIN_MEDIUM types either: the identifier pair is our
+// own GUID+ULONG+ULONG, which is the wire format.  Arithmetic note (C2118 in
+// run 36165821770): GUID alone is 16 bytes, so an identifier is 24, NOT 16 --
+// real KSPIN_CONNECT on x64 = Interface(24) Medium(24) PinId(4) [pad 4]
+// PinToHandle(8) Priority(8) = 72 bytes, and the appended KSDATAFORMAT must
+// begin at offset 72.  Earlier guesses (40-byte header, then a 56-byte one)
+// made the kernel parse format bytes as PinToHandle/Priority or read a bogus
+// PinId -> E_FAIL.
 typedef struct {
-    GUID Set;
-    ULONG Id;
-    ULONG Flags;
+GUID Set;
+ULONG Id;
+ULONG Flags;
 } ISIGHT_KS_IDENTIFIER;
 typedef struct {
-    ISIGHT_KS_IDENTIFIER Interface; // {Set GUID, Id, Flags}
-    ISIGHT_KS_IDENTIFIER Medium;    // {Set GUID, Id, Flags}
-    ULONG           PinId;
-    ULONG           _pad;           // natural alignment before the HANDLE
-    HANDLE          PinToHandle;    // NULL: create a new pin instance
-    ULONG           PriorityClass;  // KSPRIORITY_NORMAL
-    ULONG           PrioritySubclass;
+ISIGHT_KS_IDENTIFIER Interface; // {Set GUID, Id, Flags}   24 bytes
+ISIGHT_KS_IDENTIFIER Medium;    // {Set GUID, Id, Flags}   24 bytes
+ULONG           PinId;
+ULONG           _pad;           // natural alignment before the HANDLE
+HANDLE          PinToHandle;    // NULL: create a new pin instance
+ULONG           PriorityClass;  // KSPRIORITY_NORMAL
+ULONG           PrioritySubclass;
 } ISIGHT_PIN_CONNECT;
 // Compile-time guards: the appended KSDATAFORMAT must begin exactly where
-// the real KSPIN_CONNECT ends (56 bytes on x64).
+// the real KSPIN_CONNECT ends (72 bytes on x64).
 typedef char isight_guid_size_check[(sizeof(GUID) == 16) ? 1 : -1];
-typedef char isight_ksid_size_check[(sizeof(ISIGHT_KS_IDENTIFIER) == 16) ? 1 : -1];
-typedef char isight_pin_connect_size_check[(sizeof(ISIGHT_PIN_CONNECT) == 56) ? 1 : -1];
-typedef char isight_fmt_offset_check[(offsetof(ISIGHT_PIN_CONNECT, PinToHandle) == 40) ? 1 : -1];
+typedef char isight_ksid_size_check[(sizeof(ISIGHT_KS_IDENTIFIER) == 24) ? 1 : -1];
+typedef char isight_pin_connect_size_check[(sizeof(ISIGHT_PIN_CONNECT) == 72) ? 1 : -1];
+typedef char isight_fmt_offset_check[(offsetof(ISIGHT_PIN_CONNECT, PinToHandle) == 56) ? 1 : -1];
+typedef char isight_pinid_offset_check[(offsetof(ISIGHT_PIN_CONNECT, PinId) == 48) ? 1 : -1];
 #include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
