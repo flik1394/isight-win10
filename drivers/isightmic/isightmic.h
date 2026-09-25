@@ -9,7 +9,9 @@
 //   48 kHz / 16-bit / mono, signed little-endian PCM.
 #define ISIGHTMIC_SAMPLERATE   48000
 #define ISIGHTMIC_BITS         16
-#define ISIGHTMIC_CHANNELS     1
+#define ISIGHTMIC_CHANNELS     1   // the physical feeder stream is mono
+#define ISIGHTMIC_MAX_CHANNELS  2   // but we advertise up to stereo so the audio
+                                    // engine's stereo capture request intersects
 #define ISIGHTMIC_FRAME_BYTES  (ISIGHTMIC_BITS / 8 * ISIGHTMIC_CHANNELS)   // 2
 
 // How much audio the driver hands out per wake-up (10 ms at 48 kHz mono).
@@ -43,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V24-20260924-CALLTRACE"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V25-20260925-AUDIORANGE"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -85,6 +87,11 @@ typedef struct _ISIGHTMIC_DIAG {
     unsigned long WaveIntersectLastStatus;  // what we returned to the last call
     unsigned long WaveIntersectReqSpec;     // requested Specifier, first ULONG
     unsigned long TopoIntersect;      // topology DataRangeIntersection calls
+    // --- v25 additions ---
+    unsigned long WaveIntersectPhase2;   // second-stage (write-format) calls
+    unsigned long ClientChannels;        // last requested channels (MatchingDataRange)
+    unsigned long ClientSampleRate;      // last requested sample rate
+    unsigned long ClientBits;            // last requested bits per sample
 } ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"

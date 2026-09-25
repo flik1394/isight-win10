@@ -94,6 +94,14 @@ static ULONG g_WaveIntersectLastStatus;
 static ULONG g_WaveIntersectReqSpec;
 static ULONG g_TopoIntersect;
 
+// v25: how many times we actually wrote a format (not just reported its size),
+// and what the audio engine last asked for, to distinguish "range check failed
+// before we were even asked" from "we were asked and still said no".
+static ULONG g_WaveIntersectPhase2;
+static ULONG g_ClientChannels;
+static ULONG g_ClientSampleRate;
+static ULONG g_ClientBits;
+
 static void RingInit(PRING r) {
     r->Buffer = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, RING_BYTES, ISIGHTMIC_POOL_TAG);
     r->Cap = (r->Buffer != NULL) ? RING_BYTES : 0;
@@ -147,7 +155,7 @@ class CMiniportWaveCyclicStream;
 VOID StreamTimerDpc(IN PKDPC Dpc, IN PVOID DeferredContext,
                     IN PVOID SystemArgument1, IN PVOID SystemArgument2);
 
-#define WAVE_BUFFER_BYTES   9600    // 100 ms of 48 kHz mono 16-bit
+#define WAVE_BUFFER_BYTES   19200   // 100 ms of 48 kHz stereo 16-bit (covers mono too)
 #define TIMER_PERIOD_MS     10
 
 // ---------------------------------------------------------------------------
@@ -195,6 +203,8 @@ public:
     ULONG                  m_BufferSize;
     ULONG                  m_Position;
     ULONG                  m_NotificationInterval;
+    ULONG                  m_Channels;       // negotiated channel count (1 or 2)
+    ULONG                  m_FrameBytes;     // bytes per frame (channels * 2)
     KSSTATE                m_State;
     KTIMER                 m_Timer;
     KDPC                   m_Dpc;
@@ -213,6 +223,8 @@ CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {
     m_BufferSize = 0;
     m_Position = 0;
     m_NotificationInterval = 0;
+    m_Channels = 1;
+    m_FrameBytes = ISIGHTMIC_BITS / 8;
     m_State = KSSTATE_STOP;
     m_TimerOn = FALSE;
     m_RefCount = 1;
@@ -266,8 +278,9 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::GetPosition(OUT PULONG Positi
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::NormalizePhysicalPosition(IN OUT PLONGLONG PhysicalPosition) {
     if (!PhysicalPosition) return STATUS_INVALID_PARAMETER;
     // bytes -> 100 ns:  * 10000000 / (sampleRate * frameBytes)
+    ULONG fb = m_FrameBytes ? m_FrameBytes : (ISIGHTMIC_BITS / 8);
     *PhysicalPosition = (*PhysicalPosition * 10000000LL) /
-                        (ISIGHTMIC_SAMPLERATE * ISIGHTMIC_FRAME_BYTES);
+                        (ISIGHTMIC_SAMPLERATE * fb);
     return STATUS_SUCCESS;
 }
 
@@ -289,8 +302,9 @@ STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::SetNotificationFreq(IN ULONG Int
                                                                    OUT PULONG FrameSize) {
     ULONG previous = m_NotificationInterval;
     m_NotificationInterval = Interval;
-    // We service on a fixed 10 ms timer; report the matching frame count.
-    if (FrameSize) *FrameSize = ISIGHTMIC_SAMPLERATE / 100;
+    // We service on a fixed 10 ms timer; report the frame size in bytes for the
+    // channel count we are actually running.
+    if (FrameSize) *FrameSize = m_FrameBytes ? m_FrameBytes : (ISIGHTMIC_BITS / 8);
     return previous;
 }
 
@@ -319,9 +333,19 @@ NTSTATUS CMiniportWaveCyclicStream::Init(IN ULONG Pin,
                                          IN PKSDATAFORMAT DataFormat) {
     UNREFERENCED_PARAMETER(Pin);
     UNREFERENCED_PARAMETER(Capture);
-    UNREFERENCED_PARAMETER(DataFormat);
     // The cyclic buffer is sized in SetFormat, once the port has picked the
-    // format it actually wants to run.
+    // format it actually wants to run.  Here we record the channel count so
+    // Service() can upmix the mono feeder stream to what the engine asked for.
+    m_Channels = 1;
+    m_FrameBytes = ISIGHTMIC_BITS / 8;   // 2 for mono
+    if (DataFormat && DataFormat->FormatSize >= sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
+        PKSDATAFORMAT_WAVEFORMATEX wf = (PKSDATAFORMAT_WAVEFORMATEX)DataFormat;
+        ULONG ch = wf->WaveFormatEx.nChannels;
+        if (ch < 1) ch = 1;
+        if (ch > (ULONG)ISIGHTMIC_MAX_CHANNELS) ch = (ULONG)ISIGHTMIC_MAX_CHANNELS;
+        m_Channels = ch;
+        m_FrameBytes = (ISIGHTMIC_BITS / 8) * ch;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -329,24 +353,28 @@ NTSTATUS CMiniportWaveCyclicStream::Init(IN ULONG Pin,
 // the end.  Whatever the ring cannot supply becomes silence, so the endpoint
 // always runs at real time even when the camera is not streaming.
 void CMiniportWaveCyclicStream::Service() {
-    if (m_State != KSSTATE_RUN || !m_Buffer || !m_BufferSize) return;
+    if (m_State != KSSTATE_RUN || !m_Buffer || !m_BufferSize || m_FrameBytes == 0) return;
 
-    const ULONG quantum = ISIGHTMIC_QUANTUM_BYTES;
+    const ULONG frames  = ISIGHTMIC_SAMPLERATE / 100;   // 480 frames per 10 ms tick
+    const ULONG fb      = m_FrameBytes;                 // 2 (mono) or 4 (stereo)
+    const ULONG quantum = fb * frames;                  // bytes to write this tick
     ULONG pos = m_Position % m_BufferSize;
     PUCHAR base = (PUCHAR)m_Buffer;
 
-    ULONG first = m_BufferSize - pos;
-    if (first > quantum) first = quantum;
-    ULONG got = RingPull(&g_Ring, base + pos, first);
-    if (got < first) { RtlZeroMemory(base + pos + got, first - got); g_Starved += first - got; }
-
-    if (quantum > first) {
-        ULONG second = quantum - first;
-        ULONG got2 = RingPull(&g_Ring, base, second);
-        if (got2 < second) { RtlZeroMemory(base + got2, second - got2); g_Starved += second - got2; }
+    // The feeder ring is mono 16-bit.  For each frame we pull one mono sample
+    // and write it to every channel the engine asked for (upmix).  Positions
+    // wrap modulo the cyclic buffer.
+    for (ULONG f = 0; f < frames; f++) {
+        INT16 s = 0;
+        ULONG got = RingPull(&g_Ring, (PUCHAR)&s, 2);
+        if (got < 2) g_Starved += fb;
+        for (ULONG c = 0; c < m_Channels; c++) {
+            *(PINT16)(base + pos) = s;   // s == 0 when the ring was dry -> silence
+            pos = (pos + 2) % m_BufferSize;
+        }
     }
 
-    m_Position = (pos + quantum) % m_BufferSize;
+    m_Position = (m_Position + quantum) % m_BufferSize;
     g_Played += quantum;
 }
 
@@ -426,7 +454,7 @@ static KSDATARANGE_AUDIO PinDataRangesStream[] = {
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
-        ISIGHTMIC_CHANNELS,                 // MaximumChannels
+        ISIGHTMIC_MAX_CHANNELS,               // MaximumChannels (now stereo-capable)
         ISIGHTMIC_BITS,                     // MinimumBitsPerSample
         ISIGHTMIC_BITS,                     // MaximumBitsPerSample
         ISIGHTMIC_SAMPLERATE,               // MinimumSampleFrequency
@@ -718,20 +746,44 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
                                                                    OUT PULONG ResultantFormatLength) {
     UNREFERENCED_PARAMETER(DataRange);
 
-    // v24 call trace.  "WASAPI says the format is unsupported" covers both
+    // v24/v25 call trace.  "WASAPI says the format is unsupported" covers both
     // "nobody ever asked us about a format" and "we answered and it was
     // rejected", and only the second one is a format bug.  Keep enough of the
     // last call to tell them apart without a debugger.
     g_WaveIntersect++;
     g_WaveIntersectLastPin = PinId;
     g_WaveIntersectLastOutLen = OutputBufferLength;
-    if (MatchingDataRange) g_WaveIntersectReqSpec = MatchingDataRange->Specifier.Data1;
+    if (MatchingDataRange) {
+        g_WaveIntersectReqSpec = MatchingDataRange->Specifier.Data1;
+        // The client's requested format, if it carries the KSDATARANGE_AUDIO
+        // extension (channels / sample rate / bits).  Only read it when the
+        // FormatSize says the extension is present, so a bare KSDATARANGE is safe.
+        if (MatchingDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
+            PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)MatchingDataRange;
+            g_ClientChannels   = a->MaximumChannels;
+            g_ClientSampleRate = a->MaximumSampleFrequency;
+            g_ClientBits       = a->MaximumBitsPerSample;
+        }
+    }
 
     if (OutputBufferLength < sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
         g_WaveIntersectProbe++;
         g_WaveIntersectLastStatus = STATUS_BUFFER_TOO_SMALL;
         if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
         return STATUS_BUFFER_TOO_SMALL;
+    }
+    g_WaveIntersectPhase2++;
+
+    // Second stage: write a concrete format.  We accept the channel count the
+    // engine asked for (1 or 2) but physically produce 48 kHz / 16-bit mono and
+    // upmix to the requested channel count, so the only variable is nChannels.
+    ULONG channels = 1;
+    if (MatchingDataRange && MatchingDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
+        PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)MatchingDataRange;
+        if (a->MaximumChannels >= 1) {
+            channels = a->MaximumChannels;
+            if (channels > (ULONG)ISIGHTMIC_MAX_CHANNELS) channels = (ULONG)ISIGHTMIC_MAX_CHANNELS;
+        }
     }
     PKSDATAFORMAT_WAVEFORMATEX fmt = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
     if (!fmt) {
@@ -740,17 +792,17 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
     }
     RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEX));
     fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-    fmt->DataFormat.SampleSize  = ISIGHTMIC_FRAME_BYTES;
+    fmt->DataFormat.SampleSize  = (ULONG)(ISIGHTMIC_BITS / 8 * channels);
     fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
     fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
     fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
     fmt->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
-    fmt->WaveFormatEx.nChannels       = ISIGHTMIC_CHANNELS;
+    fmt->WaveFormatEx.nChannels       = (WORD)channels;
     fmt->WaveFormatEx.nSamplesPerSec  = ISIGHTMIC_SAMPLERATE;
-    fmt->WaveFormatEx.nBlockAlign     = ISIGHTMIC_FRAME_BYTES;
+    fmt->WaveFormatEx.nBlockAlign     = (WORD)(ISIGHTMIC_BITS / 8 * channels);
     fmt->WaveFormatEx.wBitsPerSample  = ISIGHTMIC_BITS;
     fmt->WaveFormatEx.cbSize          = 0;
-    fmt->WaveFormatEx.nAvgBytesPerSec = ISIGHTMIC_SAMPLERATE * ISIGHTMIC_FRAME_BYTES;
+    fmt->WaveFormatEx.nAvgBytesPerSec = ISIGHTMIC_SAMPLERATE * (ISIGHTMIC_BITS / 8 * channels);
     if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
     g_WaveIntersectLastStatus = STATUS_SUCCESS;
     return STATUS_SUCCESS;
@@ -1130,6 +1182,10 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
                 dg->WaveIntersectLastStatus = g_WaveIntersectLastStatus;
                 dg->WaveIntersectReqSpec = g_WaveIntersectReqSpec;
                 dg->TopoIntersect    = g_TopoIntersect;
+    dg->WaveIntersectPhase2 = g_WaveIntersectPhase2;
+    dg->ClientChannels  = g_ClientChannels;
+    dg->ClientSampleRate = g_ClientSampleRate;
+    dg->ClientBits      = g_ClientBits;
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
