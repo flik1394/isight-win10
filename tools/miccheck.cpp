@@ -893,6 +893,223 @@ static void DirectPinProbe(void) {
 }
 
 // ---------------------------------------------------------------------------
+// [2g] differential probe against a WORKING capture filter.  The same machine
+// runs Realtek's capture driver (rtmicinwave); the audio engine works with it
+// and not with ours.  Open both wave filters, instantiate one capture pin on
+// each (PAUSE, no data flows), run the identical property battery, and print
+// the answers side by side.  Any property the two answer differently is a
+// suspect for the 0x88890008 wall.  Pure user mode -- no driver change needed.
+// ---------------------------------------------------------------------------
+struct PropResult { bool ok; DWORD err; DWORD got; unsigned __int64 v[4]; };
+
+static PropResult PinProp(HANDLE ph, const GUID& set, ULONG id, DWORD outLen) {
+    PropResult r; r.ok = false; r.err = 0; r.got = 0;
+    r.v[0] = r.v[1] = r.v[2] = r.v[3] = 0;
+    KSPROPERTY p; ZeroMemory(&p, sizeof(p));
+    p.Set = set; p.Id = id; p.Flags = KSPROPERTY_TYPE_GET;
+    unsigned __int64 big[4] = { 0, 0, 0, 0 };
+    if (outLen > sizeof(big)) outLen = (DWORD)sizeof(big);
+    DWORD got = 0;
+    r.ok = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &p, sizeof(p),
+                           big, outLen, &got, NULL) ? true : false;
+    if (!r.ok) r.err = GetLastError();
+    r.got = got;
+    for (int i = 0; i < 4; i++) r.v[i] = big[i];
+    return r;
+}
+
+static bool FindStreamingCapturePin(HANDLE f, ULONG* pinId) {
+    ULONG ctypes = 0; DWORD got = 0;
+    if (!KsPinGet(f, 0, KSPROPERTY_PIN_CTYPES, &ctypes, sizeof(ctypes), &got))
+        return false;
+    for (ULONG id = 0; id < ctypes; id++) {
+        ULONG df = 0, comm = 0; DWORD g1 = 0, g2 = 0;
+        bool okDf = KsPinGet(f, id, KSPROPERTY_PIN_DATAFLOW, &df, sizeof(df), &g1);
+        bool okCm = KsPinGet(f, id, KSPROPERTY_PIN_COMMUNICATION, &comm, sizeof(comm), &g2);
+        if (okDf && okCm && df == KSPIN_DATAFLOW_OUT &&
+            comm == KSPIN_COMMUNICATION_SINK) {
+            *pinId = id;
+            return true;
+        }
+    }
+    return false;
+}
+
+static HANDLE CreateCapturePinAny(HANDLE f, ULONG pinId, int* usedFmt) {
+    typedef LONG (WINAPI *PFN_KsCreatePin)(HANDLE, PKSPIN_CONNECT, ACCESS_MASK,
+                                           PHANDLE);
+    PFN_KsCreatePin pKsCreatePin = NULL;
+    HMODULE ksuser = GetModuleHandleW(L"ksuser.dll");
+    if (!ksuser) ksuser = LoadLibraryW(L"ksuser.dll");
+    if (ksuser) pKsCreatePin = (PFN_KsCreatePin)GetProcAddress(ksuser, "KsCreatePin");
+    if (!pKsCreatePin) return NULL;
+    static const struct { ULONG ch, rate; } fmts[4] = {
+        { 1, 48000 }, { 2, 48000 }, { 1, 44100 }, { 2, 44100 }
+    };
+    for (int i = 0; i < 4; i++) {
+        BYTE buf[sizeof(KSPIN_CONNECT) + sizeof(KSDATAFORMAT_WAVEFORMATEX)];
+        ZeroMemory(buf, sizeof(buf));
+        KSPIN_CONNECT* pc = (KSPIN_CONNECT*)buf;
+        pc->Interface.Set = KSINTERFACESETID_Standard;
+        pc->Interface.Id  = 1;              // LOOPED_STREAMING
+        pc->Medium.Set    = KSMEDIUMSETID_Standard;
+        pc->Medium.Id     = KSMEDIUM_STANDARD_DEVIO;
+        pc->PinId         = pinId;
+        pc->Priority.PriorityClass    = KSPRIORITY_NORMAL;
+        pc->Priority.PrioritySubClass = 1;
+        KSDATAFORMAT_WAVEFORMATEX* wf =
+            (KSDATAFORMAT_WAVEFORMATEX*)(buf + sizeof(KSPIN_CONNECT));
+        wf->DataFormat.FormatSize = sizeof(KSDATAFORMAT_WAVEFORMATEX);
+        wf->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+        wf->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
+        wf->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+        wf->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
+        wf->WaveFormatEx.nChannels       = (WORD)fmts[i].ch;
+        wf->WaveFormatEx.nSamplesPerSec  = fmts[i].rate;
+        wf->WaveFormatEx.wBitsPerSample  = 16;
+        wf->WaveFormatEx.nBlockAlign     = (WORD)(fmts[i].ch * 2);
+        wf->WaveFormatEx.nAvgBytesPerSec = fmts[i].rate * fmts[i].ch * 2;
+        HANDLE ph = NULL;
+        if (pKsCreatePin(f, pc, GENERIC_READ | GENERIC_WRITE, &ph) == 0) {
+            *usedFmt = i;
+            return ph;
+        }
+    }
+    return NULL;
+}
+
+static void BatteryOne(const WCHAR* path, const char* tag) {
+    HANDLE f = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                           OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        say("    [%s] filter open failed (err=%u)", tag, GetLastError());
+        return;
+    }
+    ULONG pinId = 0;
+    if (!FindStreamingCapturePin(f, &pinId)) {
+        say("    [%s] no OUT/SINK streaming pin", tag);
+        CloseHandle(f);
+        return;
+    }
+    int used = -1;
+    HANDLE ph = CreateCapturePinAny(f, pinId, &used);
+    if (!ph) {
+        say("    [%s] pin create failed on all 4 formats", tag);
+        CloseHandle(f);
+        return;
+    }
+    static const ULONG fmtCh[4]  = { 1, 2, 1, 2 };
+    static const ULONG fmtRate[4] = { 48000, 48000, 44100, 44100 };
+    say("    [%s] pin%u created (%uch %uHz), battery:", tag, pinId,
+        fmtCh[used], fmtRate[used]);
+
+    struct { KSPROPERTY p; ULONG st; } sb;
+    sb.p.Set = KSPROPSETID_Connection;
+    sb.p.Id  = KSPROPERTY_CONNECTION_STATE;
+    sb.p.Flags = KSPROPERTY_TYPE_SET;
+    DWORD got = 0; ULONG dummy = 0;
+    sb.st = 2;   // PAUSE
+    DeviceIoControl(ph, IOCTL_KS_PROPERTY, &sb, sizeof(sb),
+                    &dummy, sizeof(dummy), &got, NULL);
+
+    PropResult r;
+    r = PinProp(ph, KSPROPSETID_Audio, KSPROPERTY_AUDIO_LATENCY, 32);
+    say("      LATENCY    : %s got=%u v=%llu/%llu (err=%u)",
+        r.ok ? "OK" : "FAIL", r.got, r.v[0], r.v[1], r.err);
+    r = PinProp(ph, KSPROPSETID_Audio, KSPROPERTY_AUDIO_POSITION, 16);
+    say("      POSITION   : %s play=%llu write=%llu (err=%u)",
+        r.ok ? "OK" : "FAIL", r.v[0], r.v[1], r.err);
+    r = PinProp(ph, KSPROPSETID_Audio, KSPROPERTY_AUDIO_CHANNEL_CONFIG, 4);
+    say("      CHANCFG    : %s mask=0x%llX (err=%u)",
+        r.ok ? "OK" : "FAIL", r.ok ? r.v[0] : 0, r.err);
+    r = PinProp(ph, KSPROPSETID_Connection,
+                KSPROPERTY_CONNECTION_ALLOCATORFRAMING, 64);
+    say("      ALLOCFRM   : %s got=%u v0=%llu v1=%llu (err=%u)",
+        r.ok ? "OK" : "FAIL", r.got, r.v[0], r.v[1], r.err);
+
+    // The engine reads position right after RUN, BEFORE its own buffers are
+    // queued.  A hardware driver's position advances freely (DMA register);
+    // ours can only move through the port's copy path.  Measure both.
+    KSPROPERTY gp; ZeroMemory(&gp, sizeof(gp));
+    gp.Set = KSPROPSETID_Audio; gp.Id = KSPROPERTY_AUDIO_POSITION;
+    gp.Flags = KSPROPERTY_TYPE_GET;
+    unsigned __int64 p0[2] = { 0, 0 }, p1[2] = { 0, 0 };
+    BOOL o0 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gp, sizeof(gp),
+                              p0, sizeof(p0), &got, NULL);
+    Sleep(300);
+    BOOL o1 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gp, sizeof(gp),
+                              p1, sizeof(p1), &got, NULL);
+    say("      pos@PAUSE(no IRP): %s p0=%llu p1=%llu advanced=%s",
+        (o0 && o1) ? "OK" : "FAIL", o0 ? p0[0] : 0, o1 ? p1[0] : 0,
+        (o0 && o1 && p1[0] != p0[0]) ? "YES" : "no");
+
+    sb.st = 3;   // RUN, still nothing queued
+    DeviceIoControl(ph, IOCTL_KS_PROPERTY, &sb, sizeof(sb),
+                    &dummy, sizeof(dummy), &got, NULL);
+    o0 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gp, sizeof(gp),
+                         p0, sizeof(p0), &got, NULL);
+    Sleep(500);
+    o1 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gp, sizeof(gp),
+                         p1, sizeof(p1), &got, NULL);
+    say("      pos@RUN (no IRP): %s p0=%llu p1=%llu advanced=%s",
+        (o0 && o1) ? "OK" : "FAIL", o0 ? p0[0] : 0, o1 ? p1[0] : 0,
+        (o0 && o1 && p1[0] != p0[0]) ? "YES" : "no");
+
+    sb.st = 0;   // STOP
+    DeviceIoControl(ph, IOCTL_KS_PROPERTY, &sb, sizeof(sb),
+                    &dummy, sizeof(dummy), &got, NULL);
+    Sleep(100);
+    CloseHandle(ph);
+    CloseHandle(f);
+}
+
+static void DiffProbe(void) {
+    say("[2g] differential probe vs a working capture filter");
+    HDEVINFO set = SetupDiGetClassDevsW(&KSCATEGORY_AUDIO, NULL, NULL,
+                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) {
+        say("    SetupDi failed (err=%u)", GetLastError());
+        return;
+    }
+    WCHAR ourPath[1024] = L"", refPath[1024] = L"";
+    for (DWORD i = 0; i < 96; i++) {
+        SP_DEVICE_INTERFACE_DATA di;
+        di.cbSize = sizeof(di);
+        if (!SetupDiEnumDeviceInterfaces(set, NULL, &KSCATEGORY_AUDIO, i, &di))
+            break;
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(set, &di, NULL, 0, &need, NULL);
+        if (!need) continue;
+        BYTE* b = (BYTE*)malloc(need);
+        if (!b) break;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W* dd =
+            (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)b;
+        dd->cbSize = sizeof(*dd);
+        if (SetupDiGetDeviceInterfaceDetailW(set, &di, dd, need, NULL, NULL)) {
+            size_t len = wcslen(dd->DevicePath);
+            if (len > 5 && _wcsicmp(dd->DevicePath + len - 5, L"\\wave") == 0) {
+                if (wcsstr(dd->DevicePath, L"isightmic")) {
+                    if (!ourPath[0])
+                        wcsncpy_s(ourPath, dd->DevicePath, _TRUNCATE);
+                } else if (!refPath[0]) {
+                    wcsncpy_s(refPath, dd->DevicePath, _TRUNCATE);
+                }
+            }
+        }
+        free(b);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    if (!ourPath[0] || !refPath[0]) {
+        say("    need ours + a reference \\wave filter (ours=%d ref=%d)",
+            ourPath[0] ? 1 : 0, refPath[0] ? 1 : 0);
+        return;
+    }
+    BatteryOne(refPath, "REF");
+    BatteryOne(ourPath, "OURS");
+    say("    -> any row where REF and OURS disagree is a suspect.");
+}
+
+// ---------------------------------------------------------------------------
 // 3 -- enumerate active capture endpoints
 // ---------------------------------------------------------------------------
 static bool FindCaptureEndpoint(IMMDevice** out, char* nameOut, size_t nameLen) {
@@ -1087,6 +1304,7 @@ int main(int argc, char** argv) {
     StatusProbe p;
     ProbeDriver(&p, 2);
     DirectPinProbe();
+    DiffProbe();
 
     IMMDevice* dev = NULL;
     char name[256] = "";
