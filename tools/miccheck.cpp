@@ -142,6 +142,34 @@ static bool ReadDiag(HANDLE h, ISIGHTMIC_DIAG* out) {
                            sizeof(*out), &got, NULL) && got >= sizeof(*out);
 }
 
+// Read the driver diag through a fresh control-device handle.  Used by [2f]
+// to snapshot the counters before/after the RUN so the DELTAS show what this
+// one pin's wakeup + copy path actually did (globals cannot distinguish pins).
+static bool ReadDiagCtl(ISIGHTMIC_DIAG* out) {
+    HANDLE h = CreateFileW(L"\\\\.\\IsightMicCtl", GENERIC_READ | GENERIC_WRITE,
+                           0, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = ReadDiag(h, out);
+    CloseHandle(h);
+    return ok;
+}
+
+static void PrintDiagDelta(const char* tag,
+                           const ISIGHTMIC_DIAG* a, const ISIGHTMIC_DIAG* b) {
+    say("    [2f] diag delta (%s):", tag);
+    say("        dpc=%u notify=%u service=%u (full=%u)",
+        b->DpcFires - a->DpcFires, b->NotifyCalls - a->NotifyCalls,
+        b->ServiceCalls - a->ServiceCalls, b->ServiceFull - a->ServiceFull);
+    say("        posgets=%u poslast=%u reqsvc=%u irpsdone=%u",
+        b->PosGets - a->PosGets, b->PosLast,
+        b->ReqSvc - a->ReqSvc, b->IrpDone - a->IrpDone);
+    say("        dma: sysaddr=%u transfer=%u bufsize=%u copyfrom=%u"
+        " copyto=%u phys=%u",
+        b->DmaSysAddr - a->DmaSysAddr, b->DmaTransfer - a->DmaTransfer,
+        b->DmaBufferSize - a->DmaBufferSize, b->DmaCopyFrom - a->DmaCopyFrom,
+        b->DmaCopyTo - a->DmaCopyTo, b->DmaPhysAddr - a->DmaPhysAddr);
+}
+
 // ---------------------------------------------------------------------------
 // The driver-side call trace
 //
@@ -721,6 +749,8 @@ static void DirectPinProbe(void) {
             if (rc3 != 0) {
                 say("    [2f] create LOOPED pin: FAIL rc=0x%08X", (DWORD)rc3);
             } else {
+                ISIGHTMIC_DIAG d0, d1;
+                bool haveD0 = ReadDiagCtl(&d0);
                 KSPROPERTY gpos3;
                 ZeroMemory(&gpos3, sizeof(gpos3));
                 gpos3.Set   = KSPROPSETID_Audio;
@@ -780,6 +810,11 @@ static void DirectPinProbe(void) {
                     moved
                         ? "PORT COPIES DATA -- driver path proven end to end"
                         : "STILL FROZEN even with a buffer queued");
+
+                if (haveD0 && ReadDiagCtl(&d1))
+                    PrintDiagDelta("this pin's RUN window", &d0, &d1);
+                else
+                    say("    [2f] diag delta: unavailable");
 
                 ULONG val0 = 0;   // KSSTATE_STOP
                 DeviceIoControl(ph3, IOCTL_KS_PROPERTY, &cprop, sizeof(cprop),
