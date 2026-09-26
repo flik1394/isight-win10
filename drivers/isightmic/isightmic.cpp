@@ -317,12 +317,15 @@ STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::Release() {
 // by one quantum per service call, which is exactly what we wrote.
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::GetPosition(OUT PULONG Position) {
     if (!Position) return STATUS_INVALID_PARAMETER;
-    *Position = m_Position;
-    // v33: does the port ever ask us?  played advances (= Service runs and
-    // m_Position moves), yet KSPROPERTY_AUDIO_POSITION returns 0 -- either
-    // the port never reaches this method or it discards the value.
+    // V37: return the RING OFFSET (0..m_BufferSize-1), not a linear count.
+    // MSVAD's GetPosition does: dmaPosition_ = (...) % dmaBufferSize_.
+    // ReactOS' PortWaveCyclic consumes the value as a ring offset:
+    //   BufferLength = Position - m_CommonBufferOffset   (ring coords)
+    //   CopyFrom(Buffer, m_CommonBuffer + m_CommonBufferOffset, ...)
+    // A linearly-growing value breaks that arithmetic for the port.
+    *Position = m_BufferSize ? (m_Position % m_BufferSize) : 0;
     g_PosGets++;
-    g_PosLast = m_Position;
+    g_PosLast = *Position;
     return STATUS_SUCCESS;
 }
 
