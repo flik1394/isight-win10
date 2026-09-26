@@ -546,11 +546,11 @@ void CMiniportWaveCyclicStream::Service() {
     m_Position += quantum;
     g_Played += quantum;
 
-    // V35: keep the port awake.  MSVAD's Service() ends by requesting another
-    // service pass so the port keeps copying captured bytes to the client IRP
-    // until every pending read is filled.  Without this the port fills our ring
-    // once and never completes the user IRP (irps done stays 0).
-    if (m_ServiceGroup) { g_ReqSvc++; m_ServiceGroup->RequestService(); }
+    // V36 REVERT: V35 called RequestService() here and that was a straight
+    // infinite recursion -- our RequestService() just calls Service(), and
+    // Service() ended by calling RequestService() again.  One DPC tick then
+    // spins at DISPATCH_LEVEL forever: the machine froze hard and miccheck
+    // hung.  MSVAD never does this; its Service() returns after one pass.
 }
 
 STDMETHODIMP_(void) CMiniportWaveCyclicStream::RequestService() {
@@ -567,14 +567,14 @@ VOID StreamTimerDpc(IN PKDPC Dpc, IN PVOID DeferredContext,
     CMiniportWaveCyclicStream* s = (CMiniportWaveCyclicStream*)DeferredContext;
     if (s == NULL) return;
     g_DpcFires++;
-    if (s->m_ServiceGroup != NULL) {
-        g_ReqSvc++;
-        // V35: MSVAD's standalone timer DPC calls IServiceGroup::RequestService,
-        // NOT IPortWaveCyclic::Notify.  Notify only marks the port "dirty" -- it
-        // does not make the port service the stream and copy bytes to the
-        // pending user IRP.  RequestService is what wakes the port's worker,
-        // which calls our Service() and then copies captured data to the IRP.
-        s->m_ServiceGroup->RequestService();
+    if (s->m_Port != NULL && s->m_ServiceGroup != NULL) {
+        g_NotifyCalls++;
+        // V36: back to the V34 Notify wakeup.  V35's RequestService here plus
+        // the one at the end of Service() formed an infinite recursion and
+        // froze the machine.  Notify is what MSVAD actually does from its
+        // timer DPC (TimerNotify -> m_pPort->Notify(m_pServiceGroup)); it
+        // queues a safe, non-recursive port service pass.
+        s->m_Port->Notify(s->m_ServiceGroup);
     }
 }
 
