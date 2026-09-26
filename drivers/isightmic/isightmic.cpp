@@ -100,6 +100,7 @@ static ULONG g_PosBufSize;    // m_BufferSize at the last GetPosition
 #define ISIGHT_J_DEPTH 32
 static ULONG g_JHead;                          // total events (mod depth stored)
 static ULONG g_StreamSeq;                      // last assigned stream number
+static ULONG g_Journal[ISIGHT_J_DEPTH * 4];
 static VOID JLog(ULONG id, ULONG a, ULONG b, ULONG c) {
     ULONG slot = g_JHead++ % ISIGHT_J_DEPTH;
     g_Journal[slot * 4 + 0] = id;
@@ -107,7 +108,6 @@ static VOID JLog(ULONG id, ULONG a, ULONG b, ULONG c) {
     g_Journal[slot * 4 + 2] = b;
     g_Journal[slot * 4 + 3] = c;
 }
-static ULONG g_Journal[ISIGHT_J_DEPTH * 4];
 static ULONG g_IrpDone;       // stream IRPs the port completed for our streams
 static ULONG g_ReqSvc;        // IServiceGroup::RequestService calls (the real wakeup)
 // v34: which IDmaChannel methods does PortCls actually call while RUN?  This is
