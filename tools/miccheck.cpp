@@ -329,7 +329,8 @@ typedef char isight_hdr_size_check[(sizeof(KSSTREAM_HEADER) == 56) ? 1 : -1];
 static __declspec(align(64)) unsigned char g_2f_buf[ISIGHT_2F_BUF];
 
 static volatile LONG g_2f_phase = 0;   // 2 = DeviceIoControl returned
-static DWORD g_2f_submit_err = 0;
+static DWORD g_2f_submit_err = 0;      // variant 1 (in+out buffers)
+static DWORD g_2f_submit_err2 = 0;     // variant 0 (in-only, legacy)
 
 static DWORD WINAPI Probe2FSubmit(LPVOID arg) {
     HANDLE ph = (HANDLE)arg;
@@ -339,9 +340,21 @@ static DWORD WINAPI Probe2FSubmit(LPVOID arg) {
     hdr.FrameExtent = ISIGHT_2F_BUF;
     hdr.Data        = g_2f_buf;
     DWORD got2 = 0;
+    // Variant 1: headers in BOTH buffers.  IOCTL_KS_READ_STREAM is
+    // METHOD_OUT_DIRECT; ReactOS' KsStreamIo/KsProbeStreamIrp reads the
+    // length check against the OUTPUT buffer length and probes MdlAddress,
+    // so a NULL out-buffer (len 0) trips the probe before the pin ever sees
+    // the request -> ERROR_INVALID_USER_BUFFER (1784).  Passing the same
+    // header memory as both in and out satisfies SystemBuffer copy AND mdl.
     BOOL ok = DeviceIoControl(ph, IOCTL_KS_READ_STREAM, &hdr, sizeof(hdr),
-                              NULL, 0, &got2, NULL);
-    g_2f_submit_err = ok ? 0 : GetLastError();
+                              &hdr, sizeof(hdr), &got2, NULL);
+    if (!ok) {
+        g_2f_submit_err = GetLastError();
+        // Variant 0: classic in-only submission (MSDN literal reading).
+        ok = DeviceIoControl(ph, IOCTL_KS_READ_STREAM, &hdr, sizeof(hdr),
+                             NULL, 0, &got2, NULL);
+        g_2f_submit_err2 = ok ? 0 : GetLastError();
+    }
     InterlockedExchange(&g_2f_phase, 2);
     return ok ? 0 : 1;
 }
@@ -764,7 +777,8 @@ static void DirectPinProbe(void) {
                 CloseHandle(ph3);          // cancels the worker's pending IRP
                 if (th) WaitForSingleObject(th, 3000);
                 if (th) CloseHandle(th);
-                say("    [2f] worker exited (submit err=%u)", g_2f_submit_err);
+                say("    [2f] worker exited (in+out err=%u, in-only err=%u)",
+                    g_2f_submit_err, g_2f_submit_err2);
             }
         }
     } else {
