@@ -570,6 +570,43 @@ static void DirectPinProbe(void) {
                                        &got, NULL);
             say("    [2d] node channel config: %s mask=0x%lX (err=%u)",
                 okc ? "OK" : "FAIL", okc ? mask : 0, okc ? 0 : GetLastError());
+
+            // [2e] the engine's post-create validation: set RUN and wait for
+            // AUDIO_POSITION to advance.  audioses tears the endpoint down
+            // when the position stays flat -- matching "3 pins created, RUN
+            // for ~200 ms, then ENDPOINT_CREATE_FAILED" in the trace.
+            struct { KSPROPERTY p; ULONG st; } sb2;
+            sb2.p.Set   = KSPROPSETID_Connection;
+            sb2.p.Id    = KSPROPERTY_CONNECTION_STATE;
+            sb2.p.Flags = KSPROPERTY_TYPE_SET;
+            const char* nm2[4] = { "STOP", "ACQUIRE", "PAUSE", "RUN" };
+            for (ULONG st2 = 1; st2 <= 3; st2++) {
+                sb2.st = st2;
+                BOOL oks = DeviceIoControl(ph2, IOCTL_KS_PROPERTY, &sb2,
+                                           sizeof(sb2), &stopval,
+                                           sizeof(stopval), &got, NULL);
+                say("    [2e] set state %s: %s (err=%u)", nm2[st2],
+                    oks ? "OK" : "FAIL", oks ? 0 : GetLastError());
+            }
+            KSPROPERTY gpos; ZeroMemory(&gpos, sizeof(gpos));
+            gpos.Set = KSPROPSETID_Audio;
+            gpos.Id  = KSPROPERTY_AUDIO_POSITION;
+            gpos.Flags = KSPROPERTY_TYPE_GET;
+            unsigned __int64 p0[2]; ZeroMemory(p0, sizeof(p0));
+            BOOL og0 = DeviceIoControl(ph2, IOCTL_KS_PROPERTY, &gpos,
+                                       sizeof(gpos), p0, sizeof(p0),
+                                       &got, NULL);
+            Sleep(500);
+            unsigned __int64 p1[2]; ZeroMemory(p1, sizeof(p1));
+            BOOL og1 = DeviceIoControl(ph2, IOCTL_KS_PROPERTY, &gpos,
+                                       sizeof(gpos), p1, sizeof(p1),
+                                       &got, NULL);
+            say("    [2e] LOOPED position: first %s play=%llu write=%llu",
+                og0 ? "OK" : "FAIL", og0 ? p0[0] : 0, og0 ? p0[1] : 0);
+            say("    [2e] after 500 ms    %s play=%llu write=%llu (advanced=%s)",
+                og1 ? "OK" : "FAIL", og1 ? p1[0] : 0, og1 ? p1[1] : 0,
+                (og1 && p1[0] != p0[0]) ? "yes" : "NO");
+
             stopval = 0;
             DeviceIoControl(ph2, IOCTL_KS_PROPERTY, &cprop, sizeof(cprop),
                             &stopval, sizeof(stopval), &got, NULL);
