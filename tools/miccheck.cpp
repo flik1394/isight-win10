@@ -1002,7 +1002,7 @@ static void BatteryOne(const WCHAR* path, const char* tag) {
     int used = -1;
     HANDLE ph = CreateCapturePinAny(f, pinId, &used);
     if (!ph) {
-        say("    [%s] pin create failed on all 4 formats", tag);
+        say("    [%s] pin create failed on all 6 formats", tag);
         CloseHandle(f);
         return;
     }
@@ -1081,7 +1081,7 @@ static void DiffProbe(void) {
           { 0xA3, 0xB9, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96 } }  // KSCATEGORY_CAPTURE
     };
     WCHAR ourPath[1024] = L"";
-    static WCHAR refList[16][1024];
+    static WCHAR refList[24][1024];
     int refCount = 0;
     for (int catIdx = 0; catIdx < 2; catIdx++) {
     HDEVINFO set = SetupDiGetClassDevsW(&catList[catIdx], NULL, NULL,
@@ -1101,20 +1101,16 @@ static void DiffProbe(void) {
             (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)b;
         dd->cbSize = sizeof(*dd);
         if (SetupDiGetDeviceInterfaceDetailW(set, &di, dd, need, NULL, NULL)) {
-            size_t len = wcslen(dd->DevicePath);
-            if (len > 5 && _wcsicmp(dd->DevicePath + len - 5, L"\\wave") == 0) {
-                if (wcsstr(dd->DevicePath, L"isightmic")) {
-                    if (!ourPath[0])
-                        wcsncpy_s(ourPath, dd->DevicePath, _TRUNCATE);
-                } else {
-                    // keep a list of candidates; the first one that really has
-                    // a capture (OUT/SINK) streaming pin becomes the reference
-                    // (many wave filters belong to RENDER devices, whose
-                    // streaming pin is DATAFLOW_IN -- e.g. the speakers).
-                    if (refCount < 16)
-                        wcsncpy_s(refList[refCount++], dd->DevicePath,
-                                  _TRUNCATE);
-                }
+            // Do NOT filter by the "\wave" reference string: Realtek's capture
+            // filters use their own names (e.g. "\rtmicinwave").  Collect every
+            // filter interface; the pin-structure dump picks the capture ones.
+            if (wcsstr(dd->DevicePath, L"isightmic")) {
+                if (!ourPath[0])
+                    wcsncpy_s(ourPath, dd->DevicePath, _TRUNCATE);
+            } else {
+                if (refCount < 24)
+                    wcsncpy_s(refList[refCount++], dd->DevicePath,
+                              _TRUNCATE);
             }
         }
         free(b);
