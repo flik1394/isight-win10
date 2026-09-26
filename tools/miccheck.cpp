@@ -1364,58 +1364,82 @@ static void WriteWav16(const char* path, const short* s, UINT n) {
 static void LegacyWaveIn(void) {
     UINT n = waveInGetNumDevs();
     say("[5] legacy waveIn probe: %u devices", n);
-    int idx = -1;
-    for (UINT i = 0; i < n; i++) {
+    if (n == 0) return;
+    // format matrix: which PCM formats does the legacy stack accept per device?
+    static const struct { DWORD rate; WORD ch, bits; } fmts[] = {
+        { 48000, 1, 16 }, { 48000, 2, 16 }, { 44100, 1, 16 }, { 44100, 2, 16 },
+        { 22050, 1, 16 }, { 16000, 1, 16 }, { 8000, 1, 16 },  { 48000, 1, 8 }
+    };
+    for (UINT d = 0; d < n; d++) {
         WAVEINCAPSW c; ZeroMemory(&c, sizeof(c));
-        if (waveInGetDevCapsW(i, &c, sizeof(c)) != MMSYSERR_NOERROR) continue;
-        char a[128];
-        WideCharToMultiByte(CP_ACP, 0, c.szPname, -1, a, sizeof(a), NULL, NULL);
-        say("      %u: %s", i, a);
-        if (idx < 0 && wcsstr(c.szPname, L"iSight")) idx = (int)i;
-    }
-    if (idx < 0) {
-        say("    no iSight waveIn device -> legacy stack never saw our endpoint");
-        return;
-    }
-    WAVEFORMATEX wf; ZeroMemory(&wf, sizeof(wf));
-    wf.wFormatTag      = WAVE_FORMAT_PCM;
-    wf.nChannels       = 1;
-    wf.nSamplesPerSec  = 48000;
-    wf.wBitsPerSample  = 16;
-    wf.nBlockAlign     = 2;
-    wf.nAvgBytesPerSec = 96000;
-    HWAVEIN h = NULL;
-    MMRESULT mr = waveInOpen(&h, (UINT)idx, &wf, 0, 0, CALLBACK_NULL);
-    if (mr != MMSYSERR_NOERROR) {
-        say("    waveInOpen(%d) FAILED mr=%u", idx, mr);
-        return;
-    }
-    say("    waveInOpen OK -- queues 5 x 19200-byte buffers, records 1.2 s");
-    static char buf[5 * 19200];
-    WAVEHDR hdrs[5]; ZeroMemory(hdrs, sizeof(hdrs));
-    for (int i = 0; i < 5; i++) {
-        hdrs[i].lpData          = buf + i * 19200;
-        hdrs[i].dwBufferLength  = 19200;
-        waveInPrepareHeader(h, &hdrs[i], sizeof(WAVEHDR));
-        waveInAddBuffer(h, &hdrs[i], sizeof(WAVEHDR));
-    }
-    mr = waveInStart(h);
-    say("    waveInStart: %s (mr=%u)", mr == MMSYSERR_NOERROR ? "OK" : "FAIL", mr);
-    Sleep(1200);
-    waveInReset(h);
-    DWORD total = 0; int done = 0;
-    for (int i = 0; i < 5; i++) {
-        if (hdrs[i].dwFlags & WHDR_DONE) {
-            done++;
-            total += hdrs[i].dwBytesRecorded;
+        char a[128] = "?";
+        if (waveInGetDevCapsW(d, &c, sizeof(c)) == MMSYSERR_NOERROR)
+            WideCharToMultiByte(CP_ACP, 0, c.szPname, -1, a, sizeof(a), NULL, NULL);
+        say("    device %u: %s", d, a);
+        say("      caps: ch=%u..%u rates=0x%08X fmts=0x%08X",
+            c.wChannels, c.wChannels, c.dwFormats, c.dwFormats);
+        for (int i = 0; i < 8; i++) {
+            WAVEFORMATEX wf; ZeroMemory(&wf, sizeof(wf));
+            wf.wFormatTag      = WAVE_FORMAT_PCM;
+            wf.nChannels       = fmts[i].ch;
+            wf.nSamplesPerSec  = fmts[i].rate;
+            wf.wBitsPerSample  = fmts[i].bits;
+            wf.nBlockAlign     = (WORD)(fmts[i].ch * fmts[i].bits / 8);
+            wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+            HWAVEIN h = NULL;
+            MMRESULT mr = waveInOpen(&h, d, &wf, 0, 0, CALLBACK_NULL |
+                                     WAVE_FORMAT_DIRECT);
+            say("      %lu Hz / %u ch / %u bit: %s (mr=%u)",
+                fmts[i].rate, fmts[i].ch, fmts[i].bits,
+                mr == MMSYSERR_NOERROR ? "OPEN-OK" : "fail", mr);
+            if (mr == MMSYSERR_NOERROR) waveInClose(h);
         }
-        waveInUnprepareHeader(h, &hdrs[i], sizeof(WAVEHDR));
     }
-    waveInClose(h);
-    say("    waveIn result: %u/5 buffers done, %u bytes in 1.2 s -> %s",
-        done, total,
-        total > 0 ? "LEGACY PATH WORKS (driver data path proven for a real client)"
-                  : "legacy path also frozen");
+    say("    (WAVE_FORMAT_DIRECT skips the mapper's conversion probing;");
+    say("     a fail here is the raw format verdict of the driver below.)");
+
+    // If any format opens on OUR device, actually record through it.
+    for (UINT d = 0; d < n; d++) {
+        WAVEINCAPSW c; ZeroMemory(&c, sizeof(c));
+        if (waveInGetDevCapsW(d, &c, sizeof(c)) != MMSYSERR_NOERROR) continue;
+        if (!wcsstr(c.szPname, L"iSight")) continue;
+        for (int i = 0; i < 8; i++) {
+            WAVEFORMATEX wf; ZeroMemory(&wf, sizeof(wf));
+            wf.wFormatTag      = WAVE_FORMAT_PCM;
+            wf.nChannels       = fmts[i].ch;
+            wf.nSamplesPerSec  = fmts[i].rate;
+            wf.wBitsPerSample  = fmts[i].bits;
+            wf.nBlockAlign     = (WORD)(fmts[i].ch * fmts[i].bits / 8);
+            wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+            HWAVEIN h = NULL;
+            if (waveInOpen(&h, d, &wf, 0, 0,
+                           CALLBACK_NULL | WAVE_FORMAT_DIRECT) != MMSYSERR_NOERROR)
+                continue;
+            static char buf[5 * 19200];
+            WAVEHDR hdrs[5]; ZeroMemory(hdrs, sizeof(hdrs));
+            for (int k = 0; k < 5; k++) {
+                hdrs[k].lpData         = buf + k * 19200;
+                hdrs[k].dwBufferLength = 19200;
+                waveInPrepareHeader(h, &hdrs[k], sizeof(WAVEHDR));
+                waveInAddBuffer(h, &hdrs[k], sizeof(WAVEHDR));
+            }
+            MMRESULT ms = waveInStart(h);
+            Sleep(1200);
+            waveInReset(h);
+            DWORD total = 0; int done = 0;
+            for (int k = 0; k < 5; k++) {
+                if (hdrs[k].dwFlags & WHDR_DONE) { done++; total += hdrs[k].dwBytesRecorded; }
+                waveInUnprepareHeader(h, &hdrs[k], sizeof(WAVEHDR));
+            }
+            waveInClose(h);
+            say("    record test @%lu Hz/%u ch/%u bit: start=%s, %u/5 done,"
+                " %u bytes in 1.2 s -> %s",
+                fmts[i].rate, fmts[i].ch, fmts[i].bits,
+                ms == MMSYSERR_NOERROR ? "OK" : "FAIL", done, total,
+                total > 0 ? "LEGACY PATH WORKS" : "legacy path also frozen");
+            return;
+        }
+    }
 }
 
 int main(int argc, char** argv) {
