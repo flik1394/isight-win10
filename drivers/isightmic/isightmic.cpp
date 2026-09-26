@@ -309,11 +309,8 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::NormalizePhysicalPosition(IN 
 
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(IN PKSDATAFORMAT DataFormat) {
     UNREFERENCED_PARAMETER(DataFormat);
-    // Allocate the cyclic buffer on our own IDmaChannel implementation.
-    PHYSICAL_ADDRESS constraint;
-    constraint.QuadPart = 0;
-    NTSTATUS st = AllocateBuffer(WAVE_BUFFER_BYTES, &constraint);
-    if (!NT_SUCCESS(st)) return st;
+    // The buffer is allocated in Init (at creation); this call just re-zeroes
+    // it for the format the port has settled on.
     m_Buffer = m_DmaBuffer;
     m_BufferSize = m_DmaSize;
     if (m_BufferSize) RtlZeroMemory(m_Buffer, m_BufferSize);
@@ -450,6 +447,19 @@ NTSTATUS CMiniportWaveCyclicStream::Init(IN ULONG Pin,
         m_Channels = ch;
         m_FrameBytes = (ISIGHTMIC_BITS / 8) * ch;
     }
+    // Allocate the cyclic buffer HERE, at stream creation (MSVAD does the
+    // same).  PortCls does NOT call SetFormat when a pin is created with a
+    // format in the connect block -- SetFormat only runs when the engine later
+    // sends KSPROPERTY_CONNECTION_DATAFORMAT.  A buffer-less stream silently
+    // no-ops in RUN (the timer never starts, Service never fires) and the
+    // port's position handler fails with STATUS_UNSUCCESSFUL, which is exactly
+    // what turned the engine's endpoint build into AUDCLNT_E_ENDPOINT_CREATE_
+    // FAILED even though the pin itself was healthy.
+    NTSTATUS st = AllocateBuffer(WAVE_BUFFER_BYTES, NULL);
+    if (!NT_SUCCESS(st)) return st;
+    m_Buffer = m_DmaBuffer;
+    m_BufferSize = m_DmaSize;
+    RtlZeroMemory(m_Buffer, m_BufferSize);
     return STATUS_SUCCESS;
 }
 
