@@ -317,23 +317,13 @@ static const char* CommName(ULONG c) {
 // thread drives ACQUIRE/PAUSE/RUN around it, exactly like audioses does.
 // ---------------------------------------------------------------------------
 
-// x64 KSSTREAM_HEADER is 64 bytes; define our own mirror so we do not depend
-// on this SDK's exact typedef.
-typedef struct {
-    ULONG  Size;
-    ULONG  TypeSpecificFlags;
-    unsigned __int64 PresTime;
-    unsigned __int64 PresInterval;
-    ULONG  PresSystem;
-    ULONG  _pad;
-    unsigned __int64 Duration;
-    ULONG  FrameExtent;
-    ULONG  DataUsed;
-    PVOID  Data;
-    ULONG  OptionsFlags;
-    ULONG  Reserved2;
-} ISIGHT_STREAM_HEADER;
-typedef char isight_hdr_size_check[(sizeof(ISIGHT_STREAM_HEADER) == 64) ? 1 : -1];
+// Use the SDK's real KSSTREAM_HEADER (miccheck already includes ks.h, and the
+// CI builds with the same Windows SDK).  Verified against SDK 10.0.26100.0:
+// KSTIME is EMBEDDED (16 bytes) and the x64 struct is 56 bytes, Data at
+// offset 40.  Our hand-rolled 64-byte mirror put the fields at wrong offsets,
+// so the kernel read Data from offset 32, got NULL, and rejected the IRP with
+// ERROR_INVALID_USER_BUFFER (1784) -- the wrong-mirror lesson, again.
+typedef char isight_hdr_size_check[(sizeof(KSSTREAM_HEADER) == 56) ? 1 : -1];
 
 #define ISIGHT_2F_BUF   (192000)   // 1 s of 48 kHz stereo 16-bit
 static __declspec(align(64)) unsigned char g_2f_buf[ISIGHT_2F_BUF];
@@ -343,7 +333,7 @@ static DWORD g_2f_submit_err = 0;
 
 static DWORD WINAPI Probe2FSubmit(LPVOID arg) {
     HANDLE ph = (HANDLE)arg;
-    ISIGHT_STREAM_HEADER hdr;
+    KSSTREAM_HEADER hdr;
     ZeroMemory(&hdr, sizeof(hdr));
     hdr.Size        = (ULONG)sizeof(hdr);
     hdr.FrameExtent = ISIGHT_2F_BUF;
