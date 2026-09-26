@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V29-20260926-INITALLOC"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V30-20260926-RUNCHAIN"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -92,6 +92,11 @@ typedef struct _ISIGHTMIC_DIAG {
     unsigned long ClientChannels;        // last requested channels (MatchingDataRange)
     unsigned long ClientSampleRate;      // last requested sample rate
     unsigned long ClientBits;            // last requested bits per sample
+    // --- v30 additions: the RUN -> Service chain ---------------------------
+    unsigned long StateLast;             // g_State when diag was read (0..3)
+    unsigned long DpcFires;              // stream timer DPC actually executed
+    unsigned long NotifyCalls;           // port->Notify(serviceGroup) attempts
+    unsigned long ServiceCalls;          // stream Service() invocations (any kind)
 } ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"

@@ -81,6 +81,15 @@ static ULONG g_FailStreamInit;
 static ULONG g_FailServiceGroup;
 static ULONG g_LastFailStatus;
 
+// v30: RUN -> Service chain counters.  The engine only sees a working endpoint
+// if data flows, and data flows only if the whole chain runs:
+// SetState(RUN) -> KeSetTimerEx -> timer DPC -> port->Notify(serviceGroup)
+// -> IServiceSink::RequestService -> Service().  played=0 with everything
+// green above it used to be undiagnosable; now each hop counts itself.
+static ULONG g_DpcFires;
+static ULONG g_NotifyCalls;
+static ULONG g_ServiceCalls;
+
 // v24 call-trace counters.  Plain ULONGs, incremented from arbitrary threads
 // and read from an IOCTL; a torn read only ever makes the snapshot
 // self-inconsistent, never wrong in a way that changes a diagnosis.
@@ -467,6 +476,7 @@ NTSTATUS CMiniportWaveCyclicStream::Init(IN ULONG Pin,
 // the end.  Whatever the ring cannot supply becomes silence, so the endpoint
 // always runs at real time even when the camera is not streaming.
 void CMiniportWaveCyclicStream::Service() {
+    g_ServiceCalls++;
     if (m_State != KSSTATE_RUN || !m_Buffer || !m_BufferSize || m_FrameBytes == 0) return;
 
     const ULONG frames  = ISIGHTMIC_SAMPLERATE / 100;   // 480 frames per 10 ms tick
@@ -505,8 +515,11 @@ VOID StreamTimerDpc(IN PKDPC Dpc, IN PVOID DeferredContext,
     UNREFERENCED_PARAMETER(SystemArgument2);
     CMiniportWaveCyclicStream* s = (CMiniportWaveCyclicStream*)DeferredContext;
     if (s == NULL) return;
-    if (s->m_Port != NULL && s->m_ServiceGroup != NULL)
+    g_DpcFires++;
+    if (s->m_Port != NULL && s->m_ServiceGroup != NULL) {
+        g_NotifyCalls++;
         s->m_Port->Notify(s->m_ServiceGroup);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1299,10 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
     dg->ClientChannels  = g_ClientChannels;
     dg->ClientSampleRate = g_ClientSampleRate;
     dg->ClientBits      = g_ClientBits;
+    dg->StateLast       = g_State;
+    dg->DpcFires        = g_DpcFires;
+    dg->NotifyCalls     = g_NotifyCalls;
+    dg->ServiceCalls    = g_ServiceCalls;
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;

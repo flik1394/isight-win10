@@ -179,9 +179,12 @@ static void ProbeDiag(const char* when) {
         d.WaveIntersectLastPin, d.WaveIntersectLastOutLen,
         d.WaveIntersectLastStatus, d.WaveIntersectReqSpec);
     say("        NewStream            entered=%u failed=%u"
-        "  [dma=%u init=%u svc=%u last=0x%08X]",
+        "  [dma=%u init=%u svcgrp=%u last=0x%08X]",
         d.NewStreamEntered, d.NewStreamFailed,
         d.FailDma, d.FailStreamInit, d.FailServiceGroup, d.LastFailStatus);
+    say("        RUN chain            state=%u dpc=%u notify=%u service=%u"
+        "  (state: 0=STOP 1=ACQ 2=PAUSE 3=RUN)",
+        d.StateLast, d.DpcFires, d.NotifyCalls, d.ServiceCalls);
 
     if (d.WaveInitCalls == 0)
         say("    -> the audio stack never opened the wave filter.");
