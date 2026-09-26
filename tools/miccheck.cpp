@@ -185,6 +185,9 @@ static void ProbeDiag(const char* when) {
     say("        RUN chain            state=%u dpc=%u notify=%u service=%u"
         "  (state: 0=STOP 1=ACQ 2=PAUSE 3=RUN)",
         d.StateLast, d.DpcFires, d.NotifyCalls, d.ServiceCalls);
+    say("        position path        miniport GetPosition calls=%u last=%u"
+        "  service(full)=%u irps done=%u",
+        d.PosGets, d.PosLast, d.ServiceFull, d.IrpDone);
 
     if (d.WaveInitCalls == 0)
         say("    -> the audio stack never opened the wave filter.");
@@ -331,6 +334,7 @@ static __declspec(align(64)) unsigned char g_2f_buf[ISIGHT_2F_BUF];
 static volatile LONG g_2f_phase = 0;   // 2 = DeviceIoControl returned
 static DWORD g_2f_submit_err = 0;      // variant 1 (in+out buffers)
 static DWORD g_2f_submit_err2 = 0;     // variant 0 (in-only, legacy)
+static DWORD g_2f_got = 0;             // bytes the completed IRP reports
 
 static DWORD WINAPI Probe2FSubmit(LPVOID arg) {
     HANDLE ph = (HANDLE)arg;
@@ -355,6 +359,7 @@ static DWORD WINAPI Probe2FSubmit(LPVOID arg) {
                              NULL, 0, &got2, NULL);
         g_2f_submit_err2 = ok ? 0 : GetLastError();
     }
+    g_2f_got = got2;
     InterlockedExchange(&g_2f_phase, 2);
     return ok ? 0 : 1;
 }
@@ -777,8 +782,9 @@ static void DirectPinProbe(void) {
                 CloseHandle(ph3);          // cancels the worker's pending IRP
                 if (th) WaitForSingleObject(th, 3000);
                 if (th) CloseHandle(th);
-                say("    [2f] worker exited (in+out err=%u, in-only err=%u)",
-                    g_2f_submit_err, g_2f_submit_err2);
+                say("    [2f] worker exited (in+out err=%u, in-only err=%u,"
+                    " completed bytes=%u)",
+                    g_2f_submit_err, g_2f_submit_err2, g_2f_got);
             }
         }
     } else {

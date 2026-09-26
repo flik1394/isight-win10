@@ -89,6 +89,10 @@ static ULONG g_LastFailStatus;
 static ULONG g_DpcFires;
 static ULONG g_NotifyCalls;
 static ULONG g_ServiceCalls;
+static ULONG g_ServiceFull;   // Service() passes that actually ran past the early-out
+static ULONG g_PosGets;       // miniport GetPosition invocations
+static ULONG g_PosLast;       // value the last GetPosition returned
+static ULONG g_IrpDone;       // stream IRPs the port completed for our streams
 
 // v24 call-trace counters.  Plain ULONGs, incremented from arbitrary threads
 // and read from an IOCTL; a torn read only ever makes the snapshot
@@ -302,6 +306,11 @@ STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::Release() {
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::GetPosition(OUT PULONG Position) {
     if (!Position) return STATUS_INVALID_PARAMETER;
     *Position = m_Position;
+    // v33: does the port ever ask us?  played advances (= Service runs and
+    // m_Position moves), yet KSPROPERTY_AUDIO_POSITION returns 0 -- either
+    // the port never reaches this method or it discards the value.
+    g_PosGets++;
+    g_PosLast = m_Position;
     return STATUS_SUCCESS;
 }
 
@@ -485,6 +494,7 @@ NTSTATUS CMiniportWaveCyclicStream::Init(IN ULONG Pin,
 void CMiniportWaveCyclicStream::Service() {
     g_ServiceCalls++;
     if (m_State != KSSTATE_RUN || !m_Buffer || !m_BufferSize || m_FrameBytes == 0) return;
+    g_ServiceFull++;
 
     const ULONG frames  = ISIGHTMIC_SAMPLERATE / 100;   // 480 frames per 10 ms tick
     const ULONG fb      = m_FrameBytes;                 // 2 (mono) or 4 (stereo)
@@ -1355,6 +1365,10 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
     dg->DpcFires        = g_DpcFires;
     dg->NotifyCalls     = g_NotifyCalls;
     dg->ServiceCalls    = g_ServiceCalls;
+    dg->PosGets         = g_PosGets;
+    dg->PosLast         = g_PosLast;
+    dg->ServiceFull     = g_ServiceFull;
+    dg->IrpDone         = g_IrpDone;
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
