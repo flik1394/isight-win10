@@ -412,9 +412,16 @@ STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::SetNotificationFreq(IN ULONG Int
                                                                    OUT PULONG FrameSize) {
     ULONG previous = m_NotificationInterval;
     m_NotificationInterval = Interval;
-    // We service on a fixed 10 ms timer; report the frame size in bytes for the
-    // channel count we are actually running.
-    if (FrameSize) *FrameSize = m_FrameBytes ? m_FrameBytes : (ISIGHTMIC_BITS / 8);
+    // The port uses this as (a) the max bytes it moves per service pass and
+    // (b) the allocator framing FrameSize the engine sizes its queued buffer
+    // with.  MSVAD reports BufferSize/Interval so one chunk equals one
+    // notification quantum; reporting a single frame (4 bytes) made the port
+    // copy 4 bytes per 10 ms, the engine saw a frozen position and tore every
+    // pin down (AUDCLNT_E_ENDPOINT_CREATE_FAILED).
+    if (FrameSize) {
+        ULONG bs = m_DmaSize ? m_DmaSize : WAVE_BUFFER_BYTES;
+        *FrameSize = Interval ? (bs / Interval) : bs;
+    }
     return previous;
 }
 
