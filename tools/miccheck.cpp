@@ -707,24 +707,45 @@ static void DirectPinProbe(void) {
             if (rc3 != 0) {
                 say("    [2f] create LOOPED pin: FAIL rc=0x%08X", (DWORD)rc3);
             } else {
-                HANDLE th = CreateThread(NULL, 0, Probe2FSubmit, ph3, 0, NULL);
-                Sleep(300);
-                say("    [2f] read IRP submit: %s (err=%u)",
-                    g_2f_phase >= 2 ? "returned immediately" : "pending in flight",
-                    g_2f_phase >= 2 ? g_2f_submit_err : 0);
-
                 KSPROPERTY gpos3;
                 ZeroMemory(&gpos3, sizeof(gpos3));
                 gpos3.Set   = KSPROPSETID_Audio;
                 gpos3.Id    = KSPROPERTY_AUDIO_POSITION;
                 gpos3.Flags = KSPROPERTY_TYPE_GET;
-                for (ULONG st3 = 1; st3 <= 3; st3++) {
+                for (ULONG st3 = 1; st3 <= 2; st3++) {
                     ULONG val3 = st3;
                     BOOL ok3 = DeviceIoControl(ph3, IOCTL_KS_PROPERTY, &cprop,
                                                sizeof(cprop), &val3,
                                                sizeof(val3), &got, NULL);
                     say("    [2f] set state %s: %s (err=%u)", names[st3],
                         ok3 ? "OK" : "FAIL", ok3 ? 0 : GetLastError());
+                }
+                // Queue the buffer at PAUSE (the engine's order).  A STOP-state
+                // submission came back ERROR_BAD_COMMAND (22) -- portcls only
+                // accepts stream IRPs once the pin is at least in PAUSE.
+                HANDLE th = CreateThread(NULL, 0, Probe2FSubmit, ph3, 0, NULL);
+                Sleep(300);
+                say("    [2f] read IRP submit @PAUSE: %s (err=%u)",
+                    g_2f_phase >= 2 ? "returned immediately" : "pending in flight",
+                    g_2f_phase >= 2 ? g_2f_submit_err : 0);
+
+                ULONG valr = 3;   // KSSTATE_RUN
+                BOOL okr = DeviceIoControl(ph3, IOCTL_KS_PROPERTY, &cprop,
+                                           sizeof(cprop), &valr, sizeof(valr),
+                                           &got, NULL);
+                say("    [2f] set state RUN: %s (err=%u)",
+                    okr ? "OK" : "FAIL", okr ? 0 : GetLastError());
+                if (g_2f_phase >= 2 && g_2f_submit_err != 0 && th) {
+                    // rejected at PAUSE: retry once, now that the pin RUNs
+                    InterlockedExchange(&g_2f_phase, 0);
+                    HANDLE th2 = CreateThread(NULL, 0, Probe2FSubmit, ph3,
+                                              0, NULL);
+                    if (th2) CloseHandle(th2);
+                    Sleep(300);
+                    say("    [2f] read IRP submit retry @RUN: %s (err=%u)",
+                        g_2f_phase >= 2 ? "returned immediately"
+                                        : "pending in flight",
+                        g_2f_phase >= 2 ? g_2f_submit_err : 0);
                 }
                 unsigned __int64 prev = 0;
                 int moved = 0;
