@@ -703,13 +703,58 @@ static PCPIN_DESCRIPTOR WavePins[] = {
     }
 };
 
+// ---- V31: channel-config automation ---------------------------------------
+// wdmaud/audioses computes the endpoint mix format by asking the topology for
+// KSPROPERTY_AUDIO_CHANNEL_CONFIG.  Every node/filter below had a NULL
+// AutomationTable, so that query answered STATUS_NOT_FOUND (1168) and the
+// engine bailed out before ever creating a pin (the 0x88890008 wall).
+static ULONG g_ChannelConfig = 0x3;   // KSAUDIO_SPEAKER_STEREO (FL|FR)
+
+static NTSTATUS PropertyHandlerChannelConfig(IN PPCPROPERTY_REQUEST PropertyRequest) {
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (PropertyRequest->ValueSize < sizeof(ULONG))
+            return STATUS_BUFFER_TOO_SMALL;
+        *(PULONG)PropertyRequest->Value =
+            KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT;
+        PropertyRequest->ValueLength = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_GET) {
+        if (PropertyRequest->ValueSize < sizeof(ULONG))
+            return STATUS_BUFFER_TOO_SMALL;
+        *(PULONG)PropertyRequest->Value = g_ChannelConfig;
+        PropertyRequest->ValueLength = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_SET) {
+        if (PropertyRequest->ValueSize < sizeof(ULONG))
+            return STATUS_BUFFER_TOO_SMALL;
+        g_ChannelConfig = *(PULONG)PropertyRequest->Value;
+        PropertyRequest->ValueLength = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    return STATUS_NOT_SUPPORTED;
+}
+
+static const PCPROPERTY_ITEM ChannelConfigProperties[] = {
+    {
+        &KSPROPSETID_Audio,
+        KSPROPERTY_AUDIO_CHANNEL_CONFIG,
+        PCPROPERTY_ITEM_FLAG_GET | PCPROPERTY_ITEM_FLAG_SET |
+            PCPROPERTY_ITEM_FLAG_BASICSUPPORT,
+        PropertyHandlerChannelConfig
+    }
+};
+DEFINE_PCAUTOMATION_TABLE_PROP(ChannelConfigAutomation, ChannelConfigProperties);
+
 // The ADC between the bridge and the streaming pin -- the reference capture
 // filter has one, and it is the node wdmaudio expects to see on the capture
-// path.  No automation table: this device has no volume/mute control.
+// path.  It serves the channel-config property (V31); there is still no
+// volume/mute control.
 static PCNODE_DESCRIPTOR WaveNodes[] = {
     {
         0,                      // Flags
-        NULL,                   // AutomationTable
+        &ChannelConfigAutomation,   // AutomationTable
         &KSNODETYPE_ADC,        // Type
         NULL                    // Name
     }
@@ -991,7 +1036,7 @@ static PCPIN_DESCRIPTOR TopologyPins[] = {
 static PCNODE_DESCRIPTOR TopologyNodes[] = {
     {
         0,                          // Flags
-        NULL,                       // AutomationTable (no volume/mute node)
+        &ChannelConfigAutomation,   // AutomationTable: serves CHANNEL_CONFIG (V31)
         &KSNODETYPE_MICROPHONE,     // Type
         NULL                        // Name
     }
