@@ -716,21 +716,21 @@ static NTSTATUS PropertyHandlerChannelConfig(IN PPCPROPERTY_REQUEST PropertyRequ
             return STATUS_BUFFER_TOO_SMALL;
         *(PULONG)PropertyRequest->Value =
             KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT;
-        PropertyRequest->ValueLength = sizeof(ULONG);
+        PropertyRequest->Irp->IoStatus.Information = sizeof(ULONG);
         return STATUS_SUCCESS;
     }
     if (PropertyRequest->Verb & KSPROPERTY_TYPE_GET) {
         if (PropertyRequest->ValueSize < sizeof(ULONG))
             return STATUS_BUFFER_TOO_SMALL;
         *(PULONG)PropertyRequest->Value = g_ChannelConfig;
-        PropertyRequest->ValueLength = sizeof(ULONG);
+        PropertyRequest->Irp->IoStatus.Information = sizeof(ULONG);
         return STATUS_SUCCESS;
     }
     if (PropertyRequest->Verb & KSPROPERTY_TYPE_SET) {
         if (PropertyRequest->ValueSize < sizeof(ULONG))
             return STATUS_BUFFER_TOO_SMALL;
         g_ChannelConfig = *(PULONG)PropertyRequest->Value;
-        PropertyRequest->ValueLength = sizeof(ULONG);
+        PropertyRequest->Irp->IoStatus.Information = sizeof(ULONG);
         return STATUS_SUCCESS;
     }
     return STATUS_NOT_SUPPORTED;
