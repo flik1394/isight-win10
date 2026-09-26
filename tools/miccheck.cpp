@@ -177,6 +177,42 @@ static void PrintDiagDelta(const char* tag,
     // 0 every tick -> ring-arithmetic problem instead.
 }
 
+// Decode the driver's per-stream event journal (the engine's own trace).
+static void PrintJournal(const ISIGHTMIC_DIAG* d) {
+    ULONG head = d->JHead;
+    ULONG n = head < 32 ? head : 32;
+    say("    event journal (last %u of %u):", n, head);
+    for (ULONG k = n; k > 0; k--) {
+        ULONG idx = (head - k) % 32;
+        ULONG id  = d->Journal[idx * 4 + 0];
+        ULONG a   = d->Journal[idx * 4 + 1];
+        ULONG b   = d->Journal[idx * 4 + 2];
+        ULONG c   = d->Journal[idx * 4 + 3];
+        switch (id) {
+        case ISIGHT_J_NEWSTREAM:
+            say("      #%-3u NEWSTREAM   ch=%lu rate=%lu bits=%lu",
+                head - k, a, b, c); break;
+        case ISIGHT_J_SETFORMAT:
+            say("      #%-3u SETFORMAT    ch=%lu rate=%lu bits=%lu",
+                head - k, a, b, c); break;
+        case ISIGHT_J_SETSTATE:
+            say("      #%-3u SETSTATE    state=%lu (seq=%lu)",
+                head - k, a, b); break;
+        case ISIGHT_J_NOTIFREQ:
+            say("      #%-3u NOTIFREQ    interval=%lu frameSize=%lu (seq=%lu)",
+                head - k, a, b, c); break;
+        case ISIGHT_J_CLOSE:
+            say("      #%-3u CLOSE       seq=%lu ch=%lu state=%lu",
+                head - k, a, b, c); break;
+        case ISIGHT_J_INTERSECT:
+            say("      #%-3u INTERSECT   ch=%lu rate=%lu bits=%lu",
+                head - k, a, b, c); break;
+        default:
+            say("      #%-3u id=%lu a=%lu b=%lu c=%lu", head - k, id, a, b, c);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The driver-side call trace
 //
@@ -240,6 +276,8 @@ static void ProbeDiag(const char* when) {
         say("    -> the pin was instantiated and NewStream failed inside the driver.");
     else
         say("    -> a capture stream was created successfully.");
+    if (strcmp(when, "after") == 0)
+        PrintJournal(&d);
 }
 
 static void ProbeDriver(StatusProbe* p, int seconds) {
@@ -855,9 +893,10 @@ static void DirectPinProbe(void) {
                         ? "PORT COPIES DATA -- driver path proven end to end"
                         : "STILL FROZEN even with a buffer queued");
 
-                if (haveD0 && ReadDiagCtl(&d1))
+                if (haveD0 && ReadDiagCtl(&d1)) {
                     PrintDiagDelta("this pin's RUN window", &d0, &d1);
-                else
+                    PrintJournal(&d1);
+                } else
                     say("    [2f] diag delta: unavailable");
 
                 ULONG val0 = 0;   // KSSTATE_STOP

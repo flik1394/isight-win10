@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V38-20260926-SILDISC"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V39-20260926-JOURNAL"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -124,7 +124,23 @@ typedef struct _ISIGHTMIC_DIAG {
     unsigned long SilenceCalls;          // IMiniportWaveCyclicStream::Silence calls
     unsigned long PosLinear;             // raw m_Position at the last GetPosition
     unsigned long PosBufSize;            // m_BufferSize at the last GetPosition
+    // --- v39 additions: per-stream EVENT JOURNAL ---------------------------
+    // The last 32 driver-side stream events, {id, a, b, c} quadruples.  This
+    // is the engine's own trace: what format it created pins with, which
+    // state transitions it made, and where it stopped -- visible from inside
+    // the only component that sees everything (our miniport).
+    unsigned long JHead;                 // total events logged (wraps)
+    unsigned long Journal[32 * 4];       // {id, a, b, c} x 32
 } ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
+
+// journal event ids (Journal[i*4+0])
+#define ISIGHT_J_NEWSTREAM   1   // a=ch b=rate c=bits, stream seq allocated
+#define ISIGHT_J_SETFORMAT   2   // a=ch b=rate c=bits
+#define ISIGHT_J_SETSTATE    3   // a=state
+#define ISIGHT_J_NOTIFREQ    4   // a=interval b=frameSize
+#define ISIGHT_J_CLOSE       5   // a=stream seq
+#define ISIGHT_J_INTERSECT   6   // a=ch b=rate c=bits (status in c's entry: use d)
+#define ISIGHT_J_GETPOS      7   // a=ring position (throttled: every 16th)
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"
 #define ISIGHTMIC_CTL_DOS_NAME     L"\\DosDevices\\IsightMicCtl"

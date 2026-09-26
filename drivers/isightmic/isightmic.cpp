@@ -95,6 +95,19 @@ static ULONG g_PosLast;       // value the last GetPosition returned
 static ULONG g_SilenceCalls;  // Silence() calls = GetMapping failed in the port
 static ULONG g_PosLinear;     // raw m_Position at the last GetPosition
 static ULONG g_PosBufSize;    // m_BufferSize at the last GetPosition
+
+// --- v39: per-stream event journal (the engine's own trace) ----------------
+#define ISIGHT_J_DEPTH 32
+static ULONG g_JHead;                          // total events (mod depth stored)
+static ULONG g_StreamSeq;                      // last assigned stream number
+static VOID JLog(ULONG id, ULONG a, ULONG b, ULONG c) {
+    ULONG slot = g_JHead++ % ISIGHT_J_DEPTH;
+    g_Journal[slot * 4 + 0] = id;
+    g_Journal[slot * 4 + 1] = a;
+    g_Journal[slot * 4 + 2] = b;
+    g_Journal[slot * 4 + 3] = c;
+}
+static ULONG g_Journal[ISIGHT_J_DEPTH * 4];
 static ULONG g_IrpDone;       // stream IRPs the port completed for our streams
 static ULONG g_ReqSvc;        // IServiceGroup::RequestService calls (the real wakeup)
 // v34: which IDmaChannel methods does PortCls actually call while RUN?  This is
@@ -253,6 +266,7 @@ public:
     PVOID                  m_Buffer;
     ULONG                  m_BufferSize;
     ULONG                  m_Position;
+    ULONG                  m_Seq;            // v39: journal stream number
     ULONG                  m_NotificationInterval;
     ULONG                  m_Channels;       // negotiated channel count (1 or 2)
     ULONG                  m_FrameBytes;     // bytes per frame (channels * 2)
@@ -265,8 +279,7 @@ protected:
     LONG m_RefCount;
 };
 
-CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {
-    UNREFERENCED_PARAMETER(outer);
+CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {    UNREFERENCED_PARAMETER(outer);
     m_Port = NULL;
     m_ServiceGroup = NULL;
     m_DmaBuffer = NULL;
@@ -275,6 +288,7 @@ CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {
     m_Buffer = NULL;
     m_BufferSize = 0;
     m_Position = 0;
+    m_Seq = 0;
     m_NotificationInterval = 0;
     m_Channels = 1;
     m_FrameBytes = ISIGHTMIC_BITS / 8;
@@ -286,6 +300,7 @@ CMiniportWaveCyclicStream::CMiniportWaveCyclicStream(PUNKNOWN outer) {
 }
 
 CMiniportWaveCyclicStream::~CMiniportWaveCyclicStream() {
+    JLog(ISIGHT_J_CLOSE, m_Seq, m_Channels, m_State);
     if (m_TimerOn) { KeCancelTimer(&m_Timer); m_TimerOn = FALSE; }
     FreeBuffer();
     if (m_ServiceGroup) { m_ServiceGroup->Release(); m_ServiceGroup = NULL; }
@@ -347,6 +362,17 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::NormalizePhysicalPosition(IN 
 
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(IN PKSDATAFORMAT DataFormat) {
     UNREFERENCED_PARAMETER(DataFormat);
+    // v39: journal it -- does the port ever call SetFormat, and with what?
+    {
+        ULONG ch = 0, rate = 0, bits = 0;
+        if (DataFormat && DataFormat->FormatSize >= sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
+            PKSDATAFORMAT_WAVEFORMATEX wf = (PKSDATAFORMAT_WAVEFORMATEX)DataFormat;
+            ch   = wf->WaveFormatEx.nChannels;
+            rate = wf->WaveFormatEx.nSamplesPerSec;
+            bits = wf->WaveFormatEx.wBitsPerSample;
+        }
+        JLog(ISIGHT_J_SETFORMAT, ch, rate, bits);
+    }
     // The buffer is allocated in Init (at creation); this call just re-zeroes
     // it for the format the port has settled on.
     m_Buffer = m_DmaBuffer;
@@ -463,6 +489,7 @@ STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::SetNotificationFreq(IN ULONG Int
         ULONG bs = m_DmaSize ? m_DmaSize : WAVE_BUFFER_BYTES;
         *FrameSize = Interval ? (bs / Interval) : bs;
     }
+    JLog(ISIGHT_J_NOTIFREQ, Interval, FrameSize ? *FrameSize : 0, m_Seq);
     return previous;
 }
 
@@ -474,6 +501,7 @@ STDMETHODIMP_(void) CMiniportWaveCyclicStream::Silence(IN PVOID Buffer, IN ULONG
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetState(IN KSSTATE State) {
     m_State = State;
     g_State = (ULONG)State;
+    JLog(ISIGHT_J_SETSTATE, (ULONG)State, m_Seq, 0);
     if (State == KSSTATE_RUN) {
         if (!m_TimerOn && m_Buffer && m_BufferSize) {
             LARGE_INTEGER due;
@@ -944,6 +972,18 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::NewStream(OUT PMINIPORTWAVECYCLICST
 
     *Stream = (PMINIPORTWAVECYCLICSTREAM)s;
     (*Stream)->AddRef();
+    // v39: journal this stream (the engine's own trace)
+    {
+        s->m_Seq = ++g_StreamSeq;
+        ULONG ch = 0, rate = 0, bits = 0;
+        if (DataFormat && DataFormat->FormatSize >= sizeof(KSDATAFORMAT_WAVEFORMATEX)) {
+            PKSDATAFORMAT_WAVEFORMATEX wf = (PKSDATAFORMAT_WAVEFORMATEX)DataFormat;
+            ch   = wf->WaveFormatEx.nChannels;
+            rate = wf->WaveFormatEx.nSamplesPerSec;
+            bits = wf->WaveFormatEx.wBitsPerSample;
+        }
+        JLog(ISIGHT_J_NEWSTREAM, ch, rate, bits);
+    }
     // The stream is its own DMA channel (MSVAD style) -- see the class comment.
     *DmaChannel = (PDMACHANNEL)(IDmaChannel*)s;
     (*DmaChannel)->AddRef();
@@ -997,6 +1037,8 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
 
     if (OutputBufferLength < sizeof(KSDATAFORMAT_WAVEFORMATEX) || !ResultantFormat) {
         g_WaveIntersectLastStatus = STATUS_NOT_IMPLEMENTED;
+        JLog(ISIGHT_J_INTERSECT, g_ClientChannels, g_ClientSampleRate,
+             g_ClientBits);
         return STATUS_NOT_IMPLEMENTED;
     }
     g_WaveIntersectPhase2++;
@@ -1028,6 +1070,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
     fmt->WaveFormatEx.nAvgBytesPerSec = ISIGHTMIC_SAMPLERATE * (ISIGHTMIC_BITS / 8 * channels);
     if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
     g_WaveIntersectLastStatus = STATUS_SUCCESS;
+    JLog(ISIGHT_J_INTERSECT, channels, ISIGHTMIC_SAMPLERATE, ISIGHTMIC_BITS);
     return STATUS_SUCCESS;
 }
 
@@ -1429,6 +1472,9 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
     dg->SilenceCalls    = g_SilenceCalls;
     dg->PosLinear       = g_PosLinear;
     dg->PosBufSize      = g_PosBufSize;
+    dg->JHead           = g_JHead;
+    for (int ji = 0; ji < ISIGHT_J_DEPTH * 4; ji++)
+        dg->Journal[ji] = g_Journal[ji];
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
