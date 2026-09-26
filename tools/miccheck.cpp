@@ -545,6 +545,45 @@ static void DirectPinProbe(void) {
                         &stopval, sizeof(stopval), &got, NULL);
         Sleep(150);
         CloseHandle(ph);
+
+        // ---- [2d] what the audio engine actually does -------------------
+        // The engine opens WaveCyclic capture pins with the LOOPED_STREAMING
+        // interface (Id 1), not STREAMING (Id 0).  Our pin descriptor's
+        // interface list is 0/NULL -- if that means "default (Id 0) only",
+        // the engine's connect is rejected before the miniport ever sees it,
+        // which matches "16 intersections, zero pin creations" exactly.
+        conn.Interface.Id   = 1;    // KSINTERFACE_STANDARD_LOOPED_STREAMING
+        CopyMemory(buf, &conn, sizeof(conn));
+        HANDLE ph2 = NULL;
+        LONG rc2 = pKsCreatePin(f, (PKSPIN_CONNECT)buf, GENERIC_READ, &ph2);
+        if (rc2 == 0) {
+            say("    [2d] KsCreatePin LOOPED_STREAMING (Id=1): SUCCESS");
+            // node-targeted channel config -- what mix-format discovery asks
+            KSP_NODE ksnode; ZeroMemory(&ksnode, sizeof(ksnode));
+            ksnode.Property.Set   = KSPROPSETID_Audio;
+            ksnode.Property.Id    = KSPROPERTY_AUDIO_CHANNEL_CONFIG;
+            ksnode.Property.Flags = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_TOPOLOGY;
+            ksnode.NodeId         = 0;   // the ADC node
+            ULONG mask = 0;
+            BOOL okc = DeviceIoControl(ph2, IOCTL_KS_PROPERTY, &ksnode,
+                                       sizeof(ksnode), &mask, sizeof(mask),
+                                       &got, NULL);
+            say("    [2d] node channel config: %s mask=0x%lX (err=%u)",
+                okc ? "OK" : "FAIL", okc ? mask : 0, okc ? 0 : GetLastError());
+            stopval = 0;
+            DeviceIoControl(ph2, IOCTL_KS_PROPERTY, &cprop, sizeof(cprop),
+                            &stopval, sizeof(stopval), &got, NULL);
+            Sleep(100);
+            CloseHandle(ph2);
+        } else {
+            say("    [2d] KsCreatePin LOOPED_STREAMING (Id=1): FAILED rc=0x%08X / %u",
+                (DWORD)rc2, (DWORD)rc2);
+            if (rc2 == 0xC000005B || (DWORD)rc2 == 0x80070057 || (DWORD)rc2 == 87)
+                say("    -> Id=1 rejected while Id=0 works: the pin descriptor's");
+            else
+                say("    -> ");
+            say("       NULL interface list is the wall; V32 must advertise both.");
+        }
     } else {
         DWORD e = (DWORD)rc;
         say("    KsCreatePin FAILED (rc=0x%08X / %u)", e, e);
