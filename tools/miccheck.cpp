@@ -950,10 +950,11 @@ static HANDLE CreateCapturePinAny(HANDLE f, ULONG pinId, int* usedFmt) {
     if (!ksuser) ksuser = LoadLibraryW(L"ksuser.dll");
     if (ksuser) pKsCreatePin = (PFN_KsCreatePin)GetProcAddress(ksuser, "KsCreatePin");
     if (!pKsCreatePin) return NULL;
-    static const struct { ULONG ch, rate; } fmts[4] = {
-        { 1, 48000 }, { 2, 48000 }, { 1, 44100 }, { 2, 44100 }
+    static const struct { ULONG ch, rate; } fmts[6] = {
+        { 1, 48000 }, { 2, 48000 }, { 1, 44100 },
+        { 2, 44100 }, { 1, 16000 }, { 1, 8000 }   // Bluetooth HFP (mSBC)
     };
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         BYTE buf[sizeof(KSPIN_CONNECT) + sizeof(KSDATAFORMAT_WAVEFORMATEX)];
         ZeroMemory(buf, sizeof(buf));
         KSPIN_CONNECT* pc = (KSPIN_CONNECT*)buf;
@@ -1005,8 +1006,8 @@ static void BatteryOne(const WCHAR* path, const char* tag) {
         CloseHandle(f);
         return;
     }
-    static const ULONG fmtCh[4]  = { 1, 2, 1, 2 };
-    static const ULONG fmtRate[4] = { 48000, 48000, 44100, 44100 };
+    static const ULONG fmtCh[6]  = { 1, 2, 1, 2, 1, 1 };
+    static const ULONG fmtRate[6] = { 48000, 48000, 44100, 44100, 16000, 8000 };
     say("    [%s] pin%u created (%uch %uHz), battery:", tag, pinId,
         fmtCh[used], fmtRate[used]);
 
@@ -1072,19 +1073,24 @@ static void BatteryOne(const WCHAR* path, const char* tag) {
 
 static void DiffProbe(void) {
     say("[2g] differential probe vs a working capture filter");
-    HDEVINFO set = SetupDiGetClassDevsW(&KSCATEGORY_AUDIO, NULL, NULL,
-                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (set == INVALID_HANDLE_VALUE) {
-        say("    SetupDi failed (err=%u)", GetLastError());
-        return;
-    }
+    // wave filters register under KSCATEGORY_AUDIO and/or KSCATEGORY_CAPTURE;
+    // enumerate both so Realtek-style capture filters are not missed
+    static const GUID catList[2] = {
+        KSCATEGORY_AUDIO,
+        { 0x65E8773D, 0x8F56, 0x11D0,
+          { 0xA3, 0xB9, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96 } }  // KSCATEGORY_CAPTURE
+    };
     WCHAR ourPath[1024] = L"";
-    static WCHAR refList[8][1024];
+    static WCHAR refList[16][1024];
     int refCount = 0;
+    for (int catIdx = 0; catIdx < 2; catIdx++) {
+    HDEVINFO set = SetupDiGetClassDevsW(&catList[catIdx], NULL, NULL,
+                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) continue;
     for (DWORD i = 0; i < 96; i++) {
         SP_DEVICE_INTERFACE_DATA di;
         di.cbSize = sizeof(di);
-        if (!SetupDiEnumDeviceInterfaces(set, NULL, &KSCATEGORY_AUDIO, i, &di))
+        if (!SetupDiEnumDeviceInterfaces(set, NULL, &catList[catIdx], i, &di))
             break;
         DWORD need = 0;
         SetupDiGetDeviceInterfaceDetailW(set, &di, NULL, 0, &need, NULL);
@@ -1105,7 +1111,7 @@ static void DiffProbe(void) {
                     // a capture (OUT/SINK) streaming pin becomes the reference
                     // (many wave filters belong to RENDER devices, whose
                     // streaming pin is DATAFLOW_IN -- e.g. the speakers).
-                    if (refCount < 8)
+                    if (refCount < 16)
                         wcsncpy_s(refList[refCount++], dd->DevicePath,
                                   _TRUNCATE);
                 }
@@ -1114,6 +1120,7 @@ static void DiffProbe(void) {
         free(b);
     }
     SetupDiDestroyDeviceInfoList(set);
+    }  // catIdx loop
     if (!ourPath[0] || !refCount) {
         say("    need ours + a capture reference \\wave filter (ours=%d refs=%d)",
             ourPath[0] ? 1 : 0, refCount);
