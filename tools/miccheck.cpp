@@ -1118,8 +1118,40 @@ static void DiffProbe(void) {
         HANDLE f = CreateFileW(refList[i], GENERIC_READ | GENERIC_WRITE, 0,
                                NULL, OPEN_EXISTING, 0, NULL);
         if (f == INVALID_HANDLE_VALUE) continue;
-        ULONG pid = 0;
-        if (FindStreamingCapturePin(f, &pid)) refPath = refList[i];
+        ULONG ctypes = 0; DWORD g0 = 0;
+        char ansi[1024];
+        WideCharToMultiByte(CP_ACP, 0, refList[i], -1, ansi, sizeof(ansi),
+                            NULL, NULL);
+        if (!KsPinGet(f, 0, KSPROPERTY_PIN_CTYPES, &ctypes, sizeof(ctypes), &g0)) {
+            say("    cand %d: %s -- CTYPES failed (err=%u)", i, ansi,
+                GetLastError());
+        } else {
+            say("    cand %d: %s -- %u pins:", i, ansi, ctypes);
+            for (ULONG id = 0; id < ctypes && id < 8; id++) {
+                ULONG df = 0, comm = 0, catGot = 0;
+                DWORD g1 = 0, g2 = 0;
+                bool okDf = KsPinGet(f, id, KSPROPERTY_PIN_DATAFLOW, &df,
+                                     sizeof(df), &g1);
+                bool okCm = KsPinGet(f, id, KSPROPERTY_PIN_COMMUNICATION,
+                                     &comm, sizeof(comm), &g2);
+                GUID cat; bool okCat = KsPinGet(f, id, KSPROPERTY_PIN_CATEGORY,
+                                                &cat, sizeof(cat), &catGot);
+                char catS[64] = "?";
+                if (okCat) {
+                    if (cat.Data1 == 0xFB6C4281) strcpy_s(catS, "CAPTURE");
+                    else if (cat.Data1 == 0x6994AD04) strcpy_s(catS, "AUDIO");
+                    else strcpy_s(catS, "other");
+                }
+                say("      pin %u: df=%s comm=%s cat=%s", id,
+                    okDf ? FlowName(df) : "ERR",
+                    okCm ? CommName(comm) : "ERR", catS);
+                if (okDf && okCm && df == KSPIN_DATAFLOW_OUT &&
+                    comm == KSPIN_COMMUNICATION_SINK && !refPath) {
+                    // capture streaming pin found: remember this candidate
+                    refPath = refList[i];
+                }
+            }
+        }
         CloseHandle(f);
     }
     if (!refPath) {
