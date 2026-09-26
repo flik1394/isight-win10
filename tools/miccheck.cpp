@@ -491,41 +491,42 @@ static void DirectPinProbe(void) {
         gprop.Set   = KSPROPSETID_Audio;
         gprop.Flags = KSPROPERTY_TYPE_GET;
 
-        KSAUDIO_POSITION pos; ZeroMemory(&pos, sizeof(pos));
+        // KSAUDIO_POSITION / KSAUDIO_CHANNEL_CONFIG member names differ between
+        // SDK versions (C2039/C2440 in run 36208095723), so read raw 64-bit
+        // words: position is two ULONGLONGs (byte pos + 100ns pos), latency a
+        // single value, channel config a bitmask.
+        unsigned __int64 posBuf[2]; ZeroMemory(posBuf, sizeof(posBuf));
         gprop.Id = KSPROPERTY_AUDIO_POSITION;
         BOOL ok1 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
-                                   &pos, sizeof(pos), &got, NULL);
+                                   posBuf, sizeof(posBuf), &got, NULL);
         say("    [2c] get position: %s pos=%llu qs=%llu (err=%u)",
-            ok1 ? "OK" : "FAIL", ok1 ? (unsigned long long)pos.Position : 0,
-            ok1 ? (unsigned long long)pos.QsPosition : 0,
+            ok1 ? "OK" : "FAIL", ok1 ? posBuf[0] : 0, ok1 ? posBuf[1] : 0,
             ok1 ? 0 : GetLastError());
 
         gprop.Id = KSPROPERTY_AUDIO_LATENCY;
-        ULONGLONG lat = 0;
+        unsigned __int64 lat = 0;
         BOOL ok2 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
                                    &lat, sizeof(lat), &got, NULL);
         say("    [2c] get latency: %s value=%llu (err=%u)",
-            ok2 ? "OK" : "FAIL", ok2 ? (unsigned long long)lat : 0,
-            ok2 ? 0 : GetLastError());
+            ok2 ? "OK" : "FAIL", ok2 ? lat : 0, ok2 ? 0 : GetLastError());
 
+        unsigned __int64 cc = 0;
         gprop.Id = KSPROPERTY_AUDIO_CHANNEL_CONFIG;
-        KSAUDIO_CHANNEL_CONFIG cc; ZeroMemory(&cc, sizeof(cc));
         BOOL ok3 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
                                    &cc, sizeof(cc), &got, NULL);
         say("    [2c] get channel config: %s mask=0x%llX (err=%u)",
-            ok3 ? "OK" : "FAIL", ok3 ? (unsigned long long)cc : 0,
-            ok3 ? 0 : GetLastError());
+            ok3 ? "OK" : "FAIL", ok3 ? cc : 0, ok3 ? 0 : GetLastError());
 
         if (ok1) {
             Sleep(300);
-            KSAUDIO_POSITION pos2; ZeroMemory(&pos2, sizeof(pos2));
+            unsigned __int64 pos2[2]; ZeroMemory(pos2, sizeof(pos2));
             gprop.Id = KSPROPERTY_AUDIO_POSITION;
             BOOL ok4 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop,
-                                       sizeof(gprop), &pos2, sizeof(pos2),
+                                       sizeof(gprop), pos2, sizeof(pos2),
                                        &got, NULL);
             say("    [2c] position after 300 ms: %s pos=%llu (advanced=%s, err=%u)",
-                ok4 ? "OK" : "FAIL", ok4 ? (unsigned long long)pos2.Position : 0,
-                (ok4 && pos2.Position != pos.Position) ? "yes" : "NO",
+                ok4 ? "OK" : "FAIL", ok4 ? pos2[0] : 0,
+                (ok4 && pos2[0] != posBuf[0]) ? "yes" : "NO",
                 ok4 ? 0 : GetLastError());
         }
 
