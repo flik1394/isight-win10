@@ -306,6 +306,56 @@ static const char* CommName(ULONG c) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// [2f] the engine-faithful probe.  A bare RUN never advances the port's
+// PlayOffset: ReactOS pinwc.cpp shows UpdateCommonBuffer only moves the
+// position while IrpQueue::GetMapping() succeeds, i.e. only when the client
+// has queued a stream buffer (IOCTL_KS_READ_STREAM).  The audio engine always
+// queues its cyclic buffer before RUN -- so a position that stays flat even
+// with a buffer queued is the real remaining wall.  The IRP submission may
+// block on a synchronous pin handle, so it runs in a worker thread; the main
+// thread drives ACQUIRE/PAUSE/RUN around it, exactly like audioses does.
+// ---------------------------------------------------------------------------
+
+// x64 KSSTREAM_HEADER is 64 bytes; define our own mirror so we do not depend
+// on this SDK's exact typedef.
+typedef struct {
+    ULONG  Size;
+    ULONG  TypeSpecificFlags;
+    unsigned __int64 PresTime;
+    unsigned __int64 PresInterval;
+    ULONG  PresSystem;
+    ULONG  _pad;
+    unsigned __int64 Duration;
+    ULONG  FrameExtent;
+    ULONG  DataUsed;
+    PVOID  Data;
+    ULONG  OptionsFlags;
+    ULONG  Reserved2;
+} ISIGHT_STREAM_HEADER;
+typedef char isight_hdr_size_check[(sizeof(ISIGHT_STREAM_HEADER) == 64) ? 1 : -1];
+
+#define ISIGHT_2F_BUF   (192000)   // 1 s of 48 kHz stereo 16-bit
+static __declspec(align(64)) unsigned char g_2f_buf[ISIGHT_2F_BUF];
+
+static volatile LONG g_2f_phase = 0;   // 2 = DeviceIoControl returned
+static DWORD g_2f_submit_err = 0;
+
+static DWORD WINAPI Probe2FSubmit(LPVOID arg) {
+    HANDLE ph = (HANDLE)arg;
+    ISIGHT_STREAM_HEADER hdr;
+    ZeroMemory(&hdr, sizeof(hdr));
+    hdr.Size        = (ULONG)sizeof(hdr);
+    hdr.FrameExtent = ISIGHT_2F_BUF;
+    hdr.Data        = g_2f_buf;
+    DWORD got2 = 0;
+    BOOL ok = DeviceIoControl(ph, IOCTL_KS_READ_STREAM, &hdr, sizeof(hdr),
+                              NULL, 0, &got2, NULL);
+    g_2f_submit_err = ok ? 0 : GetLastError();
+    InterlockedExchange(&g_2f_phase, 2);
+    return ok ? 0 : 1;
+}
+
 static bool KsPinGet(HANDLE f, ULONG pinId, ULONG propId,
                      void* out, DWORD outLen, DWORD* got) {
     KSP_PIN kp;
@@ -620,6 +670,91 @@ static void DirectPinProbe(void) {
             else
                 say("    -> ");
             say("       NULL interface list is the wall; V32 must advertise both.");
+        }
+
+        // [2f] engine-faithful: LOOPED pin + queued read buffer + RUN.
+        {
+            say("    [2f] engine-faithful probe: LOOPED pin + queued read IRP + RUN");
+            ISIGHT_PIN_CONNECT cf;
+            ZeroMemory(&cf, sizeof(cf));
+            cf.Interface.Set = KSINTERFACESETID_Standard;
+            cf.Interface.Id  = 1;                 // LOOPED_STREAMING
+            cf.Medium.Set    = KSMEDIUMSETID_Standard;
+            cf.Medium.Id     = KSMEDIUM_STANDARD_DEVIO;
+            cf.PinId         = (ULONG)capturePin;
+            cf.PriorityClass    = 1;
+            cf.PrioritySubclass = 1;
+            BYTE buf3[sizeof(ISIGHT_PIN_CONNECT) + sizeof(KSDATAFORMAT_WAVEFORMATEX)];
+            ZeroMemory(buf3, sizeof(buf3));
+            CopyMemory(buf3, &cf, sizeof(cf));
+            KSDATAFORMAT_WAVEFORMATEX* f3 =
+                (KSDATAFORMAT_WAVEFORMATEX*)(buf3 + sizeof(ISIGHT_PIN_CONNECT));
+            f3->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
+            f3->DataFormat.SampleSize  = 4;
+            f3->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+            f3->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
+            f3->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+            f3->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
+            f3->WaveFormatEx.nChannels       = 2;
+            f3->WaveFormatEx.nSamplesPerSec  = 48000;
+            f3->WaveFormatEx.nBlockAlign     = 4;
+            f3->WaveFormatEx.wBitsPerSample  = 16;
+            f3->WaveFormatEx.nAvgBytesPerSec = 48000 * 4;
+
+            HANDLE ph3 = NULL;
+            LONG rc3 = pKsCreatePin(f, (PKSPIN_CONNECT)buf3,
+                                    GENERIC_READ | GENERIC_WRITE, &ph3);
+            if (rc3 != 0) {
+                say("    [2f] create LOOPED pin: FAIL rc=0x%08X", (DWORD)rc3);
+            } else {
+                HANDLE th = CreateThread(NULL, 0, Probe2FSubmit, ph3, 0, NULL);
+                Sleep(300);
+                say("    [2f] read IRP submit: %s (err=%u)",
+                    g_2f_phase >= 2 ? "returned immediately" : "pending in flight",
+                    g_2f_phase >= 2 ? g_2f_submit_err : 0);
+
+                KSPROPERTY gpos3;
+                ZeroMemory(&gpos3, sizeof(gpos3));
+                gpos3.Set   = KSPROPSETID_Audio;
+                gpos3.Id    = KSPROPERTY_AUDIO_POSITION;
+                gpos3.Flags = KSPROPERTY_TYPE_GET;
+                for (ULONG st3 = 1; st3 <= 3; st3++) {
+                    ULONG val3 = st3;
+                    BOOL ok3 = DeviceIoControl(ph3, IOCTL_KS_PROPERTY, &cprop,
+                                               sizeof(cprop), &val3,
+                                               sizeof(val3), &got, NULL);
+                    say("    [2f] set state %s: %s (err=%u)", names[st3],
+                        ok3 ? "OK" : "FAIL", ok3 ? 0 : GetLastError());
+                }
+                unsigned __int64 prev = 0;
+                int moved = 0;
+                for (int i = 0; i < 10; i++) {
+                    Sleep(100);
+                    unsigned __int64 q[2];
+                    ZeroMemory(q, sizeof(q));
+                    BOOL og = DeviceIoControl(ph3, IOCTL_KS_PROPERTY, &gpos3,
+                                              sizeof(gpos3), q, sizeof(q),
+                                              &got, NULL);
+                    if (og && q[0] != prev) moved++;
+                    if (og) prev = q[0];
+                    if (i == 0 || i == 4 || i == 9)
+                        say("    [2f] poll %d: %s play=%llu write=%llu", i + 1,
+                            og ? "OK" : "FAIL", og ? q[0] : 0, og ? q[1] : 0);
+                }
+                say("    [2f] position advanced in %d/10 polls -> %s", moved,
+                    moved
+                        ? "PORT COPIES DATA -- driver path proven end to end"
+                        : "STILL FROZEN even with a buffer queued");
+
+                ULONG val0 = 0;   // KSSTATE_STOP
+                DeviceIoControl(ph3, IOCTL_KS_PROPERTY, &cprop, sizeof(cprop),
+                                &val0, sizeof(val0), &got, NULL);
+                Sleep(200);
+                CloseHandle(ph3);          // cancels the worker's pending IRP
+                if (th) WaitForSingleObject(th, 3000);
+                if (th) CloseHandle(th);
+                say("    [2f] worker exited (submit err=%u)", g_2f_submit_err);
+            }
         }
     } else {
         DWORD e = (DWORD)rc;
