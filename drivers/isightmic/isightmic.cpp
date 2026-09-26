@@ -92,6 +92,9 @@ static ULONG g_ServiceCalls;
 static ULONG g_ServiceFull;   // Service() passes that actually ran past the early-out
 static ULONG g_PosGets;       // miniport GetPosition invocations
 static ULONG g_PosLast;       // value the last GetPosition returned
+static ULONG g_SilenceCalls;  // Silence() calls = GetMapping failed in the port
+static ULONG g_PosLinear;     // raw m_Position at the last GetPosition
+static ULONG g_PosBufSize;    // m_BufferSize at the last GetPosition
 static ULONG g_IrpDone;       // stream IRPs the port completed for our streams
 static ULONG g_ReqSvc;        // IServiceGroup::RequestService calls (the real wakeup)
 // v34: which IDmaChannel methods does PortCls actually call while RUN?  This is
@@ -326,6 +329,8 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::GetPosition(OUT PULONG Positi
     *Position = m_BufferSize ? (m_Position % m_BufferSize) : 0;
     g_PosGets++;
     g_PosLast = *Position;
+    g_PosLinear = m_Position;    // v38: raw counters to disambiguate the
+    g_PosBufSize = m_BufferSize; //       poslast==0 ring-wrap coincidence
     return STATUS_SUCCESS;
 }
 
@@ -462,6 +467,7 @@ STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::SetNotificationFreq(IN ULONG Int
 }
 
 STDMETHODIMP_(void) CMiniportWaveCyclicStream::Silence(IN PVOID Buffer, IN ULONG ByteCount) {
+    g_SilenceCalls++;
     if (Buffer && ByteCount) RtlZeroMemory(Buffer, ByteCount);
 }
 
@@ -1420,6 +1426,9 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
     dg->DmaCopyTo       = g_DmaCopyTo;
     dg->DmaCopyFrom     = g_DmaCopyFrom;
     dg->DmaPhysAddr     = g_DmaPhysAddr;
+    dg->SilenceCalls    = g_SilenceCalls;
+    dg->PosLinear       = g_PosLinear;
+    dg->PosBufSize      = g_PosBufSize;
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;

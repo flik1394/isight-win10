@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V37-20260926-RINGPOS"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V38-20260926-SILDISC"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -114,6 +114,16 @@ typedef struct _ISIGHTMIC_DIAG {
     unsigned long DmaCopyTo;             // IDmaChannel::CopyTo calls
     unsigned long DmaCopyFrom;           // IDmaChannel::CopyFrom calls
     unsigned long DmaPhysAddr;           // IDmaChannel::PhysicalAddress calls
+    // --- v38 additions: the GetMapping discriminator -----------------------
+    // In the port's copy path, BufferLength = GetPosition() - internal offset;
+    // when GetMapping() fails it inserts silence via our Silence() instead of
+    // calling CopyFrom.  So: Silence>0  => the queued IRP never reaches the
+    // port's irp queue.  Silence==0 && CopyFrom==0 => BufferLength was 0 =>
+    // ring-arithmetic problem.  PosLinear/PosBufSize disambiguate the
+    // poslast==0 coincidence (ring wraps to 0 every 19200 bytes).
+    unsigned long SilenceCalls;          // IMiniportWaveCyclicStream::Silence calls
+    unsigned long PosLinear;             // raw m_Position at the last GetPosition
+    unsigned long PosBufSize;            // m_BufferSize at the last GetPosition
 } ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"

@@ -168,6 +168,13 @@ static void PrintDiagDelta(const char* tag,
         b->DmaSysAddr - a->DmaSysAddr, b->DmaTransfer - a->DmaTransfer,
         b->DmaBufferSize - a->DmaBufferSize, b->DmaCopyFrom - a->DmaCopyFrom,
         b->DmaCopyTo - a->DmaCopyTo, b->DmaPhysAddr - a->DmaPhysAddr);
+    say("        silence=%u posraw: linear=%u bufsize=%u (ring last=%u)",
+        b->SilenceCalls - a->SilenceCalls, b->PosLinear, b->PosBufSize,
+        b->PosLast);
+    // The discriminator: silence>0 with copyfrom==0 means the port's
+    // GetMapping failed every tick -> the queued IRP never entered the
+    // port's irp queue.  silence==0 && copyfrom==0 means BufferLength was
+    // 0 every tick -> ring-arithmetic problem instead.
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +402,30 @@ static DWORD WINAPI Probe2FSubmit(LPVOID arg) {
     }
     g_2f_got = got2;
     InterlockedExchange(&g_2f_phase, 2);
+    return ok ? 0 : 1;
+}
+
+// Variant 2: submit a second read IRP while the pin is already in RUN.
+// The PAUSE-state submission comes back "pending", yet the port never
+// consumes it; if Windows portcls only wires stream IRPs into its service
+// loop for IRPs queued after RUN, this variant gets consumed instead.
+static volatile LONG g_2f_phase_r = 0;
+static DWORD g_2f_submit_err_r = 0;
+static DWORD g_2f_got_r = 0;
+
+static DWORD WINAPI Probe2FSubmitRun(LPVOID arg) {
+    HANDLE ph = (HANDLE)arg;
+    KSSTREAM_HEADER hdr;
+    ZeroMemory(&hdr, sizeof(hdr));
+    hdr.Size        = (ULONG)sizeof(hdr);
+    hdr.FrameExtent = ISIGHT_2F_BUF / 2;                  // second half
+    hdr.Data        = g_2f_buf + ISIGHT_2F_BUF / 2;
+    DWORD got2 = 0;
+    BOOL ok = DeviceIoControl(ph, IOCTL_KS_READ_STREAM, &hdr, sizeof(hdr),
+                              &hdr, sizeof(hdr), &got2, NULL);
+    g_2f_submit_err_r = ok ? 0 : GetLastError();
+    g_2f_got_r = got2;
+    InterlockedExchange(&g_2f_phase_r, 2);
     return ok ? 0 : 1;
 }
 
@@ -779,6 +810,19 @@ static void DirectPinProbe(void) {
                                            &got, NULL);
                 say("    [2f] set state RUN: %s (err=%u)",
                     okr ? "OK" : "FAIL", okr ? 0 : GetLastError());
+                // Variant 2: a second IRP queued AFTER RUN.  If the port only
+                // consumes IRPs that arrive while the pin is in RUN, this one
+                // gets serviced even if the PAUSE-queued one never does.
+                HANDLE thr = NULL;
+                if (okr) {
+                    InterlockedExchange(&g_2f_phase_r, 0);
+                    thr = CreateThread(NULL, 0, Probe2FSubmitRun, ph3, 0, NULL);
+                    Sleep(200);
+                    say("    [2f] read IRP submit @RUN: %s (err=%u)",
+                        g_2f_phase_r >= 2 ? "returned immediately"
+                                          : "pending in flight",
+                        g_2f_phase_r >= 2 ? g_2f_submit_err_r : 0);
+                }
                 if (g_2f_phase >= 2 && g_2f_submit_err != 0 && th) {
                     // rejected at PAUSE: retry once, now that the pin RUNs
                     InterlockedExchange(&g_2f_phase, 0);
@@ -823,9 +867,13 @@ static void DirectPinProbe(void) {
                 CloseHandle(ph3);          // cancels the worker's pending IRP
                 if (th) WaitForSingleObject(th, 3000);
                 if (th) CloseHandle(th);
+                if (thr) WaitForSingleObject(thr, 3000);
+                if (thr) CloseHandle(thr);
                 say("    [2f] worker exited (in+out err=%u, in-only err=%u,"
                     " completed bytes=%u)",
                     g_2f_submit_err, g_2f_submit_err2, g_2f_got);
+                say("    [2f] RUN-variant exited (err=%u, completed bytes=%u)",
+                    g_2f_submit_err_r, g_2f_got_r);
             }
         }
     } else {
