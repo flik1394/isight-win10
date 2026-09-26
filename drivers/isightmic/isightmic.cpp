@@ -93,6 +93,17 @@ static ULONG g_ServiceFull;   // Service() passes that actually ran past the ear
 static ULONG g_PosGets;       // miniport GetPosition invocations
 static ULONG g_PosLast;       // value the last GetPosition returned
 static ULONG g_IrpDone;       // stream IRPs the port completed for our streams
+// v34: which IDmaChannel methods does PortCls actually call while RUN?  This is
+// the decisive probe for irps done=0 -- it shows whether PortCls locates our
+// data via SystemAddress / TransferCount / CopyTo / CopyFrom.
+static ULONG g_DmaSysAddr;
+static ULONG g_DmaTransfer;
+static ULONG g_DmaBufferSize;
+static ULONG g_DmaAlloc;
+static ULONG g_DmaAdapter;
+static ULONG g_DmaCopyTo;
+static ULONG g_DmaCopyFrom;
+static ULONG g_DmaPhysAddr;
 
 // v24 call-trace counters.  Plain ULONGs, incremented from arbitrary threads
 // and read from an IOCTL; a torn read only ever makes the snapshot
@@ -339,6 +350,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::SetFormat(IN PKSDATAFORMAT Da
 
 STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclicStream::AllocateBuffer(
     IN ULONG BufferSize, IN PPHYSICAL_ADDRESS PhysicalAddressConstraint) {
+    g_DmaAlloc++;
     UNREFERENCED_PARAMETER(PhysicalAddressConstraint);
     if (BufferSize == 0) return STATUS_INVALID_PARAMETER;
     if (m_DmaBuffer) {
@@ -373,6 +385,7 @@ STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::AllocatedBufferSize(void) {
 }
 
 STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::BufferSize(void) {
+    g_DmaBufferSize++;
     return m_DmaSize;
 }
 
@@ -381,6 +394,7 @@ STDMETHODIMP_(void) CMiniportWaveCyclicStream::SetBufferSize(IN ULONG BufferSize
 }
 
 STDMETHODIMP_(PHYSICAL_ADDRESS) CMiniportWaveCyclicStream::PhysicalAddress(void) {
+    g_DmaPhysAddr++;
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = 0;
     if (m_DmaBuffer) pa = MmGetPhysicalAddress(m_DmaBuffer);
@@ -388,22 +402,30 @@ STDMETHODIMP_(PHYSICAL_ADDRESS) CMiniportWaveCyclicStream::PhysicalAddress(void)
 }
 
 STDMETHODIMP_(ULONG) CMiniportWaveCyclicStream::TransferCount(void) {
-    return m_DmaSize;
+    g_DmaTransfer++;
+    // V34: previously returned m_DmaSize (a fixed constant).  PortCls uses
+    // TransferCount as the DMA "bytes transferred so far" progress counter; a
+    // frozen constant reads as "no new data produced" -> queued read IRPs never
+    // get serviced (irps done=0).  Return the live, linearly-advancing position.
+    return m_Position;
 }
 
 STDMETHODIMP_(PVOID) CMiniportWaveCyclicStream::SystemAddress(void) {
+    g_DmaSysAddr++;
     return m_DmaBuffer;
 }
 
 // A software device has no DMA adapter; the port only needs one for hardware
 // transfers, and our buffer is ordinary nonpaged pool.
 STDMETHODIMP_(PADAPTER_OBJECT) CMiniportWaveCyclicStream::GetAdapterObject(void) {
+    g_DmaAdapter++;
     return NULL;
 }
 
 STDMETHODIMP_(void) CMiniportWaveCyclicStream::CopyTo(IN PVOID Destination,
                                                       IN PVOID Source,
                                                       IN ULONG RequestedLength) {
+    g_DmaCopyTo++;
     if (Destination && Source && RequestedLength)
         RtlCopyMemory(Destination, Source, RequestedLength);
 }
@@ -411,6 +433,7 @@ STDMETHODIMP_(void) CMiniportWaveCyclicStream::CopyTo(IN PVOID Destination,
 STDMETHODIMP_(void) CMiniportWaveCyclicStream::CopyFrom(IN PVOID Destination,
                                                         IN PVOID Source,
                                                         IN ULONG RequestedLength) {
+    g_DmaCopyFrom++;
     if (Destination && Source && RequestedLength)
         RtlCopyMemory(Destination, Source, RequestedLength);
 }
@@ -515,7 +538,11 @@ void CMiniportWaveCyclicStream::Service() {
         }
     }
 
-    m_Position = (m_Position + quantum) % m_BufferSize;
+    // V34: advance LINEARLY (no modulo).  PortCls expects GetPosition and
+    // TransferCount to report a monotonically increasing byte count from stream
+    // start; it applies the buffer size itself to compute the cyclic offset.
+    // The buffer write index above (pos) already uses m_Position % m_BufferSize.
+    m_Position += quantum;
     g_Played += quantum;
 }
 
@@ -1369,6 +1396,14 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
     dg->PosLast         = g_PosLast;
     dg->ServiceFull     = g_ServiceFull;
     dg->IrpDone         = g_IrpDone;
+    dg->DmaSysAddr      = g_DmaSysAddr;
+    dg->DmaTransfer     = g_DmaTransfer;
+    dg->DmaBufferSize   = g_DmaBufferSize;
+    dg->DmaAlloc        = g_DmaAlloc;
+    dg->DmaAdapter      = g_DmaAdapter;
+    dg->DmaCopyTo       = g_DmaCopyTo;
+    dg->DmaCopyFrom     = g_DmaCopyFrom;
+    dg->DmaPhysAddr     = g_DmaPhysAddr;
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;

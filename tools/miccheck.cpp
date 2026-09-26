@@ -188,6 +188,10 @@ static void ProbeDiag(const char* when) {
     say("        position path        miniport GetPosition calls=%u last=%u"
         "  service(full)=%u irps done=%u",
         d.PosGets, d.PosLast, d.ServiceFull, d.IrpDone);
+    say("        DMA methods          sysaddr=%u transfer=%u bufsize=%u alloc=%u"
+        "  adapter=%u copyto=%u copyfrom=%u phys=%u",
+        d.DmaSysAddr, d.DmaTransfer, d.DmaBufferSize, d.DmaAlloc,
+        d.DmaAdapter, d.DmaCopyTo, d.DmaCopyFrom, d.DmaPhysAddr);
 
     if (d.WaveInitCalls == 0)
         say("    -> the audio stack never opened the wave filter.");

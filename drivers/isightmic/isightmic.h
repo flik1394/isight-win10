@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V33-20260926-POSDIAG"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V34-20260926-DMAPROBE"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -102,6 +102,17 @@ typedef struct _ISIGHTMIC_DIAG {
     unsigned long PosLast;               // value returned by the last GetPosition
     unsigned long ServiceFull;           // Service() passes that actually ran (not early-out)
     unsigned long IrpDone;               // stream IRPs completed by the port side
+    // --- v34 additions: which IDmaChannel methods does PortCls actually call
+    //     during RUN?  irps done=0 means PortCls never moved our queued read IRP
+    //     to the client; this reveals which method it uses to locate data.
+    unsigned long DmaSysAddr;            // IDmaChannel::SystemAddress calls
+    unsigned long DmaTransfer;           // IDmaChannel::TransferCount calls
+    unsigned long DmaBufferSize;         // IDmaChannel::BufferSize calls
+    unsigned long DmaAlloc;              // IDmaChannel::AllocateBuffer calls
+    unsigned long DmaAdapter;            // IDmaChannel::GetAdapterObject calls
+    unsigned long DmaCopyTo;             // IDmaChannel::CopyTo calls
+    unsigned long DmaCopyFrom;           // IDmaChannel::CopyFrom calls
+    unsigned long DmaPhysAddr;           // IDmaChannel::PhysicalAddress calls
 } ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"
