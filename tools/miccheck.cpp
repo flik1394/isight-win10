@@ -923,11 +923,18 @@ static bool FindStreamingCapturePin(HANDLE f, ULONG* pinId) {
     if (!KsPinGet(f, 0, KSPROPERTY_PIN_CTYPES, &ctypes, sizeof(ctypes), &got))
         return false;
     for (ULONG id = 0; id < ctypes; id++) {
-        ULONG df = 0, comm = 0; DWORD g1 = 0, g2 = 0;
-        bool okDf = KsPinGet(f, id, KSPROPERTY_PIN_DATAFLOW, &df, sizeof(df), &g1);
-        bool okCm = KsPinGet(f, id, KSPROPERTY_PIN_COMMUNICATION, &comm, sizeof(comm), &g2);
-        if (okDf && okCm && df == KSPIN_DATAFLOW_OUT &&
-            comm == KSPIN_COMMUNICATION_SINK) {
+        ULONG df = 0, comm = 0; DWORD g1 = 0, g2 = 0, g3 = 0;
+        GUID cat;
+        bool okDf  = KsPinGet(f, id, KSPROPERTY_PIN_DATAFLOW, &df, sizeof(df), &g1);
+        bool okCm  = KsPinGet(f, id, KSPROPERTY_PIN_COMMUNICATION, &comm, sizeof(comm), &g2);
+        bool okCat = KsPinGet(f, id, KSPROPERTY_PIN_CATEGORY, &cat, sizeof(cat), &g3);
+        // a capture streaming pin: data comes OUT of the filter, clients open
+        // it (SINK or BOTH -- Bluetooth HFP uses BOTH), and it is tagged with
+        // PIN_CATEGORY_CAPTURE ({FB6C4281-...}).
+        if (okDf && okCm && okCat && df == KSPIN_DATAFLOW_OUT &&
+            cat.Data1 == 0xFB6C4281 &&
+            (comm == KSPIN_COMMUNICATION_SINK ||
+             comm == KSPIN_COMMUNICATION_BOTH)) {
             *pinId = id;
             return true;
         }
@@ -1145,11 +1152,11 @@ static void DiffProbe(void) {
                 say("      pin %u: df=%s comm=%s cat=%s", id,
                     okDf ? FlowName(df) : "ERR",
                     okCm ? CommName(comm) : "ERR", catS);
-                if (okDf && okCm && df == KSPIN_DATAFLOW_OUT &&
-                    comm == KSPIN_COMMUNICATION_SINK && !refPath) {
-                    // capture streaming pin found: remember this candidate
-                    refPath = refList[i];
-                }
+            }
+            ULONG pid = 0;
+            if (!refPath && FindStreamingCapturePin(f, &pid)) {
+                refPath = refList[i];
+                say("      -> capture streaming pin = pin %u, using as REF", pid);
             }
         }
         CloseHandle(f);
