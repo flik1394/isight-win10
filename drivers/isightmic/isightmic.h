@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V34-20260926-DMAPROBE"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V35-20260926-REQSVC"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -102,6 +102,7 @@ typedef struct _ISIGHTMIC_DIAG {
     unsigned long PosLast;               // value returned by the last GetPosition
     unsigned long ServiceFull;           // Service() passes that actually ran (not early-out)
     unsigned long IrpDone;               // stream IRPs completed by the port side
+    unsigned long ReqSvc;                // IServiceGroup::RequestService calls (the real wakeup)
     // --- v34 additions: which IDmaChannel methods does PortCls actually call
     //     during RUN?  irps done=0 means PortCls never moved our queued read IRP
     //     to the client; this reveals which method it uses to locate data.

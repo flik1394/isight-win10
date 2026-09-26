@@ -93,6 +93,7 @@ static ULONG g_ServiceFull;   // Service() passes that actually ran past the ear
 static ULONG g_PosGets;       // miniport GetPosition invocations
 static ULONG g_PosLast;       // value the last GetPosition returned
 static ULONG g_IrpDone;       // stream IRPs the port completed for our streams
+static ULONG g_ReqSvc;        // IServiceGroup::RequestService calls (the real wakeup)
 // v34: which IDmaChannel methods does PortCls actually call while RUN?  This is
 // the decisive probe for irps done=0 -- it shows whether PortCls locates our
 // data via SystemAddress / TransferCount / CopyTo / CopyFrom.
@@ -544,6 +545,12 @@ void CMiniportWaveCyclicStream::Service() {
     // The buffer write index above (pos) already uses m_Position % m_BufferSize.
     m_Position += quantum;
     g_Played += quantum;
+
+    // V35: keep the port awake.  MSVAD's Service() ends by requesting another
+    // service pass so the port keeps copying captured bytes to the client IRP
+    // until every pending read is filled.  Without this the port fills our ring
+    // once and never completes the user IRP (irps done stays 0).
+    if (m_ServiceGroup) { g_ReqSvc++; m_ServiceGroup->RequestService(); }
 }
 
 STDMETHODIMP_(void) CMiniportWaveCyclicStream::RequestService() {
@@ -560,9 +567,14 @@ VOID StreamTimerDpc(IN PKDPC Dpc, IN PVOID DeferredContext,
     CMiniportWaveCyclicStream* s = (CMiniportWaveCyclicStream*)DeferredContext;
     if (s == NULL) return;
     g_DpcFires++;
-    if (s->m_Port != NULL && s->m_ServiceGroup != NULL) {
-        g_NotifyCalls++;
-        s->m_Port->Notify(s->m_ServiceGroup);
+    if (s->m_ServiceGroup != NULL) {
+        g_ReqSvc++;
+        // V35: MSVAD's standalone timer DPC calls IServiceGroup::RequestService,
+        // NOT IPortWaveCyclic::Notify.  Notify only marks the port "dirty" -- it
+        // does not make the port service the stream and copy bytes to the
+        // pending user IRP.  RequestService is what wakes the port's worker,
+        // which calls our Service() and then copies captured data to the IRP.
+        s->m_ServiceGroup->RequestService();
     }
 }
 
@@ -1396,6 +1408,7 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
     dg->PosLast         = g_PosLast;
     dg->ServiceFull     = g_ServiceFull;
     dg->IrpDone         = g_IrpDone;
+    dg->ReqSvc          = g_ReqSvc;
     dg->DmaSysAddr      = g_DmaSysAddr;
     dg->DmaTransfer     = g_DmaTransfer;
     dg->DmaBufferSize   = g_DmaBufferSize;

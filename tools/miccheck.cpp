@@ -188,6 +188,8 @@ static void ProbeDiag(const char* when) {
     say("        position path        miniport GetPosition calls=%u last=%u"
         "  service(full)=%u irps done=%u",
         d.PosGets, d.PosLast, d.ServiceFull, d.IrpDone);
+    say("        wakeup path          dpc->reqsvc=%u  (ReqSvc = IServiceGroup wakeups; the port services the stream + copies to the user IRP on these)",
+        d.ReqSvc);
     say("        DMA methods          sysaddr=%u transfer=%u bufsize=%u alloc=%u"
         "  adapter=%u copyto=%u copyfrom=%u phys=%u",
         d.DmaSysAddr, d.DmaTransfer, d.DmaBufferSize, d.DmaAlloc,
