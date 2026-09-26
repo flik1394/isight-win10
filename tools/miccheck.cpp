@@ -1071,7 +1071,9 @@ static void DiffProbe(void) {
         say("    SetupDi failed (err=%u)", GetLastError());
         return;
     }
-    WCHAR ourPath[1024] = L"", refPath[1024] = L"";
+    WCHAR ourPath[1024] = L"";
+    static WCHAR refList[8][1024];
+    int refCount = 0;
     for (DWORD i = 0; i < 96; i++) {
         SP_DEVICE_INTERFACE_DATA di;
         di.cbSize = sizeof(di);
@@ -1091,17 +1093,37 @@ static void DiffProbe(void) {
                 if (wcsstr(dd->DevicePath, L"isightmic")) {
                     if (!ourPath[0])
                         wcsncpy_s(ourPath, dd->DevicePath, _TRUNCATE);
-                } else if (!refPath[0]) {
-                    wcsncpy_s(refPath, dd->DevicePath, _TRUNCATE);
+                } else {
+                    // keep a list of candidates; the first one that really has
+                    // a capture (OUT/SINK) streaming pin becomes the reference
+                    // (many wave filters belong to RENDER devices, whose
+                    // streaming pin is DATAFLOW_IN -- e.g. the speakers).
+                    if (refCount < 8)
+                        wcsncpy_s(refList[refCount++], dd->DevicePath,
+                                  _TRUNCATE);
                 }
             }
         }
         free(b);
     }
     SetupDiDestroyDeviceInfoList(set);
-    if (!ourPath[0] || !refPath[0]) {
-        say("    need ours + a reference \\wave filter (ours=%d ref=%d)",
-            ourPath[0] ? 1 : 0, refPath[0] ? 1 : 0);
+    if (!ourPath[0] || !refCount) {
+        say("    need ours + a capture reference \\wave filter (ours=%d refs=%d)",
+            ourPath[0] ? 1 : 0, refCount);
+        return;
+    }
+    // pick the first candidate that really owns a capture streaming pin
+    const WCHAR* refPath = NULL;
+    for (int i = 0; i < refCount && !refPath; i++) {
+        HANDLE f = CreateFileW(refList[i], GENERIC_READ | GENERIC_WRITE, 0,
+                               NULL, OPEN_EXISTING, 0, NULL);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        ULONG pid = 0;
+        if (FindStreamingCapturePin(f, &pid)) refPath = refList[i];
+        CloseHandle(f);
+    }
+    if (!refPath) {
+        say("    none of the %d reference candidates has a capture pin", refCount);
         return;
     }
     BatteryOne(refPath, "REF");
