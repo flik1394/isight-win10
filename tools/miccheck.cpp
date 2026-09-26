@@ -1354,6 +1354,70 @@ static void WriteWav16(const char* path, const short* s, UINT n) {
     fclose(f);
 }
 
+// ---------------------------------------------------------------------------
+// [5] legacy winmm probe.  waveIn goes through the OLD stack (wdmaud.sys -> ks
+// -> the same KS filters) -- a completely different client path than
+// WASAPI/audiosrv.  If waveIn records bytes while WASAPI still fails with
+// 0x88890008, the driver's data path is proven end to end for a real client
+// and the wall is narrowed to the audiosrv endpoint graph.
+// ---------------------------------------------------------------------------
+static void LegacyWaveIn(void) {
+    UINT n = waveInGetNumDevs();
+    say("[5] legacy waveIn probe: %u devices", n);
+    int idx = -1;
+    for (UINT i = 0; i < n; i++) {
+        WAVEINCAPSW c; ZeroMemory(&c, sizeof(c));
+        if (waveInGetDevCapsW(i, &c, sizeof(c)) != MMSYSERR_NOERROR) continue;
+        char a[128];
+        WideCharToMultiByte(CP_ACP, 0, c.szPname, -1, a, sizeof(a), NULL, NULL);
+        say("      %u: %s", i, a);
+        if (idx < 0 && wcsstr(c.szPname, L"iSight")) idx = (int)i;
+    }
+    if (idx < 0) {
+        say("    no iSight waveIn device -> legacy stack never saw our endpoint");
+        return;
+    }
+    WAVEFORMATEX wf; ZeroMemory(&wf, sizeof(wf));
+    wf.wFormatTag      = WAVE_FORMAT_PCM;
+    wf.nChannels       = 1;
+    wf.nSamplesPerSec  = 48000;
+    wf.wBitsPerSample  = 16;
+    wf.nBlockAlign     = 2;
+    wf.nAvgBytesPerSec = 96000;
+    HWAVEIN h = NULL;
+    MMRESULT mr = waveInOpen(&h, (UINT)idx, &wf, 0, 0, CALLBACK_NULL);
+    if (mr != MMSYSERR_NOERROR) {
+        say("    waveInOpen(%d) FAILED mr=%u", idx, mr);
+        return;
+    }
+    say("    waveInOpen OK -- queues 5 x 19200-byte buffers, records 1.2 s");
+    static char buf[5 * 19200];
+    WAVEHDR hdrs[5]; ZeroMemory(hdrs, sizeof(hdrs));
+    for (int i = 0; i < 5; i++) {
+        hdrs[i].lpData          = buf + i * 19200;
+        hdrs[i].dwBufferLength  = 19200;
+        waveInPrepareHeader(h, &hdrs[i], sizeof(WAVEHDR));
+        waveInAddBuffer(h, &hdrs[i], sizeof(WAVEHDR));
+    }
+    mr = waveInStart(h);
+    say("    waveInStart: %s (mr=%u)", mr == MMSYSERR_NOERROR ? "OK" : "FAIL", mr);
+    Sleep(1200);
+    waveInReset(h);
+    DWORD total = 0; int done = 0;
+    for (int i = 0; i < 5; i++) {
+        if (hdrs[i].dwFlags & WHDR_DONE) {
+            done++;
+            total += hdrs[i].dwBytesRecorded;
+        }
+        waveInUnprepareHeader(h, &hdrs[i], sizeof(WAVEHDR));
+    }
+    waveInClose(h);
+    say("    waveIn result: %u/5 buffers done, %u bytes in 1.2 s -> %s",
+        done, total,
+        total > 0 ? "LEGACY PATH WORKS (driver data path proven for a real client)"
+                  : "legacy path also frozen");
+}
+
 int main(int argc, char** argv) {
     int seconds = (argc > 1) ? atoi(argv[1]) : 3;
     if (seconds < 1) seconds = 1;
@@ -1377,6 +1441,7 @@ int main(int argc, char** argv) {
         CaptureFrom(dev, seconds);
         dev->Release();
     }
+    LegacyWaveIn();
     // Read the trace again now that we have just tried to open the endpoint the
     // way WeChat does.  The delta between this and the "before" reading is what
     // our own attempt touched -- and if it is all zeros, our attempt never

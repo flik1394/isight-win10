@@ -104,7 +104,7 @@ jobs:
         continue-on-error: true
         run: |
           cl /nologo /O2 /W3 /EHsc /MD /I"drivers\isightmic" ^
-             tools\miccheck.cpp ole32.lib /Fe:isight-miccheck.exe
+             tools\miccheck.cpp ole32.lib winmm.lib /Fe:isight-miccheck.exe
           if errorlevel 1 exit /b 1
           dir isight-miccheck.exe
 
