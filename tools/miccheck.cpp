@@ -473,16 +473,22 @@ static void DirectPinProbe(void) {
         //   KSPROPERTY_AUDIO_LATENCY / CHANNEL_CONFIG
         // Whatever step fails here is the step that makes WASAPI answer
         // AUDCLNT_E_ENDPOINT_CREATE_FAILED (0x88890008).
+        //
+        // KS property convention (verified against the ReactOS portcls
+        // PinWaveCyclicState): the property handler receives (Request, Data)
+        // and Data is the OUTPUT buffer for BOTH get and set -- so a set
+        // passes the value in lpOutBuffer, not appended to the input buffer.
+        // Appending it to the input gave STATUS_BUFFER_TOO_SMALL (err=122).
         DWORD got = 0;
-        struct { KSPROPERTY p; ULONG st; } setbuf;
-        setbuf.p.Set   = KSPROPSETID_Connection;
-        setbuf.p.Id    = KSPROPERTY_CONNECTION_STATE;
-        setbuf.p.Flags = KSPROPERTY_TYPE_SET;
+        KSPROPERTY cprop;
+        cprop.Set   = KSPROPSETID_Connection;
+        cprop.Id    = KSPROPERTY_CONNECTION_STATE;
+        cprop.Flags = KSPROPERTY_TYPE_SET;
         const char* names[4] = { "STOP", "ACQUIRE", "PAUSE", "RUN" };
         for (ULONG st = 1; st <= 3; st++) {
-            setbuf.st = st;
-            BOOL ok = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &setbuf,
-                                      sizeof(setbuf), NULL, 0, &got, NULL);
+            ULONG val = st;
+            BOOL ok = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &cprop,
+                                      sizeof(cprop), &val, sizeof(val), &got, NULL);
             say("    [2c] set state %s: %s (err=%u)", names[st],
                 ok ? "OK" : "FAIL", ok ? 0 : GetLastError());
         }
@@ -504,17 +510,17 @@ static void DirectPinProbe(void) {
             ok1 ? 0 : GetLastError());
 
         gprop.Id = KSPROPERTY_AUDIO_LATENCY;
-        unsigned __int64 lat = 0;
+        ULONG lat = 0;
         BOOL ok2 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
                                    &lat, sizeof(lat), &got, NULL);
-        say("    [2c] get latency: %s value=%llu (err=%u)",
+        say("    [2c] get latency: %s value=%lu (err=%u)",
             ok2 ? "OK" : "FAIL", ok2 ? lat : 0, ok2 ? 0 : GetLastError());
 
-        unsigned __int64 cc = 0;
+        ULONG cc = 0;
         gprop.Id = KSPROPERTY_AUDIO_CHANNEL_CONFIG;
         BOOL ok3 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
                                    &cc, sizeof(cc), &got, NULL);
-        say("    [2c] get channel config: %s mask=0x%llX (err=%u)",
+        say("    [2c] get channel config: %s mask=0x%lX (err=%u)",
             ok3 ? "OK" : "FAIL", ok3 ? cc : 0, ok3 ? 0 : GetLastError());
 
         if (ok1) {
@@ -531,9 +537,9 @@ static void DirectPinProbe(void) {
         }
 
         // leave the pin stopped and close it so [4] still has its instance.
-        setbuf.st = 0;   // KSSTATE_STOP
-        DeviceIoControl(ph, IOCTL_KS_PROPERTY, &setbuf, sizeof(setbuf),
-                        NULL, 0, &got, NULL);
+        ULONG stopval = 0;   // KSSTATE_STOP
+        DeviceIoControl(ph, IOCTL_KS_PROPERTY, &cprop, sizeof(cprop),
+                        &stopval, sizeof(stopval), &got, NULL);
         Sleep(150);
         CloseHandle(ph);
     } else {
