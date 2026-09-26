@@ -461,11 +461,79 @@ static void DirectPinProbe(void) {
         CloseHandle(f);
         return;
     }
-    LONG rc = pKsCreatePin(f, (PKSPIN_CONNECT)buf, GENERIC_READ, &ph);
+    LONG rc = pKsCreatePin(f, (PKSPIN_CONNECT)buf, GENERIC_READ | GENERIC_WRITE, &ph);
     if (rc == 0) {
         say("    KsCreatePin SUCCESS -- the pin instantiates fine from user mode.");
         say("    -> the fault is NOT in the create path; engine/topology side.");
-        Sleep(150);        // let PortCls run the pin a moment
+
+        // [2c] Replay the exact property sequence the audio engine runs on a
+        // freshly created pin before it will report a working endpoint:
+        //   KSPROPERTY_CONNECTION_STATE  ACQUIRE -> PAUSE -> RUN
+        //   KSPROPERTY_AUDIO_POSITION    (twice -- it must advance)
+        //   KSPROPERTY_AUDIO_LATENCY / CHANNEL_CONFIG
+        // Whatever step fails here is the step that makes WASAPI answer
+        // AUDCLNT_E_ENDPOINT_CREATE_FAILED (0x88890008).
+        DWORD got = 0;
+        struct { KSPROPERTY p; ULONG st; } setbuf;
+        setbuf.p.Set   = KSPROPSETID_Connection;
+        setbuf.p.Id    = KSPROPERTY_CONNECTION_STATE;
+        setbuf.p.Flags = KSPROPERTY_TYPE_SET;
+        const char* names[4] = { "STOP", "ACQUIRE", "PAUSE", "RUN" };
+        for (ULONG st = 1; st <= 3; st++) {
+            setbuf.st = st;
+            BOOL ok = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &setbuf,
+                                      sizeof(setbuf), NULL, 0, &got, NULL);
+            say("    [2c] set state %s: %s (err=%u)", names[st],
+                ok ? "OK" : "FAIL", ok ? 0 : GetLastError());
+        }
+
+        KSPROPERTY gprop;
+        gprop.Set   = KSPROPSETID_Audio;
+        gprop.Flags = KSPROPERTY_TYPE_GET;
+
+        KSAUDIO_POSITION pos; ZeroMemory(&pos, sizeof(pos));
+        gprop.Id = KSPROPERTY_AUDIO_POSITION;
+        BOOL ok1 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
+                                   &pos, sizeof(pos), &got, NULL);
+        say("    [2c] get position: %s pos=%llu qs=%llu (err=%u)",
+            ok1 ? "OK" : "FAIL", ok1 ? (unsigned long long)pos.Position : 0,
+            ok1 ? (unsigned long long)pos.QsPosition : 0,
+            ok1 ? 0 : GetLastError());
+
+        gprop.Id = KSPROPERTY_AUDIO_LATENCY;
+        ULONGLONG lat = 0;
+        BOOL ok2 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
+                                   &lat, sizeof(lat), &got, NULL);
+        say("    [2c] get latency: %s value=%llu (err=%u)",
+            ok2 ? "OK" : "FAIL", ok2 ? (unsigned long long)lat : 0,
+            ok2 ? 0 : GetLastError());
+
+        gprop.Id = KSPROPERTY_AUDIO_CHANNEL_CONFIG;
+        KSAUDIO_CHANNEL_CONFIG cc; ZeroMemory(&cc, sizeof(cc));
+        BOOL ok3 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop, sizeof(gprop),
+                                   &cc, sizeof(cc), &got, NULL);
+        say("    [2c] get channel config: %s mask=0x%llX (err=%u)",
+            ok3 ? "OK" : "FAIL", ok3 ? (unsigned long long)cc : 0,
+            ok3 ? 0 : GetLastError());
+
+        if (ok1) {
+            Sleep(300);
+            KSAUDIO_POSITION pos2; ZeroMemory(&pos2, sizeof(pos2));
+            gprop.Id = KSPROPERTY_AUDIO_POSITION;
+            BOOL ok4 = DeviceIoControl(ph, IOCTL_KS_PROPERTY, &gprop,
+                                       sizeof(gprop), &pos2, sizeof(pos2),
+                                       &got, NULL);
+            say("    [2c] position after 300 ms: %s pos=%llu (advanced=%s, err=%u)",
+                ok4 ? "OK" : "FAIL", ok4 ? (unsigned long long)pos2.Position : 0,
+                (ok4 && pos2.Position != pos.Position) ? "yes" : "NO",
+                ok4 ? 0 : GetLastError());
+        }
+
+        // leave the pin stopped and close it so [4] still has its instance.
+        setbuf.st = 0;   // KSSTATE_STOP
+        DeviceIoControl(ph, IOCTL_KS_PROPERTY, &setbuf, sizeof(setbuf),
+                        NULL, 0, &got, NULL);
+        Sleep(150);
         CloseHandle(ph);
     } else {
         DWORD e = (DWORD)rc;
