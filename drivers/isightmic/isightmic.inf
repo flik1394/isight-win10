@@ -80,6 +80,15 @@
 ; mask).  Fix: add the Name, advertise BOTH WAVEFORMATEXTENSIBLE and
 ; WAVEFORMATEX data ranges, and echo the client's requested specifier back from
 ; DataRangeIntersection.  JLog(ISIGHT_J_PROPOSE) records what the engine asked.
+;
+; DriverVer 1.0.21.0 (2026-09-27): V41 PROPOSEDATAFORMAT.  V40 telemetry showed
+; the engine iterating our data ranges (EXTENSIBLE and WAVEFORMATEX) endlessly
+; without ever creating a pin.  The MSVAD mic reference answers
+; KSPROPERTY_PIN_PROPOSEDATAFORMAT (SET) on the wave filter -- the gate we
+; never answered.  Fix: wave filter automation table with a
+; PROPOSEDATAFORMAT handler that accepts PCM 16-bit 1..2ch @48000
+; (WAVEFORMATEX or WAVEFORMATEXTENSIBLE cbSize=22), journals every verdict
+; (ISIGHT_J_PROPOSEFMT), and rejects everything else with STATUS_NO_MATCH.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -87,7 +96,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/27/2026,1.0.20.0
+DriverVer   = 09/27/2026,1.0.21.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64

@@ -207,6 +207,9 @@ static void PrintJournal(const ISIGHTMIC_DIAG* d) {
         case ISIGHT_J_INTERSECT:
             say("      #%-3u INTERSECT   ch=%lu rate=%lu bits=%lu",
                 head - k, a, b, c); break;
+        case ISIGHT_J_PROPOSEFMT:
+            say("      #%-3u PDFORMAT    ch=%lu rate=%lu %s",
+                head - k, a, b, c ? "ACCEPT" : "reject"); break;
         default:
             say("      #%-3u id=%lu a=%lu b=%lu c=%lu", head - k, id, a, b, c);
         }

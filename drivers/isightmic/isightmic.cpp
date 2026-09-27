@@ -897,9 +897,86 @@ static PCCONNECTION_DESCRIPTOR WaveConnections[] = {
 // PinSize, PinCount, Pins, NodeSize, NodeCount, Nodes, ConnectionCount,
 // Connections, CategoryCount, Categories.  There is no AutomationTableSize
 // member; inserting one silently reinterprets the whole descriptor.
+
+// V41: KSPROPERTY_PIN_PROPOSEDATAFORMAT on the wave filter -- the one thing
+// the MSVAD mic sample has and we did not.  audiosrv's endpoint builder
+// proposes each candidate mix format through this property (SET verb) before
+// accepting it; with no handler every candidate came back STATUS_NOT_FOUND,
+// the engine never even tried to create a pin, and GetMixFormat died with
+// 0x88890008 -- while DataRangeIntersection (which we did answer) said yes
+// to everything.  V40 telemetry proved the engine iterated our EXTENSIBLE and
+// WAVEFORMATEX ranges endlessly without ever calling NewStream: this property
+// is the gate we were not answering.
+static NTSTATUS PropertyHandler_WaveFilterPropose(IN PPCPROPERTY_REQUEST PropertyRequest) {
+    PAGED_CODE();
+
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (PropertyRequest->ValueSize >= sizeof(ULONG)) {
+            if (PropertyRequest->Value)
+                *(PULONG)PropertyRequest->Value = KSPROPERTY_TYPE_SET;
+            PropertyRequest->ValueSize = sizeof(ULONG);
+            return STATUS_SUCCESS;
+        }
+        PropertyRequest->ValueSize = sizeof(ULONG);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    NTSTATUS st = STATUS_INVALID_DEVICE_REQUEST;
+    ULONG ch = 0, rate = 0;
+
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_SET) {
+        ULONG cbMinSize = sizeof(KSDATAFORMAT_WAVEFORMATEX);
+        if (PropertyRequest->ValueSize == 0) {
+            PropertyRequest->ValueSize = cbMinSize;
+            st = STATUS_BUFFER_OVERFLOW;
+        } else if (PropertyRequest->ValueSize < cbMinSize) {
+            st = STATUS_BUFFER_TOO_SMALL;
+        } else {
+            PKSDATAFORMAT_WAVEFORMATEX p =
+                (PKSDATAFORMAT_WAVEFORMATEX)PropertyRequest->Value;
+            st = STATUS_NO_MATCH;
+            if ((p->DataFormat.MajorFormat == KSDATAFORMAT_TYPE_AUDIO) &&
+                (p->DataFormat.SubFormat   == KSDATAFORMAT_SUBTYPE_PCM) &&
+                (p->DataFormat.Specifier   == KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)) {
+                PWAVEFORMATEX wfx = &p->WaveFormatEx;
+                ch   = wfx->nChannels;
+                rate = wfx->nSamplesPerSec;
+                ULONG blockalign = wfx->nChannels * 2;   // 16-bit PCM
+                bool ext = (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE);
+                if (ext && wfx->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+                    PWAVEFORMATEXTENSIBLE wex = (PWAVEFORMATEXTENSIBLE)wfx;
+                    ext = ext && (wex->SubFormat == KSDATAFORMAT_SUBTYPE_PCM);
+                }
+                if ((wfx->wBitsPerSample  == ISIGHTMIC_BITS) &&
+                    (ch  >= 1) && (ch <= ISIGHTMIC_MAX_CHANNELS) &&
+                    (rate == ISIGHTMIC_SAMPLERATE) &&
+                    (wfx->nBlockAlign     == blockalign) &&
+                    (wfx->nAvgBytesPerSec == rate * blockalign) &&
+                    (!ext || wfx->cbSize == (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)))) {
+                    st = STATUS_SUCCESS;
+                }
+            }
+        }
+    }
+
+    JLog(ISIGHT_J_PROPOSEFMT, ch, rate,
+         (st == STATUS_SUCCESS) ? 1 : 0);
+    return st;
+}
+
+static const PCPROPERTY_ITEM WaveFilterProperties[] = {
+    {
+        &KSPROPSETID_Pin,
+        KSPROPERTY_PIN_PROPOSEDATAFORMAT,
+        PCPROPERTY_ITEM_FLAG_SET | PCPROPERTY_ITEM_FLAG_BASICSUPPORT,
+        PropertyHandler_WaveFilterPropose
+    }
+};
+DEFINE_PCAUTOMATION_TABLE_PROP(WaveFilterAutomation, WaveFilterProperties);
+
 static PCFILTER_DESCRIPTOR WaveFilterDescriptor = {
     0,                                  // Version
-    NULL,                               // AutomationTable
+    &WaveFilterAutomation,              // AutomationTable (V41: PROPOSEDATAFORMAT)
     sizeof(PCPIN_DESCRIPTOR),           // PinSize
     2,                                  // PinCount (bridge + streaming)
     WavePins,                           // Pins
