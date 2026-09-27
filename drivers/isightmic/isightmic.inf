@@ -69,6 +69,17 @@
 ; software device.  The Microsoft MSVAD virtual-audio sample avoids the call
 ; entirely: the stream object implements IDmaChannel itself and NewStream
 ; returns the stream as the DMA channel.  Same fix here (V28-SELFDMACH).
+;
+; DriverVer 1.0.20.0 (2026-09-27): V40 capture-format fix.  Both real clients
+; (audiosrv GetMixFormat -> AUDCLNT_E_UNSUPPORTED_FORMAT 0x88890008, and wdmaud
+; waveInOpen -> WAVERR_BADFORMAT) rejected the pin even though our own KS probe
+; could RUN it.  Diffed against MSVAD (the reference WaveCyclic virtual mic):
+; the host pin was missing its KSAUDFNAME_RECORDING_CONTROL Name, and the pin's
+; data ranges only advertised WAVEFORMATEX while the audio engine negotiates the
+; mix format as WAVEFORMATEXTENSIBLE (the only PCM form that carries the channel
+; mask).  Fix: add the Name, advertise BOTH WAVEFORMATEXTENSIBLE and
+; WAVEFORMATEX data ranges, and echo the client's requested specifier back from
+; DataRangeIntersection.  JLog(ISIGHT_J_PROPOSE) records what the engine asked.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -76,7 +87,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/26/2026,1.0.19.0
+DriverVer   = 09/27/2026,1.0.20.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64

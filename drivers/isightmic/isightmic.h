@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V39-20260926-JOURNAL"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V40-20260927-EXTRANGE"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -141,6 +141,7 @@ typedef struct _ISIGHTMIC_DIAG {
 #define ISIGHT_J_CLOSE       5   // a=stream seq
 #define ISIGHT_J_INTERSECT   6   // a=ch b=rate c=bits (status in c's entry: use d)
 #define ISIGHT_J_GETPOS      7   // a=ring position (throttled: every 16th)
+#define ISIGHT_J_PROPOSE     8   // a=specifier Data1 b=ch c=rate -- what the engine asked for
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"
 #define ISIGHTMIC_CTL_DOS_NAME     L"\\DosDevices\\IsightMicCtl"

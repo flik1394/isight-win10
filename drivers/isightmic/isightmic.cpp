@@ -663,7 +663,32 @@ protected:
 // MaximumChannels, MinimumBitsPerSample, MaximumBitsPerSample,
 // MinimumSampleFrequency, MaximumSampleFrequency.  (There is no
 // MinimumChannels member -- adding one shifts every following field.)
+// V40: offer BOTH a WAVEFORMATEXTENSIBLE range and a plain WAVEFORMATEX range.
+// The audio engine (audiosrv) negotiates the capture endpoint's mix format
+// against the pin's data ranges.  Modern WASAPI clients (WeChat/QQ go through
+// this path) ask for WAVEFORMATEXTENSIBLE -- the only PCM form that carries the
+// channel mask a mono/stereo capture device needs -- and reject a bare
+// WAVEFORMATEX as AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008).  Keeping both lets
+// the engine pick the EXTENSIBLE form it wants while legacy WAVEFORMATEX
+// clients (waveIn, our own [2f] probe) still match.  This is a strict superset
+// of the old single-WAVEFORMATEX range: no regression risk.
 static KSDATARANGE_AUDIO PinDataRangesStream[] = {
+    {
+        {
+            sizeof(KSDATARANGE_AUDIO),
+            0,                               // Flags
+            0,                               // SampleSize (informational)
+            0,                               // Reserved
+            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE)
+        },
+        ISIGHTMIC_MAX_CHANNELS,               // MaximumChannels (now stereo-capable)
+        ISIGHTMIC_BITS,                     // MinimumBitsPerSample
+        ISIGHTMIC_BITS,                     // MaximumBitsPerSample
+        ISIGHTMIC_SAMPLERATE,               // MinimumSampleFrequency
+        ISIGHTMIC_SAMPLERATE                // MaximumSampleFrequency
+    },
     {
         {
             sizeof(KSDATARANGE_AUDIO),
@@ -682,7 +707,8 @@ static KSDATARANGE_AUDIO PinDataRangesStream[] = {
     }
 };
 static PKSDATARANGE PinDataRangePointersStream[] = {
-    (PKSDATARANGE)&PinDataRangesStream[0]
+    (PKSDATARANGE)&PinDataRangesStream[0],
+    (PKSDATARANGE)&PinDataRangesStream[1]
 };
 
 // Bridge data ranges carry analog audio: no format, just a connection.  Both
@@ -786,11 +812,11 @@ static PCPIN_DESCRIPTOR WavePins[] = {
         {
             0, NULL,        // Interfaces
             0, NULL,        // Mediums
-            1, (const PKSDATARANGE*)PinDataRangePointersStream,
+            2, (const PKSDATARANGE*)PinDataRangePointersStream,
             KSPIN_DATAFLOW_OUT,
             KSPIN_COMMUNICATION_SINK,
             &ISIGHTMIC_PIN_CATEGORY_CAPTURE,
-            NULL,
+            &KSAUDFNAME_RECORDING_CONTROL,
             { 0 }
         }
     }
@@ -1006,71 +1032,93 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
                                                                    IN ULONG OutputBufferLength,
                                                                    OUT PVOID ResultantFormat,
                                                                    OUT PULONG ResultantFormatLength) {
-    UNREFERENCED_PARAMETER(DataRange);
     UNREFERENCED_PARAMETER(MatchingDataRange);
-    UNREFERENCED_PARAMETER(OutputBufferLength);
-    UNREFERENCED_PARAMETER(ResultantFormat);
-    UNREFERENCED_PARAMETER(ResultantFormatLength);
 
-    // v27 dual-phase, driven by hard data from v25 and v26:
-    //   v25 (always BUFFER_TOO_SMALL): PortCls called 6982 times, EVERY one
-    //          with OutputBufferLength==0, and never came back with a buffer.
-    //   v26 (always NOT_IMPLEMENTED): PortCls suddenly called with
-    //          OutputBufferLength==82 == sizeof(KSDATAFORMAT_WAVEFORMATEX),
-    //          i.e. the buffer we asked for all along -- but we had nothing
-    //          to write, so the format still never materialised.
-    // So: if the buffer is big enough, WRITE the format and succeed (that is
-    // the only path that ever produces a format).  If it is not, return
-    // NOT_IMPLEMENTED, which provably pushes PortCls into the buffered call.
+    // V40: mirror the client's requested SPECIFIER.  The audio engine's
+    // GetMixFormat / IsFormatSupported round-trips the very format it proposes
+    // through this handler.  If we return a DIFFERENT specifier -- e.g. plain
+    // WAVEFORMATEX when the engine asked for WAVEFORMATEXTENSIBLE (which is the
+    // form GetMixFormat actually returns, and which carries the channel mask a
+    // mono capture device needs) -- the engine rejects the result and WASAPI
+    // reports AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008).  So echo the client's
+    // specifier verbatim, clamped to our hardware (48 kHz / 16-bit, 1..MAX ch).
     g_WaveIntersect++;
     g_WaveIntersectLastPin = PinId;
     g_WaveIntersectLastOutLen = OutputBufferLength;
+
+    ULONG cliSpec = 0, cliCh = 0, cliRate = 0, cliBits = 0;
+    if (DataRange && DataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
+        PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)DataRange;
+        cliSpec = a->Specifier.Data1;
+        cliCh   = a->MaximumChannels;
+        cliRate = a->MaximumSampleFrequency;
+        cliBits = a->MaximumBitsPerSample;
+        g_ClientChannels   = cliCh;
+        g_ClientSampleRate = cliRate;
+        g_ClientBits       = cliBits;
+    }
     if (MatchingDataRange) {
         g_WaveIntersectReqSpec = MatchingDataRange->Specifier.Data1;
-        if (MatchingDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
-            PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)MatchingDataRange;
-            g_ClientChannels   = a->MaximumChannels;
-            g_ClientSampleRate = a->MaximumSampleFrequency;
-            g_ClientBits       = a->MaximumBitsPerSample;
-        }
     }
+    // journal the engine's PROPOSAL verbatim (specifier Data1, channels, rate)
+    JLog(ISIGHT_J_PROPOSE, cliSpec, cliCh, cliRate);
 
-    if (OutputBufferLength < sizeof(KSDATAFORMAT_WAVEFORMATEX) || !ResultantFormat) {
+    // WAVEFORMATEX specifier Data1 = 0x05589F81; WAVEFORMATEXTENSIBLE = 0x00000002.
+    bool wantExt = (cliSpec == 0x00000002);
+    ULONG need = wantExt ? sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE)
+                         : sizeof(KSDATAFORMAT_WAVEFORMATEX);
+    if (OutputBufferLength < need || !ResultantFormat) {
         g_WaveIntersectLastStatus = STATUS_NOT_IMPLEMENTED;
-        JLog(ISIGHT_J_INTERSECT, g_ClientChannels, g_ClientSampleRate,
-             g_ClientBits);
+        JLog(ISIGHT_J_INTERSECT, cliCh, cliRate, cliBits);
         return STATUS_NOT_IMPLEMENTED;
     }
     g_WaveIntersectPhase2++;
 
-    // We accept the channel count the engine asked for (1 or 2) but
-    // physically produce 48 kHz / 16-bit mono and upmix to the requested
-    // channel count, so the only variable is nChannels.
-    ULONG channels = 1;
-    if (MatchingDataRange && MatchingDataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
-        PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)MatchingDataRange;
-        if (a->MaximumChannels >= 1) {
-            channels = a->MaximumChannels;
-            if (channels > (ULONG)ISIGHTMIC_MAX_CHANNELS) channels = (ULONG)ISIGHTMIC_MAX_CHANNELS;
-        }
+    ULONG channels = (cliCh >= 1) ? cliCh : 1;
+    if (channels > (ULONG)ISIGHTMIC_MAX_CHANNELS) channels = (ULONG)ISIGHTMIC_MAX_CHANNELS;
+    ULONG bits = (cliBits >= 16) ? 16 : (cliBits > 0 ? cliBits : 16);
+    if (bits > 16) bits = 16;
+    ULONG rate = ISIGHTMIC_SAMPLERATE; // hardware is 48 kHz only
+
+    if (wantExt) {
+        PKSDATAFORMAT_WAVEFORMATEXTENSIBLE fmt = (PKSDATAFORMAT_WAVEFORMATEXTENSIBLE)ResultantFormat;
+        RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE));
+        fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
+        fmt->DataFormat.SampleSize  = (ULONG)(bits / 8 * channels);
+        fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+        fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
+        fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE;
+        fmt->WaveFormatExt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+        fmt->WaveFormatExt.Format.nChannels       = (WORD)channels;
+        fmt->WaveFormatExt.Format.nSamplesPerSec  = rate;
+        fmt->WaveFormatExt.Format.nBlockAlign     = (WORD)(bits / 8 * channels);
+        fmt->WaveFormatExt.Format.wBitsPerSample  = (WORD)bits;
+        fmt->WaveFormatExt.Format.cbSize          = (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
+        fmt->WaveFormatExt.Format.nAvgBytesPerSec = rate * (bits / 8 * channels);
+        fmt->WaveFormatExt.Samples.wValidBitsPerSample = (WORD)bits;
+        fmt->WaveFormatExt.dwChannelMask = (channels == 1)
+            ? KSAUDIO_SPEAKER_MONO : KSAUDIO_SPEAKER_STEREO;
+        fmt->WaveFormatExt.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+        if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
+    } else {
+        PKSDATAFORMAT_WAVEFORMATEX fmt = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
+        RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEX));
+        fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
+        fmt->DataFormat.SampleSize  = (ULONG)(bits / 8 * channels);
+        fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+        fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
+        fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+        fmt->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
+        fmt->WaveFormatEx.nChannels       = (WORD)channels;
+        fmt->WaveFormatEx.nSamplesPerSec  = rate;
+        fmt->WaveFormatEx.nBlockAlign     = (WORD)(bits / 8 * channels);
+        fmt->WaveFormatEx.wBitsPerSample  = (WORD)bits;
+        fmt->WaveFormatEx.cbSize          = 0;
+        fmt->WaveFormatEx.nAvgBytesPerSec = rate * (bits / 8 * channels);
+        if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
     }
-    PKSDATAFORMAT_WAVEFORMATEX fmt = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
-    RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEX));
-    fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-    fmt->DataFormat.SampleSize  = (ULONG)(ISIGHTMIC_BITS / 8 * channels);
-    fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-    fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
-    fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
-    fmt->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
-    fmt->WaveFormatEx.nChannels       = (WORD)channels;
-    fmt->WaveFormatEx.nSamplesPerSec  = ISIGHTMIC_SAMPLERATE;
-    fmt->WaveFormatEx.nBlockAlign     = (WORD)(ISIGHTMIC_BITS / 8 * channels);
-    fmt->WaveFormatEx.wBitsPerSample  = ISIGHTMIC_BITS;
-    fmt->WaveFormatEx.cbSize          = 0;
-    fmt->WaveFormatEx.nAvgBytesPerSec = ISIGHTMIC_SAMPLERATE * (ISIGHTMIC_BITS / 8 * channels);
-    if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
     g_WaveIntersectLastStatus = STATUS_SUCCESS;
-    JLog(ISIGHT_J_INTERSECT, channels, ISIGHTMIC_SAMPLERATE, ISIGHTMIC_BITS);
+    JLog(ISIGHT_J_INTERSECT, channels, rate, bits);
     return STATUS_SUCCESS;
 }
 
