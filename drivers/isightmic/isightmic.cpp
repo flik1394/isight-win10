@@ -1265,9 +1265,70 @@ static PCCONNECTION_DESCRIPTOR TopologyConnections[] = {
     { KSNODE_TOPO_MIC, 0,                   KSFILTER_NODE, KSPIN_TOPO_WAVE_BRIDGE }
 };
 
+// ---- V45: KSPROPERTY_JACK_DESCRIPTION -------------------------------------
+// Measured gap against the MSVAD "mic" reference: its topology filter
+// publishes an automation table whose single item is
+// KSPROPERTY_JACK_DESCRIPTION, and it supplies a KSJACK_DESCRIPTION for the
+// microphone pin.  Ours published none -- TopologyFilterDescriptor.
+// AutomationTable was NULL.
+//
+// That matters because the audio endpoint builder reads this property while it
+// decides what the capture endpoint's default mix format is: the very first
+// field of KSJACK_DESCRIPTION is the channel mapping.  Missing it is
+// consistent with everything measured on the box after the V43 reboot --
+// endpoint holds 3 audio-format keys against the working Realtek mic's 12,
+// and PKEY_AudioEngine_DeviceFormat (the mix format) is absent, which is
+// exactly what GetMixFormat reports as 0x88890008.
+static KSJACK_DESCRIPTION IsightJackDescription = {
+    KSAUDIO_SPEAKER_STEREO,     // ChannelMapping
+    0xE88C99,                   // Color: HDAudio spec value for pink (mic)
+    eConnType3Point5mm,         // ConnectionType
+    eGeoLocRear,                // GeoLocation
+    eGenLocPrimaryBox,          // GenLocation
+    ePortConnJack,              // PortConnection
+    TRUE                        // IsConnected
+};
+
+static NTSTATUS PropertyHandlerJackDescription(IN PPCPROPERTY_REQUEST PropertyRequest) {
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (PropertyRequest->ValueSize < sizeof(ULONG))
+            return STATUS_BUFFER_TOO_SMALL;
+        *(PULONG)PropertyRequest->Value =
+            KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
+        PropertyRequest->Irp->IoStatus.Information = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_GET) {
+        // The property instance names the pin whose jack is being described.
+        ULONG pinId = (ULONG)-1;
+        if (PropertyRequest->InstanceSize >= sizeof(ULONG))
+            pinId = *(PULONG)PropertyRequest->Instance;
+        if (pinId != KSPIN_TOPO_MIC_JACK)
+            return STATUS_INVALID_DEVICE_REQUEST;
+        if (PropertyRequest->ValueSize < sizeof(KSJACK_DESCRIPTION))
+            return STATUS_BUFFER_TOO_SMALL;
+        PKSJACK_DESCRIPTION jd = (PKSJACK_DESCRIPTION)PropertyRequest->Value;
+        RtlZeroMemory(jd, sizeof(KSJACK_DESCRIPTION));
+        *jd = IsightJackDescription;
+        PropertyRequest->Irp->IoStatus.Information = sizeof(KSJACK_DESCRIPTION);
+        return STATUS_SUCCESS;
+    }
+    return STATUS_NOT_SUPPORTED;
+}
+
+static const PCPROPERTY_ITEM TopoFilterProperties[] = {
+    {
+        &KSPROPSETID_Jack,
+        KSPROPERTY_JACK_DESCRIPTION,
+        PCPROPERTY_ITEM_FLAG_GET | PCPROPERTY_ITEM_FLAG_BASICSUPPORT,
+        PropertyHandlerJackDescription
+    }
+};
+DEFINE_PCAUTOMATION_TABLE_PROP(TopoFilterAutomation, TopoFilterProperties);
+
 static PCFILTER_DESCRIPTOR TopologyFilterDescriptor = {
     0,                                  // Version
-    NULL,                               // AutomationTable
+    &TopoFilterAutomation,              // AutomationTable (V45: JACK_DESCRIPTION)
     sizeof(PCPIN_DESCRIPTOR),           // PinSize
     2,                                  // PinCount
     TopologyPins,                       // Pins
