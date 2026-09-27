@@ -1310,7 +1310,11 @@ static HRESULT TryInitFormat(IMMDevice* dev, const WAVEFORMATEX* wfx,
     Sleep(200);
     while (loops++ < 25) {
         UINT32 n = 0; DWORD flags = 0; BYTE* pb = NULL;
-        HRESULT gh = cap->GetBuffer(&n, &pb, &flags);
+        // IAudioCaptureClient::GetBuffer takes FIVE arguments (data ptr first,
+        // then frame count, flags, device position, QPC).  Passing NULL for the
+        // two positions is legal; getting the count order wrong silently reads
+        // the pointer as a length.
+        HRESULT gh = cap->GetBuffer(&pb, &n, &flags, NULL, NULL);
         if (gh == AUDCLNT_S_BUFFER_EMPTY) { Sleep(10); continue; }
         if (FAILED(gh)) break;
         frames += n; cap->ReleaseBuffer(n);
