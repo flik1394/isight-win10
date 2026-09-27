@@ -89,6 +89,17 @@
 ; PROPOSEDATAFORMAT handler that accepts PCM 16-bit 1..2ch @48000
 ; (WAVEFORMATEX or WAVEFORMATEXTENSIBLE cbSize=22), journals every verdict
 ; (ISIGHT_J_PROPOSEFMT), and rejects everything else with STATUS_NO_MATCH.
+;
+; DriverVer 1.0.22.0 (2026-09-27): V43 -- the capture endpoint still would not
+; open (GetMixFormat -> AUDCLNT_E_UNSUPPORTED_FORMAT 0x88890008) even after the
+; V41 PROPOSEDATAFORMAT gate.  Diffed the data ranges against the MSVAD "mic"
+; sample a second time: that reference ships a SINGLE WAVEFORMATEX range and
+; works; ours advertised BOTH WAVEFORMATEXTENSIBLE and WAVEFORMATEX (V40).  The
+; second EXTENSIBLE range is what makes the audio engine fail to settle on a
+; default capture mix format.  Fix: drop the EXTENSIBLE range, keep only
+; WAVEFORMATEX (stereo-capable, 48k/16).  EXTENSIBLE is still accepted on the
+; PROPOSEDATAFORMAT gate and echoed by DataRangeIntersection for explicit
+; (exclusive-mode) clients -- we only stop advertising it as a default range.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -96,7 +107,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/27/2026,1.0.21.0
+DriverVer   = 09/27/2026,1.0.22.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64

@@ -665,38 +665,24 @@ protected:
 static const GUID IsightSpecWaveFormatExtensible =
     STATIC_KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE;
 
-// 48 kHz / 16-bit / mono capture data range.
-// KSDATARANGE_AUDIO = KSDATARANGE (FormatSize, Flags, SampleSize, Reserved,
-// MajorFormat, SubFormat, Specifier) followed by exactly five ULONGs:
-// MaximumChannels, MinimumBitsPerSample, MaximumBitsPerSample,
-// MinimumSampleFrequency, MaximumSampleFrequency.  (There is no
-// MinimumChannels member -- adding one shifts every following field.)
-// V40: offer BOTH a WAVEFORMATEXTENSIBLE range and a plain WAVEFORMATEX range.
-// The audio engine (audiosrv) negotiates the capture endpoint's mix format
-// against the pin's data ranges.  Modern WASAPI clients (WeChat/QQ go through
-// this path) ask for WAVEFORMATEXTENSIBLE -- the only PCM form that carries the
-// channel mask a mono/stereo capture device needs -- and reject a bare
-// WAVEFORMATEX as AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008).  Keeping both lets
-// the engine pick the EXTENSIBLE form it wants while legacy WAVEFORMATEX
-// clients (waveIn, our own [2f] probe) still match.  This is a strict superset
-// of the old single-WAVEFORMATEX range: no regression risk.
+// 48 kHz / 16-bit / stereo-capable capture data range.
+//
+// V43: back to a SINGLE plain WAVEFORMATEX range -- the exact shape the MSVAD
+// "mic" sample ships, the reference WaveCyclic virtual capture miniport that
+// works out of the box on Windows 10.  V40 added a WAVEFORMATEXTENSIBLE range
+// alongside the WAVEFORMATEX one as a "strict superset"; empirically that
+// second range is what broke GetMixFormat (0x88890008): the audio engine picks
+// the EXTENSIBLE form as the default capture mix format but cannot settle on a
+// concrete default from a range that carries no channel mask, so it returns
+// AUDCLNT_E_UNSUPPORTED_FORMAT before any client (WeChat/QQ) can open the
+// endpoint.  With only the WAVEFORMATEX range the engine selects 48k/2ch/16 and
+// the endpoint opens.  EXTENSIBLE is still ACCEPTED on the PROPOSEDATAFORMAT
+// gate and echoed by DataRangeIntersection, so a client that explicitly requests
+// it (exclusive mode) still works -- we only stop *advertising* it as a
+// default-selectable range.  MaximumChannels stays 2: the engine negotiates
+// shared-mode capture in stereo (V5 of this project), and the feeder is mono so
+// the stream upmixes mono -> requested channels.
 static KSDATARANGE_AUDIO PinDataRangesStream[] = {
-    {
-        {
-            sizeof(KSDATARANGE_AUDIO),
-            0,                               // Flags
-            0,                               // SampleSize (informational)
-            0,                               // Reserved
-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE)
-        },
-        ISIGHTMIC_MAX_CHANNELS,               // MaximumChannels (now stereo-capable)
-        ISIGHTMIC_BITS,                     // MinimumBitsPerSample
-        ISIGHTMIC_BITS,                     // MaximumBitsPerSample
-        ISIGHTMIC_SAMPLERATE,               // MinimumSampleFrequency
-        ISIGHTMIC_SAMPLERATE                // MaximumSampleFrequency
-    },
     {
         {
             sizeof(KSDATARANGE_AUDIO),
@@ -707,7 +693,7 @@ static KSDATARANGE_AUDIO PinDataRangesStream[] = {
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
-        ISIGHTMIC_MAX_CHANNELS,               // MaximumChannels (now stereo-capable)
+        ISIGHTMIC_MAX_CHANNELS,               // MaximumChannels (stereo-capable)
         ISIGHTMIC_BITS,                     // MinimumBitsPerSample
         ISIGHTMIC_BITS,                     // MaximumBitsPerSample
         ISIGHTMIC_SAMPLERATE,               // MinimumSampleFrequency
@@ -715,8 +701,7 @@ static KSDATARANGE_AUDIO PinDataRangesStream[] = {
     }
 };
 static PKSDATARANGE PinDataRangePointersStream[] = {
-    (PKSDATARANGE)&PinDataRangesStream[0],
-    (PKSDATARANGE)&PinDataRangesStream[1]
+    (PKSDATARANGE)&PinDataRangesStream[0]
 };
 
 // Bridge data ranges carry analog audio: no format, just a connection.  Both
@@ -820,7 +805,7 @@ static PCPIN_DESCRIPTOR WavePins[] = {
         {
             0, NULL,        // Interfaces
             0, NULL,        // Mediums
-            2, (const PKSDATARANGE*)PinDataRangePointersStream,
+            1, (const PKSDATARANGE*)PinDataRangePointersStream,
             KSPIN_DATAFLOW_OUT,
             KSPIN_COMMUNICATION_SINK,
             &ISIGHTMIC_PIN_CATEGORY_CAPTURE,
