@@ -1284,6 +1284,62 @@ static bool FindCaptureEndpoint(IMMDevice** out, char* nameOut, size_t nameLen) 
 // ---------------------------------------------------------------------------
 static void WriteWav16(const char* path, const short* s, UINT n);
 
+// V42 diagnostic: GetMixFormat failed (0x88890008).  That HRESULT is WASAPI's
+// catch-all for "could not settle on a default mix format".  To isolate whether
+// the audio engine will accept OUR endpoint at all (vs. merely failing to pick
+// a default), probe IAudioClient::Initialize() with hard-coded 48 kHz formats
+// -- 1ch PCM, 2ch PCM, and 2ch WAVEFORMATEXTENSIBLE -- and report which one the
+// engine accepts and whether real capture bytes flow.  If any succeeds the
+// driver data path is fine and the only remaining fix is to make GetMixFormat
+// *return* that format; if all fail the fault is deeper (topology / nodes).
+static HRESULT TryInitFormat(IMMDevice* dev, const WAVEFORMATEX* wfx,
+                             const char* label) {
+    IAudioClient* ac = NULL;
+    HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&ac);
+    if (FAILED(hr)) { say("[4b] %-14s activate failed 0x%08X", label, hr); return hr; }
+    REFERENCE_TIME dur = 2000000; // 200 ms buffer
+    hr = ac->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, dur, 0, (WAVEFORMATEX*)wfx, NULL);
+    if (FAILED(hr)) { say("[4b] %-14s init failed     0x%08X", label, hr); ac->Release(); return hr; }
+    say("[4b] %-14s init OK", label);
+    IAudioCaptureClient* cap = NULL;
+    hr = ac->GetService(__uuidof(IAudioCaptureClient), (void**)&cap);
+    if (FAILED(hr)) { say("[4b] %-14s GetService fail 0x%08X", label, hr); ac->Release(); return hr; }
+    hr = ac->Start();
+    if (FAILED(hr)) { say("[4b] %-14s Start fail      0x%08X", label, hr); cap->Release(); ac->Release(); return hr; }
+    UINT32 frames = 0, loops = 0;
+    Sleep(200);
+    while (loops++ < 25) {
+        UINT32 n = 0; DWORD flags = 0; BYTE* pb = NULL;
+        HRESULT gh = cap->GetBuffer(&n, &pb, &flags);
+        if (gh == AUDCLNT_S_BUFFER_EMPTY) { Sleep(10); continue; }
+        if (FAILED(gh)) break;
+        frames += n; cap->ReleaseBuffer(n);
+    }
+    say("[4b] %-14s captured %u frames", label, frames);
+    ac->Stop(); cap->Release(); ac->Release();
+    return S_OK;
+}
+
+static void ProbeInitFormats(IMMDevice* dev) {
+    WAVEFORMATEX a = { WAVE_FORMAT_PCM, 1, 48000, 48000 * 2, 2, 16, 0 };
+    TryInitFormat(dev, &a, "48k/1ch PCM");
+    WAVEFORMATEX b = { WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0 };
+    TryInitFormat(dev, &b, "48k/2ch PCM");
+    BYTE eb[sizeof(WAVEFORMATEXTENSIBLE)] = { 0 };
+    PWAVEFORMATEXTENSIBLE e = (PWAVEFORMATEXTENSIBLE)eb;
+    e->Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+    e->Format.nChannels       = 2;
+    e->Format.nSamplesPerSec  = 48000;
+    e->Format.nBlockAlign     = 4;
+    e->Format.wBitsPerSample  = 16;
+    e->Format.cbSize          = (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
+    e->Format.nAvgBytesPerSec = 48000 * 4;
+    e->Samples.wValidBitsPerSample = 16;
+    e->dwChannelMask          = KSAUDIO_SPEAKER_STEREO;
+    e->SubFormat              = KSDATAFORMAT_SUBTYPE_PCM;
+    TryInitFormat(dev, (WAVEFORMATEX*)e, "48k/2ch EXT");
+}
+
 static void CaptureFrom(IMMDevice* dev, int seconds) {
     IAudioClient* ac = NULL;
     HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&ac);
@@ -1291,7 +1347,11 @@ static void CaptureFrom(IMMDevice* dev, int seconds) {
 
     WAVEFORMATEX* mix = NULL;
     hr = ac->GetMixFormat(&mix);
-    if (FAILED(hr) || !mix) { say("[4] GetMixFormat failed (0x%08X)", hr); ac->Release(); return; }
+    if (FAILED(hr) || !mix) {
+        say("[4] GetMixFormat failed (0x%08X)", hr);
+        ProbeInitFormats(dev);   // V42: isolate engine-accepted format
+        ac->Release(); return;
+    }
     bool isFloat = (mix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
                    (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix->wBitsPerSample == 32);
     say("[4] endpoint format : %u Hz / %u ch / %u bit / %s", mix->nSamplesPerSec,
