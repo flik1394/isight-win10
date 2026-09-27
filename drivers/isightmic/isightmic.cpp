@@ -657,6 +657,14 @@ protected:
     LONG m_RefCount;
 };
 
+// V40: the WAVEFORMATEXTENSIBLE specifier GUID {0316AC81-376D-11D2-8FC4-00C04FB9988E}
+// is absent from this WDK's ksmedia.h -- write the literal ourselves (GUID symbol
+// macros have burned this project before: verify, never assume).
+#define STATIC_KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE \
+    {0x0316AC81, 0x376D, 0x11D2, {0x8F, 0xC4, 0x00, 0xC0, 0x4F, 0xB9, 0x98, 0x8E}}
+static const GUID IsightSpecWaveFormatExtensible =
+    STATIC_KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE;
+
 // 48 kHz / 16-bit / mono capture data range.
 // KSDATARANGE_AUDIO = KSDATARANGE (FormatSize, Flags, SampleSize, Reserved,
 // MajorFormat, SubFormat, Specifier) followed by exactly five ULONGs:
@@ -1047,12 +1055,28 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
     g_WaveIntersectLastOutLen = OutputBufferLength;
 
     ULONG cliSpec = 0, cliCh = 0, cliRate = 0, cliBits = 0;
-    if (DataRange && DataRange->FormatSize >= sizeof(KSDATARANGE_AUDIO)) {
-        PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)DataRange;
-        cliSpec = a->Specifier.Data1;
-        cliCh   = a->MaximumChannels;
-        cliRate = a->MaximumSampleFrequency;
-        cliBits = a->MaximumBitsPerSample;
+    bool wantExt = false;
+    if (DataRange) {
+        cliSpec = DataRange->Specifier.Data1;
+        // The engine proposes a KSDATAFORMAT whose WAVEFORMATEX header trails
+        // the KSDATAFORMAT fixed part -- NOT a KSDATARANGE_AUDIO.  (Reading
+        // MaximumChannels through a KSDATARANGE_AUDIO cast on a KSDATAFORMAT
+        // would land in the WAVEFORMATEX header bytes = garbage.)
+        if (DataRange->FormatSize == sizeof(KSDATARANGE_AUDIO)) {
+            PKSDATARANGE_AUDIO a = (PKSDATARANGE_AUDIO)DataRange;
+            cliCh   = a->MaximumChannels;
+            cliRate = a->MaximumSampleFrequency;
+            cliBits = a->MaximumBitsPerSample;
+        } else if (DataRange->FormatSize >= sizeof(KSDATAFORMAT) + sizeof(WAVEFORMATEX)) {
+            PWAVEFORMATEX wfx = (PWAVEFORMATEX)((PBYTE)DataRange + sizeof(KSDATAFORMAT));
+            cliCh   = wfx->nChannels;
+            cliRate = wfx->nSamplesPerSec;
+            cliBits = wfx->wBitsPerSample;
+            // WAVE_FORMAT_EXTENSIBLE (0xFFFE) is the authoritative marker: a
+            // KSDATAFORMAT_WAVEFORMATEXTENSIBLE keeps Specifier=WAVEFORMATEX
+            // and carries the extension via wFormatTag/cbSize=22.
+            wantExt = (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE);
+        }
         g_ClientChannels   = cliCh;
         g_ClientSampleRate = cliRate;
         g_ClientBits       = cliBits;
@@ -1063,8 +1087,8 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
     // journal the engine's PROPOSAL verbatim (specifier Data1, channels, rate)
     JLog(ISIGHT_J_PROPOSE, cliSpec, cliCh, cliRate);
 
-    // WAVEFORMATEX specifier Data1 = 0x05589F81; WAVEFORMATEXTENSIBLE = 0x00000002.
-    bool wantExt = (cliSpec == 0x00000002);
+    // An explicit EXTENSIBLE specifier GUID in the proposal also counts.
+    if (cliSpec == 0x0316AC81) wantExt = true;
     ULONG need = wantExt ? sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE)
                          : sizeof(KSDATAFORMAT_WAVEFORMATEX);
     if (OutputBufferLength < need || !ResultantFormat) {
@@ -1087,7 +1111,7 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
         fmt->DataFormat.SampleSize  = (ULONG)(bits / 8 * channels);
         fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
         fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
-        fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE;
+        fmt->DataFormat.Specifier   = IsightSpecWaveFormatExtensible;
         fmt->WaveFormatExt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
         fmt->WaveFormatExt.Format.nChannels       = (WORD)channels;
         fmt->WaveFormatExt.Format.nSamplesPerSec  = rate;
