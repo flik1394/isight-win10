@@ -101,7 +101,7 @@
 ; PROPOSEDATAFORMAT gate and echoed by DataRangeIntersection for explicit
 ; (exclusive-mode) clients -- we only stop advertising it as a default range.
 ;
-; DriverVer 1.0.23.0 (2026-09-28): V44 -- V43 was measured on the box after a
+; DriverVer 1.0.23.0 (2026-09-27): V44 -- V43 was measured on the box after a
 ; reboot and it did NOT clear the wall: GetMixFormat still 0x88890008, and all
 ; three hard-coded WASAPI probes (48k/1ch, 48k/2ch, 48k/2ch EXTENSIBLE) still
 ; failed the same way.  The decisive measurement: our endpoint's MMDevices
@@ -116,7 +116,7 @@
 ; reads "Portcls will handle the request for us").  Fix: hand the intersection
 ; back to PortCls; keep parsing the proposal for telemetry only.
 ;
-; DriverVer 1.0.24.0 (2026-09-28): V45 -- while preparing V44 the topology
+; DriverVer 1.0.24.0 (2026-09-27): V45 -- while preparing V44 the topology
 ; tables were diffed against the MSVAD "mic" reference for the first time, and
 ; a second gap turned up: that reference's topology filter publishes an
 ; automation table with KSPROPERTY_JACK_DESCRIPTION plus a KSJACK_DESCRIPTION
@@ -133,7 +133,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/28/2026,1.0.24.0
+DriverVer   = 09/27/2026,1.0.24.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64
