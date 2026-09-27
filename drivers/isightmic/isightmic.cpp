@@ -1151,61 +1151,36 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
 
     // An explicit EXTENSIBLE specifier GUID in the proposal also counts.
     if (cliSpec == 0x0316AC81) wantExt = true;
-    ULONG need = wantExt ? sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE)
-                         : sizeof(KSDATAFORMAT_WAVEFORMATEX);
-    if (OutputBufferLength < need || !ResultantFormat) {
-        g_WaveIntersectLastStatus = STATUS_NOT_IMPLEMENTED;
-        JLog(ISIGHT_J_INTERSECT, cliCh, cliRate, cliBits);
-        return STATUS_NOT_IMPLEMENTED;
-    }
-    g_WaveIntersectPhase2++;
+    (void)wantExt;   // telemetry only: PortCls now owns the match
 
-    ULONG channels = (cliCh >= 1) ? cliCh : 1;
-    if (channels > (ULONG)ISIGHTMIC_MAX_CHANNELS) channels = (ULONG)ISIGHTMIC_MAX_CHANNELS;
-    ULONG bits = (cliBits >= 16) ? 16 : (cliBits > 0 ? cliBits : 16);
-    if (bits > 16) bits = 16;
-    ULONG rate = ISIGHTMIC_SAMPLERATE; // hardware is 48 kHz only
-
-    if (wantExt) {
-        PKSDATAFORMAT_WAVEFORMATEXTENSIBLE fmt = (PKSDATAFORMAT_WAVEFORMATEXTENSIBLE)ResultantFormat;
-        RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE));
-        fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
-        fmt->DataFormat.SampleSize  = (ULONG)(bits / 8 * channels);
-        fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-        fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
-        fmt->DataFormat.Specifier   = IsightSpecWaveFormatExtensible;
-        fmt->WaveFormatExt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
-        fmt->WaveFormatExt.Format.nChannels       = (WORD)channels;
-        fmt->WaveFormatExt.Format.nSamplesPerSec  = rate;
-        fmt->WaveFormatExt.Format.nBlockAlign     = (WORD)(bits / 8 * channels);
-        fmt->WaveFormatExt.Format.wBitsPerSample  = (WORD)bits;
-        fmt->WaveFormatExt.Format.cbSize          = (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
-        fmt->WaveFormatExt.Format.nAvgBytesPerSec = rate * (bits / 8 * channels);
-        fmt->WaveFormatExt.Samples.wValidBitsPerSample = (WORD)bits;
-        fmt->WaveFormatExt.dwChannelMask = (channels == 1)
-            ? KSAUDIO_SPEAKER_MONO : KSAUDIO_SPEAKER_STEREO;
-        fmt->WaveFormatExt.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
-        if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
-    } else {
-        PKSDATAFORMAT_WAVEFORMATEX fmt = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
-        RtlZeroMemory(fmt, sizeof(KSDATAFORMAT_WAVEFORMATEX));
-        fmt->DataFormat.FormatSize  = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-        fmt->DataFormat.SampleSize  = (ULONG)(bits / 8 * channels);
-        fmt->DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-        fmt->DataFormat.SubFormat   = KSDATAFORMAT_SUBTYPE_PCM;
-        fmt->DataFormat.Specifier   = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
-        fmt->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
-        fmt->WaveFormatEx.nChannels       = (WORD)channels;
-        fmt->WaveFormatEx.nSamplesPerSec  = rate;
-        fmt->WaveFormatEx.nBlockAlign     = (WORD)(bits / 8 * channels);
-        fmt->WaveFormatEx.wBitsPerSample  = (WORD)bits;
-        fmt->WaveFormatEx.cbSize          = 0;
-        fmt->WaveFormatEx.nAvgBytesPerSec = rate * (bits / 8 * channels);
-        if (ResultantFormatLength) *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-    }
-    g_WaveIntersectLastStatus = STATUS_SUCCESS;
-    JLog(ISIGHT_J_INTERSECT, channels, rate, bits);
-    return STATUS_SUCCESS;
+    // ----------------------------------------------------------------
+    // V44: MSVAD-mic parity -- deliberately do NOT synthesise a format.
+    //
+    // The Microsoft msvad/mic reference (a working WaveCyclic virtual
+    // capture miniport) answers this request with STATUS_NOT_IMPLEMENTED
+    // and the comment "Portcls will handle the request for us".
+    //
+    // Our V40 handler instead echoed the client's specifier back.
+    // V41..V43 proved that is not enough: the pin instantiates and the
+    // port copies data (PORT COPIES DATA), PROPOSEDATAFORMAT accepts
+    // 48k 1ch and 2ch, the intersection returns STATUS_SUCCESS -- and
+    // still the endpoint ends up with an EMPTY format list.
+    // Measured on the live box after the V43 reboot: our endpoint's
+    // MMDevices property store carries 3 format keys while the working
+    // Realtek mic carries 12, and PKEY_AudioEngine_DeviceFormat
+    // (f19f064d,0) -- the mix format itself -- is absent.  That absence
+    // is exactly what GetMixFormat reports as 0x88890008.
+    //
+    // With the data range now matching MSVAD field for field (V43), this
+    // handler is the last structural difference from the working
+    // reference.  Hand the intersection back to PortCls.
+    // ----------------------------------------------------------------
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(ResultantFormat);
+    UNREFERENCED_PARAMETER(ResultantFormatLength);
+    g_WaveIntersectLastStatus = STATUS_NOT_IMPLEMENTED;
+    JLog(ISIGHT_J_INTERSECT, cliCh, cliRate, cliBits);
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 // ---------------------------------------------------------------------------

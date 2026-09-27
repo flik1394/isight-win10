@@ -100,6 +100,21 @@
 ; WAVEFORMATEX (stereo-capable, 48k/16).  EXTENSIBLE is still accepted on the
 ; PROPOSEDATAFORMAT gate and echoed by DataRangeIntersection for explicit
 ; (exclusive-mode) clients -- we only stop advertising it as a default range.
+;
+; DriverVer 1.0.23.0 (2026-09-28): V44 -- V43 was measured on the box after a
+; reboot and it did NOT clear the wall: GetMixFormat still 0x88890008, and all
+; three hard-coded WASAPI probes (48k/1ch, 48k/2ch, 48k/2ch EXTENSIBLE) still
+; failed the same way.  The decisive measurement: our endpoint's MMDevices
+; property store holds 3 audio-format keys while the working Realtek mic on the
+; same machine holds 12, and PKEY_AudioEngine_DeviceFormat ({f19f064d},0) --
+; the mix format itself -- is absent.  The endpoint was rebuilt from scratch by
+; the V43 reboot, so this is a clean verdict: format discovery still produces
+; nothing.  Data range now matches MSVAD field for field, so the LAST remaining
+; structural difference is DataRangeIntersection: we synthesised a format by
+; echoing the client's specifier, while the MSVAD "mic" reference returns
+; STATUS_NOT_IMPLEMENTED and lets PortCls do the intersection (its own comment
+; reads "Portcls will handle the request for us").  Fix: hand the intersection
+; back to PortCls; keep parsing the proposal for telemetry only.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -107,7 +122,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/27/2026,1.0.22.0
+DriverVer   = 09/28/2026,1.0.23.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64
