@@ -1260,16 +1260,16 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
             pf->DataFormat.MajorFormat   = KSDATAFORMAT_TYPE_AUDIO;
             pf->DataFormat.SubFormat     = KSDATAFORMAT_SUBTYPE_PCM;
             pf->DataFormat.Specifier     = KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE;
-            pf->WaveFormatEx.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
-            pf->WaveFormatEx.Format.nChannels       = (WORD)ch;
-            pf->WaveFormatEx.Format.nSamplesPerSec  = rate;
-            pf->WaveFormatEx.Format.nAvgBytesPerSec = rate * ch * 2;
-            pf->WaveFormatEx.Format.nBlockAlign     = (WORD)(ch * 2);
-            pf->WaveFormatEx.Format.wBitsPerSample  = (WORD)bits;
-            pf->WaveFormatEx.Format.cbSize          = (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
-            pf->WaveFormatEx.Samples.wValidBitsPerSample = (WORD)bits;
-            pf->WaveFormatEx.dwChannelMask   = (ch == 1) ? KSAUDIO_SPEAKER_MONO : KSAUDIO_SPEAKER_STEREO;
-            pf->WaveFormatEx.SubFormat       = KSDATAFORMAT_SUBTYPE_PCM;
+            pf->WaveFormatExt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+            pf->WaveFormatExt.Format.nChannels       = (WORD)ch;
+            pf->WaveFormatExt.Format.nSamplesPerSec  = rate;
+            pf->WaveFormatExt.Format.nAvgBytesPerSec = rate * ch * 2;
+            pf->WaveFormatExt.Format.nBlockAlign     = (WORD)(ch * 2);
+            pf->WaveFormatExt.Format.wBitsPerSample  = (WORD)bits;
+            pf->WaveFormatExt.Format.cbSize          = (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
+            pf->WaveFormatExt.Samples.wValidBitsPerSample = (WORD)bits;
+            pf->WaveFormatExt.dwChannelMask   = (ch == 1) ? KSAUDIO_SPEAKER_MONO : KSAUDIO_SPEAKER_STEREO;
+            pf->WaveFormatExt.SubFormat       = KSDATAFORMAT_SUBTYPE_PCM;
         } else {
             PKSDATAFORMAT_WAVEFORMATEX pf = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
             pf->DataFormat.FormatSize    = need;
