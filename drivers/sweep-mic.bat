@@ -37,6 +37,20 @@ echo V46 sweep  %DATE% %TIME% > "%SUM%"
 echo combos: baseline, ranges_dual, mono, no_jack, intersect_echo, topo_full, ranges_mono, ranges_mono_nojack, full_mono >> "%SUM%"
 echo. >> "%SUM%"
 
+REM ---- trust THIS package's test certificate before touching the device --
+REM Every CI build ships a fresh throwaway cert (CN=iSightMic Test), and
+REM switch-mic.bat only remove/installs the device node -- it never imports a
+REM cert.  Run straight into the sweep on a freshly downloaded package and the
+REM new .sys cannot load, so the sweep would quietly measure whatever older
+REM trusted driver is still installed.  Re-importing is harmless and idempotent.
+if exist iSightMicTest.cer (
+  echo [sweep] importing this package's test certificate ...
+  certutil -addstore Root             iSightMicTest.cer >nul 2>&1
+  certutil -addstore TrustedPublisher iSightMicTest.cer >nul 2>&1
+) else (
+  echo [sweep] WARNING: iSightMicTest.cer not found -- run this from the unzipped package dir.
+)
+
 REM ---- curated matrix: call :run <label> <I> <R> <J> <T> <M> ----
 call :run baseline_V45       0 0 1 0 0
 call :run ranges_dual        0 1 1 0 0
