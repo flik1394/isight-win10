@@ -126,6 +126,14 @@
 ; default mix format.  Fix: add a JACK_DESCRIPTION handler on the topology
 ; filter describing the mic jack as a connected 3.5mm stereo input.  Both V44
 ; and V45 ship in this build.
+;
+; DriverVer 1.0.25.0 (2026-09-27): V46 -- runtime switch harness.  Five DWORDs
+; under HKLM\SOFTWARE\iSightMic (Intersect / Ranges / Jack / Topo / Mono) select
+; the format-negotiation shape at DriverEntry, so every hypothesis V40-V45 tried
+; (and the untested "Full" topology with a volume node) can be enumerated on the
+; live box WITHOUT recompiling and WITHOUT rebooting: set the DWORDs, cycle the
+; device with switch-mic.bat, re-run miccheck.  Default bit values reproduce V45
+; exactly, so a clean install is unchanged.  Build tag: ISIGHTMIC-BUILD-V46-...SWITCH.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -133,7 +141,7 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/27/2026,1.0.24.0
+DriverVer   = 09/27/2026,1.0.25.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64

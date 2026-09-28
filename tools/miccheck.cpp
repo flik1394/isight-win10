@@ -210,6 +210,10 @@ static void PrintJournal(const ISIGHTMIC_DIAG* d) {
         case ISIGHT_J_PROPOSEFMT:
             say("      #%-3u PDFORMAT    ch=%lu rate=%lu %s",
                 head - k, a, b, c ? "ACCEPT" : "reject"); break;
+        case ISIGHT_J_CONFIG:
+            say("      #%-3u CONFIG     code=%lu (i=%lu r=%lu j=%lu t=%lu m=%lu)",
+                head - k, a, a & 1, (a >> 1) & 1, (a >> 2) & 1,
+                (a >> 3) & 1, (a >> 4) & 1); break;
         default:
             say("      #%-3u id=%lu a=%lu b=%lu c=%lu", head - k, id, a, b, c);
         }
@@ -269,6 +273,10 @@ static void ProbeDiag(const char* when) {
         d.DmaSysAddr, d.DmaTransfer, d.DmaBufferSize, d.DmaAlloc,
         d.DmaAdapter, d.DmaCopyTo, d.DmaCopyFrom, d.DmaPhysAddr);
 
+    say("        V46 config code    %lu  (intersect=%lu ranges=%lu jack=%lu"
+        " topo=%lu mono=%lu)",
+        d.CfgCode, d.CfgCode & 1, (d.CfgCode >> 1) & 1, (d.CfgCode >> 2) & 1,
+        (d.CfgCode >> 3) & 1, (d.CfgCode >> 4) & 1);
     if (d.WaveInitCalls == 0)
         say("    -> the audio stack never opened the wave filter.");
     else if (d.WaveIntersect == 0)

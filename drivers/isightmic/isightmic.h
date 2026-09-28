@@ -45,7 +45,7 @@
 
 // Bumped whenever the driver changes.  Kept in the same shape as the filter's
 // tag so one grep over a binary answers "which build is this".
-#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V45-20260928-PCXSECT-JACK"
+#define ISIGHTMIC_BUILD_TAG "ISIGHTMIC-BUILD-V46-20260928-SWITCH"
 
 // Old name, kept so a stale header/test build still links.
 #define IOCTL_ISIGHTMIC_GETLEVEL IOCTL_ISIGHTMIC_GETSTATUS
@@ -131,6 +131,7 @@ typedef struct _ISIGHTMIC_DIAG {
     // the only component that sees everything (our miniport).
     unsigned long JHead;                 // total events logged (wraps)
     unsigned long Journal[32 * 4];       // {id, a, b, c} x 32
+    unsigned long CfgCode;               // V46: active runtime switch code (bit0 intersect, 1 ranges, 2 jack, 3 topo, 4 mono)
 } ISIGHTMIC_DIAG, *PISIGHTMIC_DIAG;
 
 // journal event ids (Journal[i*4+0])
@@ -143,6 +144,7 @@ typedef struct _ISIGHTMIC_DIAG {
 #define ISIGHT_J_GETPOS      7   // a=ring position (throttled: every 16th)
 #define ISIGHT_J_PROPOSE     8   // a=specifier Data1 b=ch c=rate -- what the engine asked for
 #define ISIGHT_J_PROPOSEFMT  9   // a=ch b=rate c=1 accepted / 0 rejected -- KSPROPERTY_PIN_PROPOSEDATAFORMAT (V41)
+#define ISIGHT_J_CONFIG      10  // a=code -- V46 runtime switch signature (see g_Cfg bit layout)
 
 #define ISIGHTMIC_CTL_DEVICE_NAME  L"\\Device\\IsightMicCtl"
 #define ISIGHTMIC_CTL_DOS_NAME     L"\\DosDevices\\IsightMicCtl"

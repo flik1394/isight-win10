@@ -143,6 +143,35 @@ static ULONG g_ClientChannels;
 static ULONG g_ClientSampleRate;
 static ULONG g_ClientBits;
 
+// ---- V46: runtime switch signature ---------------------------------------
+// Each bit is read from HKLM\SOFTWARE\iSightMic at DriverEntry so we can
+// enumerate format-negotiation hypotheses on the live box without recompiling
+// (and without waiting on CI): flip a registry DWORD, cycle the device via
+// switch-mic.bat, re-run miccheck.  Default bit values reproduce the V45
+// behaviour exactly, so a clean install is unchanged from V45.
+//
+//   bit0  Intersect : 0 = hand intersection back to PortCls (STATUS_NOT_IMPLEMENTED,
+//                     the V44/V45 choice); 1 = echo the client's proposed
+//                     specifier (the original V40 behaviour).
+//   bit1  Ranges    : 0 = advertise a single WAVEFORMATEX range (V43/V45);
+//                     1 = also advertise a WAVEFORMATEXTENSIBLE range (V40-V42).
+//   bit2  Jack      : 0 = no topology automation table (pre-V45);
+//                     1 = publish KSPROPERTY_JACK_DESCRIPTION (V45).
+//   bit3  Topo      : 0 = single MIC node (current); 1 = MIC + VOLUME node
+//                     (the "full" reference topology hypothesis).
+//   bit4  Mono      : 0 = stereo channel config + stereo jack mapping;
+//                     1 = mono channel config + mono jack mapping.
+typedef struct _ISIGHT_CFG {
+    ULONG intersect;   // 0 | 1
+    ULONG ranges;      // 0 | 1
+    ULONG jack;        // 0 | 1
+    ULONG topo;        // 0 | 1
+    ULONG mono;        // 0 | 1
+} ISIGHT_CFG;
+// Defaults == V45: PortCls intersection, single range, jack on, simple topo, stereo.
+static ISIGHT_CFG g_Cfg = { 0, 0, 1, 0, 0 };
+static ULONG g_CfgCode = 0;   // packed bitfield, surfaced in the journal + GETDIAG
+
 static void RingInit(PRING r) {
     r->Buffer = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, RING_BYTES, ISIGHTMIC_POOL_TAG);
     r->Cap = (r->Buffer != NULL) ? RING_BYTES : 0;
@@ -682,7 +711,11 @@ static const GUID IsightSpecWaveFormatExtensible =
 // default-selectable range.  MaximumChannels stays 2: the engine negotiates
 // shared-mode capture in stereo (V5 of this project), and the feeder is mono so
 // the stream upmixes mono -> requested channels.
-static KSDATARANGE_AUDIO PinDataRangesStream[] = {
+// V46: two runtime-selectable streaming data ranges.  "Single" (Ranges=0, the
+// V43/V45 shape) advertises only a plain WAVEFORMATEX range; "Dual" (Ranges=1,
+// the V40-V42 shape) also advertises a WAVEFORMATEXTENSIBLE range.  ApplyConfig
+// points the wave host pin at the chosen one so we never recompile to flip it.
+static KSDATARANGE_AUDIO g_RangeSingle[] = {
     {
         {
             sizeof(KSDATARANGE_AUDIO),
@@ -700,8 +733,31 @@ static KSDATARANGE_AUDIO PinDataRangesStream[] = {
         ISIGHTMIC_SAMPLERATE                // MaximumSampleFrequency
     }
 };
-static PKSDATARANGE PinDataRangePointersStream[] = {
-    (PKSDATARANGE)&PinDataRangesStream[0]
+static KSDATARANGE_AUDIO g_RangeDual[] = {
+    {   // [0] plain WAVEFORMATEX -- identical to the Single range
+        {
+            sizeof(KSDATARANGE_AUDIO), 0, 0, 0,
+            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+        },
+        ISIGHTMIC_MAX_CHANNELS, ISIGHTMIC_BITS, ISIGHTMIC_BITS,
+        ISIGHTMIC_SAMPLERATE, ISIGHTMIC_SAMPLERATE
+    },
+    {   // [1] WAVEFORMATEXTENSIBLE -- the V40-V42 second range
+        {
+            sizeof(KSDATARANGE_AUDIO), 0, 0, 0,
+            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+            STATICGUIDOF(IsightSpecWaveFormatExtensible)
+        },
+        ISIGHTMIC_MAX_CHANNELS, ISIGHTMIC_BITS, ISIGHTMIC_BITS,
+        ISIGHTMIC_SAMPLERATE, ISIGHTMIC_SAMPLERATE
+    }
+};
+static PKSDATARANGE g_RangePtrSingle[] = { (PKSDATARANGE)&g_RangeSingle[0] };
+static PKSDATARANGE g_RangePtrDual[] = {
+    (PKSDATARANGE)&g_RangeDual[0], (PKSDATARANGE)&g_RangeDual[1]
 };
 
 // Bridge data ranges carry analog audio: no format, just a connection.  Both
@@ -805,7 +861,7 @@ static PCPIN_DESCRIPTOR WavePins[] = {
         {
             0, NULL,        // Interfaces
             0, NULL,        // Mediums
-            1, (const PKSDATARANGE*)PinDataRangePointersStream,
+            1, (const PKSDATARANGE*)g_RangePtrSingle,
             KSPIN_DATAFLOW_OUT,
             KSPIN_COMMUNICATION_SINK,
             &ISIGHTMIC_PIN_CATEGORY_CAPTURE,
@@ -1151,30 +1207,81 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
 
     // An explicit EXTENSIBLE specifier GUID in the proposal also counts.
     if (cliSpec == 0x0316AC81) wantExt = true;
-    (void)wantExt;   // telemetry only: PortCls now owns the match
 
     // ----------------------------------------------------------------
-    // V44: MSVAD-mic parity -- deliberately do NOT synthesise a format.
+    // V46: intersection mode is a registry switch (g_Cfg.intersect).
     //
-    // The Microsoft msvad/mic reference (a working WaveCyclic virtual
-    // capture miniport) answers this request with STATUS_NOT_IMPLEMENTED
-    // and the comment "Portcls will handle the request for us".
+    //   intersect=0 (DEFAULT, V44/V45): hand the request back to PortCls with
+    //   STATUS_NOT_IMPLEMENTED -- "Portcls will handle the request for us",
+    //   exactly like the MSVAD-mic reference.
     //
-    // Our V40 handler instead echoed the client's specifier back.
-    // V41..V43 proved that is not enough: the pin instantiates and the
-    // port copies data (PORT COPIES DATA), PROPOSEDATAFORMAT accepts
-    // 48k 1ch and 2ch, the intersection returns STATUS_SUCCESS -- and
-    // still the endpoint ends up with an EMPTY format list.
-    // Measured on the live box after the V43 reboot: our endpoint's
-    // MMDevices property store carries 3 format keys while the working
-    // Realtek mic carries 12, and PKEY_AudioEngine_DeviceFormat
-    // (f19f064d,0) -- the mix format itself -- is absent.  That absence
-    // is exactly what GetMixFormat reports as 0x88890008.
-    //
-    // With the data range now matching MSVAD field for field (V43), this
-    // handler is the last structural difference from the working
-    // reference.  Hand the intersection back to PortCls.
+    //   intersect=1 (V40 behaviour, kept for hypothesis testing): echo the
+    //   client's proposed specifier back, clamped to our hardware.  V41..V43
+    //   proved this alone is NOT enough (the endpoint still ends up with an
+    //   EMPTY format list, GetMixFormat still 0x88890008), but it is cheap to
+    //   re-test now that flipping it needs no recompile.
     // ----------------------------------------------------------------
+    if (g_Cfg.intersect == 1) {
+        // Echo mode: build the resultant format from the client's proposal,
+        // clamped to 48 kHz / 16-bit, 1..MAX channels, matching its specifier.
+        bool ext = wantExt || (cliSpec == 0x0316AC81);
+        ULONG need = ext ? sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE)
+                         : sizeof(KSDATAFORMAT_WAVEFORMATEX);
+        if (ResultantFormat == NULL || OutputBufferLength == 0) {
+            // length-only probe: report the size we would write.
+            g_WaveIntersectProbe++;
+            if (ResultantFormatLength) *ResultantFormatLength = need;
+            g_WaveIntersectLastStatus = STATUS_SUCCESS;
+            JLog(ISIGHT_J_INTERSECT, cliCh, cliRate, cliBits);
+            return STATUS_SUCCESS;
+        }
+        if (OutputBufferLength < need) {
+            if (ResultantFormatLength) *ResultantFormatLength = need;
+            g_WaveIntersectLastStatus = STATUS_BUFFER_OVERFLOW;
+            JLog(ISIGHT_J_INTERSECT, cliCh, cliRate, cliBits);
+            return STATUS_BUFFER_OVERFLOW;
+        }
+        ULONG ch = (cliCh < 1) ? 1 : ((cliCh > ISIGHTMIC_MAX_CHANNELS) ? ISIGHTMIC_MAX_CHANNELS : cliCh);
+        ULONG rate = ISIGHTMIC_SAMPLERATE;   // we only do 48 kHz
+        ULONG bits = ISIGHTMIC_BITS;
+        RtlZeroMemory(ResultantFormat, need);
+        if (ext) {
+            PKSDATAFORMAT_WAVEFORMATEXTENSIBLE pf = (PKSDATAFORMAT_WAVEFORMATEXTENSIBLE)ResultantFormat;
+            pf->DataFormat.FormatSize    = need;
+            pf->DataFormat.MajorFormat   = KSDATAFORMAT_TYPE_AUDIO;
+            pf->DataFormat.SubFormat     = KSDATAFORMAT_SUBTYPE_PCM;
+            pf->DataFormat.Specifier     = KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE;
+            pf->WaveFormatEx.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
+            pf->WaveFormatEx.nChannels       = (WORD)ch;
+            pf->WaveFormatEx.nSamplesPerSec  = rate;
+            pf->WaveFormatEx.nAvgBytesPerSec = rate * ch * 2;
+            pf->WaveFormatEx.nBlockAlign     = (WORD)(ch * 2);
+            pf->WaveFormatEx.wBitsPerSample  = (WORD)bits;
+            pf->WaveFormatEx.cbSize          = (WORD)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
+            pf->WaveFormatEx.Samples.wValidBitsPerSample = (WORD)bits;
+            pf->WaveFormatEx.dwChannelMask   = (ch == 1) ? KSAUDIO_SPEAKER_MONO : KSAUDIO_SPEAKER_STEREO;
+            pf->WaveFormatEx.SubFormat       = KSDATAFORMAT_SUBTYPE_PCM;
+        } else {
+            PKSDATAFORMAT_WAVEFORMATEX pf = (PKSDATAFORMAT_WAVEFORMATEX)ResultantFormat;
+            pf->DataFormat.FormatSize    = need;
+            pf->DataFormat.MajorFormat   = KSDATAFORMAT_TYPE_AUDIO;
+            pf->DataFormat.SubFormat     = KSDATAFORMAT_SUBTYPE_PCM;
+            pf->DataFormat.Specifier     = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+            pf->WaveFormatEx.wFormatTag      = WAVE_FORMAT_PCM;
+            pf->WaveFormatEx.nChannels       = (WORD)ch;
+            pf->WaveFormatEx.nSamplesPerSec  = rate;
+            pf->WaveFormatEx.nAvgBytesPerSec = rate * ch * 2;
+            pf->WaveFormatEx.nBlockAlign     = (WORD)(ch * 2);
+            pf->WaveFormatEx.wBitsPerSample  = (WORD)bits;
+            pf->WaveFormatEx.cbSize          = 0;
+        }
+        if (ResultantFormatLength) *ResultantFormatLength = need;
+        g_WaveIntersectLastStatus = STATUS_SUCCESS;
+        JLog(ISIGHT_J_INTERSECT, cliCh, cliRate, cliBits);
+        return STATUS_SUCCESS;
+    }
+
+    // Default (intersect=0): defer to PortCls.
     UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(ResultantFormat);
     UNREFERENCED_PARAMETER(ResultantFormatLength);
@@ -1220,6 +1327,7 @@ protected:
 #define KSPIN_TOPO_MIC_JACK     0
 #define KSPIN_TOPO_WAVE_BRIDGE  1
 #define KSNODE_TOPO_MIC         0
+#define KSNODE_TOPO_VOL         1   // only used by the V46 "Full" topology
 
 static PCPIN_DESCRIPTOR TopologyPins[] = {
     {   // 0 - the microphone jack (signal enters the filter here)
@@ -1250,7 +1358,55 @@ static PCPIN_DESCRIPTOR TopologyPins[] = {
     }
 };
 
-static PCNODE_DESCRIPTOR TopologyNodes[] = {
+// ---- V46: topology volume node (used only by the "Full" variant) ----------
+// A KSNODETYPE_VOLUME with a working AUDIO_VOLUMELEVEL handler is the one
+// structural element the MSVAD "mic" reference exposes on the capture path
+// that we do not.  The endpoint builder reads the volume node to derive a
+// default capture volume; a missing one is a plausible reason our endpoint
+// ends up with only 3 format keys against Realtek's 12.  Defined here so the
+// "Full" node/connection arrays below can reference it.
+static LONG g_Volume = 0x80000000;   // 0 dB (unity) on the KSAUDIO_VOLUMELEVEL scale
+static NTSTATUS PropertyHandlerVolume(IN PPCPROPERTY_REQUEST PropertyRequest) {
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_BASICSUPPORT) {
+        if (PropertyRequest->ValueSize < sizeof(ULONG))
+            return STATUS_BUFFER_TOO_SMALL;
+        *(PULONG)PropertyRequest->Value =
+            KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT;
+        PropertyRequest->Irp->IoStatus.Information = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_GET) {
+        if (PropertyRequest->ValueSize < sizeof(ULONG))
+            return STATUS_BUFFER_TOO_SMALL;
+        *(PLONG)PropertyRequest->Value = g_Volume;
+        PropertyRequest->Irp->IoStatus.Information = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_SET) {
+        if (PropertyRequest->ValueSize < sizeof(ULONG))
+            return STATUS_BUFFER_TOO_SMALL;
+        g_Volume = *(PLONG)PropertyRequest->Value;
+        PropertyRequest->Irp->IoStatus.Information = sizeof(ULONG);
+        return STATUS_SUCCESS;
+    }
+    return STATUS_NOT_SUPPORTED;
+}
+static const PCPROPERTY_ITEM VolumeProperties[] = {
+    {
+        &KSPROPSETID_Audio,
+        KSPROPERTY_AUDIO_VOLUMELEVEL,
+        PCPROPERTY_ITEM_FLAG_GET | PCPROPERTY_ITEM_FLAG_SET |
+            PCPROPERTY_ITEM_FLAG_BASICSUPPORT,
+        PropertyHandlerVolume
+    }
+};
+DEFINE_PCAUTOMATION_TABLE_PROP(VolumeAutomation, VolumeProperties);
+
+// ---- V46 topology variants -------------------------------------------------
+// Topo=0 (Simple, default / V45): a single MIC node between the jack and the
+// wave bridge -- what we have shipped since V31.  Topo=1 (Full): insert the
+// VOLUME node above on the capture path (jack -> volume -> mic -> bridge).
+static PCNODE_DESCRIPTOR g_TopoNodesSimple[] = {
     {
         0,                          // Flags
         &ChannelConfigAutomation,   // AutomationTable: serves CHANNEL_CONFIG (V31)
@@ -1259,10 +1415,32 @@ static PCNODE_DESCRIPTOR TopologyNodes[] = {
     }
 };
 
-static PCCONNECTION_DESCRIPTOR TopologyConnections[] = {
+static PCNODE_DESCRIPTOR g_TopoNodesFull[] = {
+    {
+        0,                          // Flags
+        &VolumeAutomation,          // AutomationTable: serves AUDIO_VOLUMELEVEL
+        &KSNODETYPE_VOLUME,         // Type
+        NULL                        // Name
+    },
+    {
+        0,                          // Flags
+        &ChannelConfigAutomation,   // AutomationTable: serves CHANNEL_CONFIG (V31)
+        &KSNODETYPE_MICROPHONE,     // Type
+        NULL                        // Name
+    }
+};
+
+static PCCONNECTION_DESCRIPTOR g_TopoConnsSimple[] = {
     // Node pin numbering: 0 is the output, 1 the input.
     { KSFILTER_NODE, KSPIN_TOPO_MIC_JACK,    KSNODE_TOPO_MIC, 1 },
     { KSNODE_TOPO_MIC, 0,                   KSFILTER_NODE, KSPIN_TOPO_WAVE_BRIDGE }
+};
+
+static PCCONNECTION_DESCRIPTOR g_TopoConnsFull[] = {
+    // jack -> volume(in) -> mic(in) -> bridge
+    { KSFILTER_NODE, KSPIN_TOPO_MIC_JACK,    KSNODE_TOPO_VOL, 1 },
+    { KSNODE_TOPO_VOL, 0,                    KSNODE_TOPO_MIC, 1 },
+    { KSNODE_TOPO_MIC, 0,                    KSFILTER_NODE, KSPIN_TOPO_WAVE_BRIDGE }
 };
 
 // ---- V45: KSPROPERTY_JACK_DESCRIPTION -------------------------------------
@@ -1279,7 +1457,10 @@ static PCCONNECTION_DESCRIPTOR TopologyConnections[] = {
 // endpoint holds 3 audio-format keys against the working Realtek mic's 12,
 // and PKEY_AudioEngine_DeviceFormat (the mix format) is absent, which is
 // exactly what GetMixFormat reports as 0x88890008.
-static KSJACK_DESCRIPTION IsightJackDescription = {
+// V46: two jack descriptions (stereo / mono), selected at runtime by the
+// handler from g_Cfg.mono.  Kept as full static initialisers (which already
+// compile for this WDK) rather than mutating the union's ChannelMapping field.
+static KSJACK_DESCRIPTION g_JackStereo = {
     KSAUDIO_SPEAKER_STEREO,     // ChannelMapping
     0xE88C99,                   // Color: HDAudio spec value for pink (mic)
     eConnType3Point5mm,         // ConnectionType
@@ -1287,6 +1468,15 @@ static KSJACK_DESCRIPTION IsightJackDescription = {
     eGenLocPrimaryBox,          // GenLocation
     ePortConnJack,              // PortConnection
     TRUE                        // IsConnected
+};
+static KSJACK_DESCRIPTION g_JackMono = {
+    KSAUDIO_SPEAKER_MONO,       // ChannelMapping (V46 Mono switch)
+    0xE88C99,
+    eConnType3Point5mm,
+    eGeoLocRear,
+    eGenLocPrimaryBox,
+    ePortConnJack,
+    TRUE
 };
 
 static NTSTATUS PropertyHandlerJackDescription(IN PPCPROPERTY_REQUEST PropertyRequest) {
@@ -1309,7 +1499,7 @@ static NTSTATUS PropertyHandlerJackDescription(IN PPCPROPERTY_REQUEST PropertyRe
             return STATUS_BUFFER_TOO_SMALL;
         PKSJACK_DESCRIPTION jd = (PKSJACK_DESCRIPTION)PropertyRequest->Value;
         RtlZeroMemory(jd, sizeof(KSJACK_DESCRIPTION));
-        *jd = IsightJackDescription;
+        *jd = (g_Cfg.mono ? g_JackMono : g_JackStereo);
         PropertyRequest->Irp->IoStatus.Information = sizeof(KSJACK_DESCRIPTION);
         return STATUS_SUCCESS;
     }
@@ -1328,15 +1518,15 @@ DEFINE_PCAUTOMATION_TABLE_PROP(TopoFilterAutomation, TopoFilterProperties);
 
 static PCFILTER_DESCRIPTOR TopologyFilterDescriptor = {
     0,                                  // Version
-    &TopoFilterAutomation,              // AutomationTable (V45: JACK_DESCRIPTION)
+    &TopoFilterAutomation,              // AutomationTable (V45: JACK_DESCRIPTION) -- patched by ApplyConfig
     sizeof(PCPIN_DESCRIPTOR),           // PinSize
     2,                                  // PinCount
-    TopologyPins,                       // Pins
+    TopologyPins,                       // Pins (identical for Simple and Full)
     sizeof(PCNODE_DESCRIPTOR),          // NodeSize
-    1,                                  // NodeCount
-    TopologyNodes,                      // Nodes
-    2,                                  // ConnectionCount
-    TopologyConnections,                // Connections
+    1,                                  // NodeCount -- patched by ApplyConfig (2 when Full)
+    g_TopoNodesSimple,                  // Nodes -- patched by ApplyConfig
+    2,                                  // ConnectionCount -- patched by ApplyConfig (3 when Full)
+    g_TopoConnsSimple,                  // Connections -- patched by ApplyConfig
     0,                                  // CategoryCount
     NULL                                // Categories
 };
@@ -1645,6 +1835,7 @@ static NTSTATUS CtlDispatch(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
     dg->JHead           = g_JHead;
     for (int ji = 0; ji < ISIGHT_J_DEPTH * 4; ji++)
         dg->Journal[ji] = g_Journal[ji];
+    dg->CfgCode         = g_CfgCode;   // V46: active runtime switch signature
                 info = sizeof(ISIGHTMIC_DIAG);
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
@@ -1682,10 +1873,97 @@ static VOID CtlUnload(PDRIVER_OBJECT DriverObject) {
     if (g_PortClsUnload) g_PortClsUnload(DriverObject);
 }
 
+// ---- V46: read the runtime switch signature from the registry ------------
+// The key is HKLM\SOFTWARE\iSightMic (native view -- kernel ZwOpenKey reads the
+// real registry, not Wow6432Node, so a 32-bit reg.exe still lands here as long
+// as it writes the native path).  Every value is a DWORD; absence => the default
+// compiled into g_Cfg, which reproduces V45 exactly.
+static ULONG RegReadDword(HANDLE hKey, PCWSTR Name, ULONG Def) {
+    UNICODE_STRING un;
+    RtlInitUnicodeString(&un, Name);
+    UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    ULONG need = 0;
+    NTSTATUS s = ZwQueryValueKey(hKey, &un, KeyValuePartialInformation,
+                                 buf, sizeof(buf), &need);
+    if (NT_SUCCESS(s)) {
+        PKEY_VALUE_PARTIAL_INFORMATION pi = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        if (pi->Type == REG_DWORD && pi->DataLength >= sizeof(ULONG))
+            return *(PULONG)pi->Data;
+    }
+    return Def;
+}
+
+static void ReadConfig() {
+    UNICODE_STRING path;
+    RtlInitUnicodeString(&path, L"\\Registry\\Machine\\SOFTWARE\\iSightMic");
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &path,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    HANDLE hKey = NULL;
+    if (NT_SUCCESS(ZwOpenKey(&hKey, KEY_READ, &oa))) {
+        g_Cfg.intersect = RegReadDword(hKey, L"Intersect", g_Cfg.intersect);
+        g_Cfg.ranges    = RegReadDword(hKey, L"Ranges",    g_Cfg.ranges);
+        g_Cfg.jack      = RegReadDword(hKey, L"Jack",      g_Cfg.jack);
+        g_Cfg.topo      = RegReadDword(hKey, L"Topo",      g_Cfg.topo);
+        g_Cfg.mono      = RegReadDword(hKey, L"Mono",      g_Cfg.mono);
+        ZwClose(hKey);
+    }
+}
+
+// Apply the signature to the static descriptor tables.  Called once from
+// DriverEntry, before PnP starts the device, so PortCls reads the patched
+// descriptors when it builds the filters.
+static void ApplyConfig() {
+    // Data ranges (single vs dual) on the wave host pin.
+    if (g_Cfg.ranges) {
+        WavePins[1].KsPinDescriptor.DataRangesCount = 2;
+        WavePins[1].KsPinDescriptor.DataRanges =
+            (const PKSDATARANGE*)g_RangePtrDual;
+    } else {
+        WavePins[1].KsPinDescriptor.DataRangesCount = 1;
+        WavePins[1].KsPinDescriptor.DataRanges =
+            (const PKSDATARANGE*)g_RangePtrSingle;
+    }
+
+    // Topology: jack description on/off + simple/full node layout.
+    TopologyFilterDescriptor.AutomationTable =
+        g_Cfg.jack ? &TopoFilterAutomation : NULL;
+    if (g_Cfg.topo) {
+        TopologyFilterDescriptor.NodeCount       = 2;
+        TopologyFilterDescriptor.Nodes          = g_TopoNodesFull;
+        TopologyFilterDescriptor.ConnectionCount = 3;
+        TopologyFilterDescriptor.Connections    = g_TopoConnsFull;
+    } else {
+        TopologyFilterDescriptor.NodeCount       = 1;
+        TopologyFilterDescriptor.Nodes          = g_TopoNodesSimple;
+        TopologyFilterDescriptor.ConnectionCount = 2;
+        TopologyFilterDescriptor.Connections    = g_TopoConnsSimple;
+    }
+
+    // Channel config (wave ADC node) + jack channel mapping (via the jack
+    // handler choosing g_JackMono/g_JackStereo): stereo (default) or mono.
+    g_ChannelConfig = g_Cfg.mono ? KSAUDIO_SPEAKER_MONO : KSAUDIO_SPEAKER_STEREO;
+
+    // Pack the signature and journal it (decoded by miccheck as CONFIG).
+    g_CfgCode = (g_Cfg.intersect ? 1u : 0u)
+              | ((g_Cfg.ranges    ? 1u : 0u) << 1)
+              | ((g_Cfg.jack      ? 1u : 0u) << 2)
+              | ((g_Cfg.topo      ? 1u : 0u) << 3)
+              | ((g_Cfg.mono      ? 1u : 0u) << 4);
+    JLog(ISIGHT_J_CONFIG, g_CfgCode, 0, 0);
+    DbgPrint("iSightMic V46 config code=%u (i=%u r=%u j=%u t=%u m=%u)\n",
+             g_CfgCode, g_Cfg.intersect, g_Cfg.ranges,
+             g_Cfg.jack, g_Cfg.topo, g_Cfg.mono);
+}
+
 extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject,
                                 IN PUNICODE_STRING RegistryPath) {
     RingInit(&g_Ring);
     if (g_Ring.Buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+
+    // V46: read the runtime switch signature before PnP builds the filters.
+    ReadConfig();
+    ApplyConfig();
 
     NTSTATUS status = PcInitializeAdapterDriver(DriverObject, RegistryPath, AddDevice);
     if (!NT_SUCCESS(status)) return status;
