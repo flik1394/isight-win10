@@ -16,6 +16,15 @@ REM         show which hard-coded formats the audio engine WOULD accept)
 REM    [4] endpoint format : ...             -> GetMixFormat succeeded
 REM    [4] captured N samples                -> endpoint fully works (FIXED)
 REM
+REM  Sanity signal, checked FIRST when reading a combo:
+REM    CFGCODE: expect N / V46 config code N (...)
+REM    -> the driver's own report of which switches it actually loaded.
+REM       If "expect" and the reported number differ, the registry never
+REM       reached the driver (permissions / wrong native view / stale image)
+REM       and this combo's verdict is meaningless -- do NOT conclude "this
+REM       combination does not help".  CfgCode = Intersect + 2*Ranges +
+REM       4*Jack + 8*Topo + 16*Mono.
+REM
 REM  MUST be run as Administrator, from the unzipped isight-vmic package dir.
 REM  Output:  sweep\sweep_<label>.txt  (full miccheck, one per combo)
 REM           sweep\SWEEP_SUMMARY.txt  (decisive lines + [4b] detail)
@@ -69,6 +78,7 @@ set "L_DEAD="
 set "L_OURS="
 set "L_MIX="
 set "L_CAP="
+set "L_CFG="
 echo.
 echo ================================================================
 echo [sweep] combo "%LBL%"   I=%I% R=%R% J=%J% T=%T% M=%M%
@@ -91,8 +101,16 @@ if not defined L_MIX (
   for /f "delims=" %%a in ('findstr /l "endpoint format :" miccheck.txt') do set "L_MIX=%%a"
 )
 for /f "delims=" %%a in ('findstr /l "[4] captured" miccheck.txt') do set "L_CAP=%%a"
+for /f "delims=" %%a in ('findstr /l "config code" miccheck.txt') do set "L_CFG=%%a"
+REM CfgCode = Intersect + 2*Ranges + 4*Jack + 8*Topo + 16*Mono
+set /a "EXPECT=%I% + 2*%R% + 4*%J% + 8*%T% + 16*%M%"
 
 echo ---- combo %LBL% (I=%I% R=%R% J=%J% T=%T% M=%M%) >> "%SUM%"
+if defined L_CFG (
+  echo   CFGCODE: expect %EXPECT% / %L_CFG% >> "%SUM%"
+) else (
+  echo   CFGCODE: expect %EXPECT% / (driver did NOT report -- combo inconclusive) >> "%SUM%"
+)
 if defined L_DEAD (echo   CONTROL: device NOT reachable >> "%SUM%") else (echo   CONTROL: ok >> "%SUM%")
 if defined L_OURS (echo   ENDPOINT: %L_OURS% >> "%SUM%") else (echo   ENDPOINT: OURS not found >> "%SUM%")
 echo   MIX: %L_MIX% >> "%SUM%"
