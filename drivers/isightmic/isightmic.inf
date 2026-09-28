@@ -141,7 +141,13 @@ Class       = Media
 ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = isightmic.cat
-DriverVer   = 09/27/2026,1.0.25.0
+; 1.0.26.0 (2026-09-28): bumped because the driver IMAGE does not unload on
+; device removal -- the control device \\.\IsightMicCtl keeps it resident, so a
+; remove/install cycle keeps running whatever .sys was already in memory (a
+; sweep run right after installing V46 reported ISIGHTMIC-BUILD-V43, i.e. the
+; previous build).  A higher DriverVer at least guarantees the new package wins
+; in the driver store; the running image still needs one reboot to be replaced.
+DriverVer   = 09/28/2026,1.0.26.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64

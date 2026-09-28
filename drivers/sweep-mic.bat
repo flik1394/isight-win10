@@ -51,6 +51,27 @@ if exist iSightMicTest.cer (
   echo [sweep] WARNING: iSightMicTest.cer not found -- run this from the unzipped package dir.
 )
 
+REM ---- make sure the RUNNING driver is the V46 build ----------------------
+REM The driver image does not unload when the device node is removed (the
+REM control device \\.\IsightMicCtl keeps it resident), so right after
+REM installing V46 the box can still be executing the previous build -- and
+REM every combo would silently measure that old driver.  Check before spending
+REM half an hour on it.
+echo [sweep] checking which driver build is actually running ...
+isight-miccheck.exe 1 > "%SWEEP_DIR%\precheck.txt" 2>&1
+findstr /l "ISIGHTMIC-BUILD-V46" "%SWEEP_DIR%\precheck.txt" >nul
+if not errorlevel 1 goto :precheck_ok
+echo.
+echo [sweep] ABORT: the running driver is NOT the V46 build.
+echo   A remove/install cycle does not replace a resident image, so this sweep
+echo   would measure the old driver.  Reboot ONCE (that loads the new .sys),
+echo   then run this script again.  Current build line:
+findstr /l "driver build" "%SWEEP_DIR%\precheck.txt"
+echo   (full output: %SWEEP_DIR%\precheck.txt)
+goto :eof
+:precheck_ok
+echo [sweep] V46 build confirmed.
+
 REM ---- curated matrix: call :run <label> <I> <R> <J> <T> <M> ----
 call :run baseline_V45       0 0 1 0 0
 call :run ranges_dual        0 1 1 0 0

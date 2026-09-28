@@ -27,17 +27,22 @@ if "%~3"=="" (set J=1) else (set J=%~3)
 if "%~4"=="" (set T=0) else (set T=%~4)
 if "%~5"=="" (set M=0) else (set M=%~5)
 
-echo [switch-mic] V46 config -^> Intersect=%I Ranges=%R Jack=%J Topo=%T Mono=%M
+REM NOTE: every variable reference here must be CLOSED (%I%, not %I).  An
+REM unclosed %I makes cmd treat "%I Ranges=%" as one variable name (it happily
+REM includes the space), which is undefined and expands to nothing -- the
+REM echoed line then loses whole words and, worse, "reg add /d" receives no
+REM value and silently swallows "64" from the trailing /reg:64.
+echo [switch-mic] V46 config -^> Intersect=%I% Ranges=%R% Jack=%J% Topo=%T% Mono=%M%
 echo [switch-mic] writing HKLM\SOFTWARE\iSightMic ...
 REM /reg:64 is load-bearing: a 32-bit reg.exe silently redirects HKLM\SOFTWARE
 REM to Wow6432Node, while the driver's ZwOpenKey reads the NATIVE view --
 REM the switches would then never be seen and every combo would silently run
 REM with the compiled-in defaults.  Force the 64-bit (native) view.
-reg add "HKLM\SOFTWARE\iSightMic" /v Intersect /t REG_DWORD /d %I /f /reg:64 >nul 2>&1 || goto :regfail
-reg add "HKLM\SOFTWARE\iSightMic" /v Ranges    /t REG_DWORD /d %R /f /reg:64 >nul 2>&1 || goto :regfail
-reg add "HKLM\SOFTWARE\iSightMic" /v Jack      /t REG_DWORD /d %J /f /reg:64 >nul 2>&1 || goto :regfail
-reg add "HKLM\SOFTWARE\iSightMic" /v Topo      /t REG_DWORD /d %T /f /reg:64 >nul 2>&1 || goto :regfail
-reg add "HKLM\SOFTWARE\iSightMic" /v Mono      /t REG_DWORD /d %M /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Intersect /t REG_DWORD /d %I% /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Ranges    /t REG_DWORD /d %R% /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Jack      /t REG_DWORD /d %J% /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Topo      /t REG_DWORD /d %T% /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Mono      /t REG_DWORD /d %M% /f /reg:64 >nul 2>&1 || goto :regfail
 
 REM Read back and show what is actually stored, so a redirect/permission
 REM problem is visible here instead of masquerading as "this combo does not
