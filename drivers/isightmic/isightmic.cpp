@@ -172,6 +172,15 @@ typedef struct _ISIGHT_CFG {
 static ISIGHT_CFG g_Cfg = { 0, 0, 1, 0, 0 };
 static ULONG g_CfgCode = 0;   // packed bitfield, surfaced in the journal + GETDIAG
 
+// Forward declarations: ReadConfig / ApplyConfig are defined further down, but
+// StartDevice (which runs on EVERY device start, including the node recycle that
+// switch-mic.bat performs) must call them so the registry signature is re-read
+// each time.  They are intentionally NOT only called from DriverEntry: the
+// control device created there keeps the driver image resident, so DriverEntry
+// does not re-run when the PnP node is removed and re-added.
+static void ReadConfig(void);
+static void ApplyConfig(void);
+
 static void RingInit(PRING r) {
     r->Buffer = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, RING_BYTES, ISIGHTMIC_POOL_TAG);
     r->Cap = (r->Buffer != NULL) ? RING_BYTES : 0;
@@ -1656,6 +1665,14 @@ static NTSTATUS StartDevice(PDEVICE_OBJECT DeviceObject, PIRP Irp, PRESOURCELIST
     PPORT wavePort = NULL;
     PPORT topoPort = NULL;
 
+    // V46: re-read the runtime switch signature here, on every device start.
+    // PortCls builds the wave + topology filters (calling GetDescription) during
+    // the subdevice registration below, so patching the static descriptor tables
+    // now makes the current registry selection take effect without a reboot --
+    // a node remove/install cycle (switch-mic.bat) re-enters this routine.
+    ReadConfig();
+    ApplyConfig();
+
     CMiniportWaveCyclic* w = new(NonPagedPool, ISIGHTMIC_POOL_TAG) CMiniportWaveCyclic(NULL);
     if (!w) return STATUS_INSUFFICIENT_RESOURCES;
     PUNKNOWN wave = (PUNKNOWN)(IMiniportWaveCyclic*)w;
@@ -1961,10 +1978,10 @@ extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject,
     RingInit(&g_Ring);
     if (g_Ring.Buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
 
-    // V46: read the runtime switch signature before PnP builds the filters.
-    ReadConfig();
-    ApplyConfig();
-
+    // V46: the runtime switch signature is read in StartDevice (which re-runs on
+    // every device start / node recycle), NOT here -- the control device created
+    // below keeps this driver image resident, so DriverEntry would otherwise run
+    // only once and the registry switches would need a reboot to take effect.
     NTSTATUS status = PcInitializeAdapterDriver(DriverObject, RegistryPath, AddDevice);
     if (!NT_SUCCESS(status)) return status;
 
