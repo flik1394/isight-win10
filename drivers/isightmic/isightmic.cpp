@@ -1427,17 +1427,23 @@ static PCNODE_DESCRIPTOR g_TopoNodesSimple[] = {
     }
 };
 
+// V46 NOTE: node ids are *array indices*, and KSNODE_TOPO_MIC is fixed at 0
+// (the Simple topology has only that one node), so MIC must stay element [0]
+// and VOLUME -- wired in front of it on the capture path -- is element [1].
+// Listing them path-first (volume, then mic) silently swaps their ids and
+// makes the Full topology describe a different graph than the connections
+// below: KSPROPERTY_AUDIO_CHANNEL_CONFIG would land on the volume node.
 static PCNODE_DESCRIPTOR g_TopoNodesFull[] = {
-    {
-        0,                          // Flags
-        &VolumeAutomation,          // AutomationTable: serves AUDIO_VOLUMELEVEL
-        &KSNODETYPE_VOLUME,         // Type
-        NULL                        // Name
-    },
     {
         0,                          // Flags
         &ChannelConfigAutomation,   // AutomationTable: serves CHANNEL_CONFIG (V31)
         &KSNODETYPE_MICROPHONE,     // Type
+        NULL                        // Name
+    },
+    {
+        0,                          // Flags
+        &VolumeAutomation,          // AutomationTable: serves AUDIO_VOLUMELEVEL
+        &KSNODETYPE_VOLUME,         // Type
         NULL                        // Name
     }
 };
@@ -1944,6 +1950,17 @@ static void ApplyConfig() {
         WavePins[1].KsPinDescriptor.DataRanges =
             (const PKSDATARANGE*)g_RangePtrSingle;
     }
+
+    // Channel count the two ranges advertise.  Mono used to touch only
+    // g_ChannelConfig (a property value) and the jack's ChannelMapping,
+    // leaving MaximumChannels at 2 -- so the engine kept negotiating stereo
+    // and the Mono switch was effectively a no-op on the mix format.  Cap the
+    // ranges themselves: that is what the engine reads when it picks a
+    // default format for the endpoint.
+    ULONG maxCh = g_Cfg.mono ? 1u : (ULONG)ISIGHTMIC_MAX_CHANNELS;
+    g_RangeSingle[0].MaximumChannels = maxCh;
+    g_RangeDual[0].MaximumChannels   = maxCh;
+    g_RangeDual[1].MaximumChannels   = maxCh;
 
     // Topology: jack description on/off + simple/full node layout.
     TopologyFilterDescriptor.AutomationTable =
