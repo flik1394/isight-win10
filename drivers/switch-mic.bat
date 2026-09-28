@@ -21,6 +21,21 @@ REM
 REM  MUST be run as Administrator, from the unzipped isight-vmic package dir.
 REM =====================================================================
 setlocal
+
+REM ---- elevation self-check + self-relaunch --------------------------------
+REM Everything this script does (reg add HKLM, net stop Audiosrv, remove and
+REM re-install the device node) needs an elevated token.  Run non-elevated it
+REM used to limp on: the first "reg add" returns access-denied, :regfail fires
+REM and the script exits before miccheck ever runs -- so the caller sees a
+REM missing report and reads it as a driver fault.  Re-launch ourselves with
+REM the UAC prompt instead, so double-clicking this file just works.
+net session >nul 2>&1
+if not errorlevel 1 goto :elevated
+echo [switch-mic] not elevated -- asking for Administrator (click YES) ...
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%1 %2 %3 %4 %5' -WorkingDirectory '%~dp0' -Verb RunAs"
+exit /b 1
+:elevated
+
 if "%~1"=="" (set I=0) else (set I=%~1)
 if "%~2"=="" (set R=0) else (set R=%~2)
 if "%~3"=="" (set J=1) else (set J=%~3)

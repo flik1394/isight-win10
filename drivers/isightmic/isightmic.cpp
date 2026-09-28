@@ -1229,11 +1229,27 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
     //   proved this alone is NOT enough (the endpoint still ends up with an
     //   EMPTY format list, GetMixFormat still 0x88890008), but it is cheap to
     //   re-test now that flipping it needs no recompile.
+    //
+    //   intersect=2 (V47): echo, but ALWAYS in WAVEFORMATEXTENSIBLE form.
+    //   Measured 2026-09-29: with intersect=1 the intersection itself SUCCEEDS
+    //   (last intersection status 0x00000000 vs 0xC0000002 at intersect=0) and
+    //   the pin instantiates and copies data -- GetMixFormat still fails.  So
+    //   the remaining difference is the SHAPE of what we hand back.  The audio
+    //   engine caches an endpoint device format and every working capture
+    //   endpoint on this box has one, and every one of them is
+    //   wFormatTag=0xFFFE (WAVEFORMATEXTENSIBLE), never plain WAVEFORMATEX.
+    //   Our endpoint has no cached format at all.  The engine asks with
+    //   Specifier=WAVEFORMATEX and an 82-byte buffer, and intersect=1 mirrors
+    //   that -- so it never gets the extensible form (with the channel mask)
+    //   it evidently wants.  There ARE length probes in the log (103+), so
+    //   answering "I need 104 bytes" should make it retry with room for it.
     // ----------------------------------------------------------------
-    if (g_Cfg.intersect == 1) {
+    if (g_Cfg.intersect == 1 || g_Cfg.intersect == 2) {
         // Echo mode: build the resultant format from the client's proposal,
-        // clamped to 48 kHz / 16-bit, 1..MAX channels, matching its specifier.
-        bool ext = wantExt || (cliSpec == 0x0316AC81);
+        // clamped to 48 kHz / 16-bit, 1..MAX channels.  intersect=2 forces the
+        // EXTENSIBLE shape regardless of what the client asked for.
+        bool ext = (g_Cfg.intersect == 2) ? true
+                                          : (wantExt || (cliSpec == 0x0316AC81));
         ULONG need = ext ? sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE)
                          : sizeof(KSDATAFORMAT_WAVEFORMATEX);
         if (ResultantFormat == NULL || OutputBufferLength == 0) {

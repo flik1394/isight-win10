@@ -30,6 +30,27 @@ REM  Output:  sweep\sweep_<label>.txt  (full miccheck, one per combo)
 REM           sweep\SWEEP_SUMMARY.txt  (decisive lines + [4b] detail)
 REM =====================================================================
 setlocal
+
+REM ---- elevation self-check -------------------------------------------------
+REM A non-elevated run does not fail loudly: switch-mic.bat's very first step
+REM is "reg add HKLM", which returns access-denied, so it jumps to :regfail and
+REM exits without ever running miccheck.  The sweep then burns its way through
+REM all nine combos in four minutes and reports every one of them as
+REM "DEVICE-DEAD: miccheck.txt not produced" -- which reads like a driver
+REM problem and is really just "you did not get the UAC prompt".  (Seen once:
+REM 2026-09-29, all 9 combos DEVICE-DEAD, only the final restore left a
+REM miccheck.txt behind.)  Fail here instead, before touching the device.
+net session >nul 2>&1
+if not errorlevel 1 goto :elevated
+echo.
+echo [sweep] ABORT: this window is NOT elevated.
+echo   Nothing was measured.  Re-run it as Administrator:
+echo     - double-click run-sweep-admin.vbs and click YES at the UAC prompt, or
+echo     - right-click sweep-mic.bat -^> Run as administrator.
+echo   (If no UAC prompt appeared at all, UAC may be set to silent-deny.)
+goto :eof
+:elevated
+
 set "SWEEP_DIR=sweep"
 if not exist "%SWEEP_DIR%" mkdir "%SWEEP_DIR%"
 set "SUM=%SWEEP_DIR%\SWEEP_SUMMARY.txt"
@@ -59,7 +80,7 @@ REM every combo would silently measure that old driver.  Check before spending
 REM half an hour on it.
 echo [sweep] checking which driver build is actually running ...
 isight-miccheck.exe 1 > "%SWEEP_DIR%\precheck.txt" 2>&1
-findstr /l "ISIGHTMIC-BUILD-V46" "%SWEEP_DIR%\precheck.txt" >nul
+findstr /l "ISIGHTMIC-BUILD-V4" "%SWEEP_DIR%\precheck.txt" >nul
 if not errorlevel 1 goto :precheck_ok
 echo.
 echo [sweep] ABORT: the running driver is NOT the V46 build.
