@@ -29,15 +29,28 @@ if "%~5"=="" (set M=0) else (set M=%~5)
 
 echo [switch-mic] V46 config -^> Intersect=%I Ranges=%R Jack=%J Topo=%T Mono=%M
 echo [switch-mic] writing HKLM\SOFTWARE\iSightMic ...
-reg add "HKLM\SOFTWARE\iSightMic" /v Intersect /t REG_DWORD /d %I /f >nul 2>&1
-reg add "HKLM\SOFTWARE\iSightMic" /v Ranges    /t REG_DWORD /d %R /f >nul 2>&1
-reg add "HKLM\SOFTWARE\iSightMic" /v Jack      /t REG_DWORD /d %J /f >nul 2>&1
-reg add "HKLM\SOFTWARE\iSightMic" /v Topo      /t REG_DWORD /d %T /f >nul 2>&1
-reg add "HKLM\SOFTWARE\iSightMic" /v Mono      /t REG_DWORD /d %M /f >nul 2>&1
-if errorlevel 1 (
-  echo [switch-mic] could not write the registry -- are you Administrator?
-  exit /b 1
-)
+REM /reg:64 is load-bearing: a 32-bit reg.exe silently redirects HKLM\SOFTWARE
+REM to Wow6432Node, while the driver's ZwOpenKey reads the NATIVE view --
+REM the switches would then never be seen and every combo would silently run
+REM with the compiled-in defaults.  Force the 64-bit (native) view.
+reg add "HKLM\SOFTWARE\iSightMic" /v Intersect /t REG_DWORD /d %I /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Ranges    /t REG_DWORD /d %R /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Jack      /t REG_DWORD /d %J /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Topo      /t REG_DWORD /d %T /f /reg:64 >nul 2>&1 || goto :regfail
+reg add "HKLM\SOFTWARE\iSightMic" /v Mono      /t REG_DWORD /d %M /f /reg:64 >nul 2>&1 || goto :regfail
+
+REM Read back and show what is actually stored, so a redirect/permission
+REM problem is visible here instead of masquerading as "this combo does not
+REM help" in the sweep results.
+echo [switch-mic] registry now reads:
+reg query "HKLM\SOFTWARE\iSightMic" /reg:64
+goto :wrotereg
+
+:regfail
+echo [switch-mic] could not write the registry -- are you Administrator?
+exit /b 1
+
+:wrotereg
 
 echo [switch-mic] stopping audio services + killing audiodg.exe ...
 net stop AudioEndpointBuilder /y >nul 2>&1
