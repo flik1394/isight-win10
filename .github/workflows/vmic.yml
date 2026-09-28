@@ -210,7 +210,7 @@ jobs:
           # codepage (936 on a Chinese Windows), so a UTF-8 file shows up as
           # garbled text -- re-encode to GBK with CRLF, which is what cmd wants.
           $gbk = [Text.Encoding]::GetEncoding(936)
-          foreach ($f in "install-mic.bat", "uninstall-mic.bat", "switch-mic.bat", "README-mic.txt") {
+          foreach ($f in "install-mic.bat", "uninstall-mic.bat", "switch-mic.bat", "sweep-mic.bat", "README-mic.txt") {
             $text = [IO.File]::ReadAllText("drivers\$f", [Text.Encoding]::UTF8)
             $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n"
             [IO.File]::WriteAllText("pkg\$f", $text, $gbk)
