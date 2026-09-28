@@ -758,7 +758,7 @@ static KSDATARANGE_AUDIO g_RangeDual[] = {
             sizeof(KSDATARANGE_AUDIO), 0, 0, 0,
             STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
-            STATICGUIDOF(IsightSpecWaveFormatExtensible)
+            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE)
         },
         ISIGHTMIC_MAX_CHANNELS, ISIGHTMIC_BITS, ISIGHTMIC_BITS,
         ISIGHTMIC_SAMPLERATE, ISIGHTMIC_SAMPLERATE
@@ -1259,7 +1259,10 @@ STDMETHODIMP_(NTSTATUS) CMiniportWaveCyclic::DataRangeIntersection(IN ULONG PinI
             pf->DataFormat.FormatSize    = need;
             pf->DataFormat.MajorFormat   = KSDATAFORMAT_TYPE_AUDIO;
             pf->DataFormat.SubFormat     = KSDATAFORMAT_SUBTYPE_PCM;
-            pf->DataFormat.Specifier     = KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE;
+            // V40 shape (a34ddb6 line 1114): the local const GUID, NOT a
+            // KSDATAFORMAT_SPECIFIER_WAVEFORMATEXTENSIBLE symbol -- that name
+            // does not exist anywhere in this WDK (verified across shared/um/km).
+            pf->DataFormat.Specifier     = IsightSpecWaveFormatExtensible;
             pf->WaveFormatExt.Format.wFormatTag      = WAVE_FORMAT_EXTENSIBLE;
             pf->WaveFormatExt.Format.nChannels       = (WORD)ch;
             pf->WaveFormatExt.Format.nSamplesPerSec  = rate;
