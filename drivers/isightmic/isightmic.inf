@@ -147,7 +147,11 @@ CatalogFile = isightmic.cat
 ; sweep run right after installing V46 reported ISIGHTMIC-BUILD-V43, i.e. the
 ; previous build).  A higher DriverVer at least guarantees the new package wins
 ; in the driver store; the running image still needs one reboot to be replaced.
-DriverVer   = 09/29/2026,1.0.27.0
+;
+; NOTE: inf2cat rejects a DriverVer dated today-or-later as "postdated", so we
+; keep the date at 09/28 and win the driver store on the 1.0.28 version field
+; (still > 1.0.26 of V46, same date, version tie-break).
+DriverVer   = 09/28/2026,1.0.28.0
 
 [Manufacturer]
 %Provider% = IsightMic,NTamd64
